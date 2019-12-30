@@ -2437,10 +2437,9 @@ void SurfaceFlinger::postComposition()
         // Disable SmoMo by passing empty layer stack in multiple display case
         if (mDisplays.size() == 1) {
             for (const auto& layer : displayDevice->getVisibleLayersSortedByZ()) {
-                smomo::SmomoLayerStats layerStats = {
-                    layer->getName().string(),
-                    layer->getSequence(),
-                };
+                smomo::SmomoLayerStats layerStats;
+                layerStats.id = layer->getSequence();
+                layerStats.name = layer->getName().string();
                 layers.push_back(layerStats);
             }
 
@@ -2485,11 +2484,13 @@ void SurfaceFlinger::forceResyncModel() NO_THREAD_SAFETY_ANALYSIS {
     // as soon as change is fps(period) is observed.
 
     if (period > mVsyncPeriod.at(mVsyncPeriod.size() - 1)) {
-        mScheduler->resyncToHardwareVsync(true, period);
+        ATRACE_CALL();
+        mScheduler->resyncToHardwareVsync(true, period, true /* force resync */);
         mVsyncPeriod.push_back(period);
     } else if (period < mVsyncPeriod.at(mVsyncPeriod.size() - 1)) {
         // Vsync period changed. Trigger resync.
-        mScheduler->resyncToHardwareVsync(true, period);
+        ATRACE_CALL();
+        mScheduler->resyncToHardwareVsync(true, period, true /* force resync */);
         mVsyncPeriod = {};
     }
 }
@@ -3938,7 +3939,8 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<DisplayDevice>& displayDevice,
                                               HWC2::DisplayCapability::SkipClientColorTransform);
 
         // Compute the global color transform matrix.
-        applyColorMatrix = !hasDeviceComposition && !skipClientColorTransform;
+        applyColorMatrix = !hasDeviceComposition && !skipClientColorTransform &&
+                           (displayDevice->isPrimary() || displayDevice->getIsDisplayBuiltInType());
         if (applyColorMatrix) {
             clientCompositionDisplay.colorTransform = displayState.colorTransformMat;
         }
@@ -5294,12 +5296,11 @@ void SurfaceFlinger::dumpMemoryAllocations(bool dump)
         return;
     }
 
-    {
-       Mutex::Autolock lock(mLayerCountLock);
-       if (mNumLayers < 50) {
-           return;
-       }
+    if (mMemoryDump.mMemoryDumpCount--) {
+        return;
     }
+    mMemoryDump.mMemoryDumpCount = 300;
+
     std::string dumpsys;
     GraphicBufferAllocator& alloc(GraphicBufferAllocator::get());
     alloc.dump(dumpsys);
@@ -7015,13 +7016,24 @@ void SurfaceFlinger::setAllowedDisplayConfigsInternal(const sp<DisplayDevice>& d
     }
 
     ALOGV("Updating allowed configs");
-    mAllowedDisplayConfigs = DisplayConfigs(allowedConfigs.begin(), allowedConfigs.end());
+
+    std::vector<int32_t> displayConfigs;
+    for (int i = 0; i < allowedConfigs.size(); i++) {
+        displayConfigs.push_back(allowedConfigs.at(i));
+    }
+
+    // Update the allowed Display Configs.
+    mRefreshRateConfigs.getAllowedConfigs(getHwComposer().getConfigs(*display->getId()),
+                                          &displayConfigs);
+
+    mAllowedDisplayConfigs = DisplayConfigs(displayConfigs.begin(), displayConfigs.end());
 
     // Set the highest allowed config by iterating backwards on available refresh rates
     const auto& refreshRates = mRefreshRateConfigs.getRefreshRates();
     for (auto iter = refreshRates.crbegin(); iter != refreshRates.crend(); ++iter) {
         if (iter->second && isDisplayConfigAllowed(iter->second->configId)) {
             ALOGV("switching to config %d", iter->second->configId);
+            mRefreshRateConfigs.setActiveConfig(iter->second->configId);
             setDesiredActiveConfig(
                     {iter->first, iter->second->configId, Scheduler::ConfigEvent::Changed});
             break;
