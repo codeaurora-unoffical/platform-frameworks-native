@@ -188,8 +188,33 @@ ssize_t ProcessState::getKernelReferences(size_t buf_count, uintptr_t* buf)
     return count;
 }
 
+// Queries the driver for the current strong reference count of the node
+// that the handle points to. Can only be used by the servicemanager.
+//
+// Returns -1 in case of failure, otherwise the strong reference count.
+ssize_t ProcessState::getStrongRefCountForNodeByHandle(int32_t handle) {
+    binder_node_info_for_ref info;
+    memset(&info, 0, sizeof(binder_node_info_for_ref));
+
+    info.handle = handle;
+
+    status_t result = ioctl(mDriverFD, BINDER_GET_NODE_INFO_FOR_REF, &info);
+
+    if (result != OK) {
+        static bool logged = false;
+        if (!logged) {
+          ALOGW("Kernel does not support BINDER_GET_NODE_INFO_FOR_REF.");
+          logged = true;
+        }
+        return -1;
+    }
+
+    return info.strong_count;
+}
+
 void ProcessState::setCallRestriction(CallRestriction restriction) {
-    LOG_ALWAYS_FATAL_IF(IPCThreadState::selfOrNull(), "Call restrictions must be set before the threadpool is started.");
+    LOG_ALWAYS_FATAL_IF(IPCThreadState::selfOrNull() != nullptr,
+        "Call restrictions must be set before the threadpool is started.");
 
     mCallRestriction = restriction;
 }
@@ -360,6 +385,12 @@ ProcessState::ProcessState(const char *driver)
     , mThreadPoolSeq(1)
     , mCallRestriction(CallRestriction::NONE)
 {
+
+// TODO(b/139016109): enforce in build system
+#if defined(__ANDROID_APEX__) && !defined(__ANDROID_APEX_COM_ANDROID_VNDK_CURRENT__)
+    LOG_ALWAYS_FATAL("Cannot use libbinder in APEX (only system.img libbinder) since it is not stable.");
+#endif
+
     if (mDriverFD >= 0) {
         // mmap the binder, providing a chunk of virtual address space to receive transactions.
         mVMStart = mmap(nullptr, BINDER_VM_SIZE, PROT_READ, MAP_PRIVATE | MAP_NORESERVE, mDriverFD, 0);
@@ -372,7 +403,9 @@ ProcessState::ProcessState(const char *driver)
         }
     }
 
+#ifdef __ANDROID__
     LOG_ALWAYS_FATAL_IF(mDriverFD < 0, "Binder driver '%s' could not be opened.  Terminating.", driver);
+#endif
 }
 
 ProcessState::~ProcessState()
@@ -386,4 +419,4 @@ ProcessState::~ProcessState()
     mDriverFD = -1;
 }
         
-}; // namespace android
+} // namespace android

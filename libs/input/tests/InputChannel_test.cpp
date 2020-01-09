@@ -46,7 +46,8 @@ TEST_F(InputChannelTest, ConstructorAndDestructor_TakesOwnershipOfFileDescriptor
 
     android::base::unique_fd sendFd(pipe.sendFd);
 
-    sp<InputChannel> inputChannel = InputChannel::create("channel name", std::move(sendFd));
+    sp<InputChannel> inputChannel =
+            InputChannel::create("channel name", std::move(sendFd), new BBinder());
 
     EXPECT_NE(inputChannel, nullptr) << "channel should be successfully created";
     EXPECT_STREQ("channel name", inputChannel->getName().c_str())
@@ -59,13 +60,11 @@ TEST_F(InputChannelTest, ConstructorAndDestructor_TakesOwnershipOfFileDescriptor
 
 TEST_F(InputChannelTest, SetAndGetToken) {
     Pipe pipe;
-    sp<InputChannel> channel =
-            InputChannel::create("test channel", android::base::unique_fd(pipe.sendFd));
-    EXPECT_EQ(channel->getToken(), nullptr);
-
     sp<IBinder> token = new BBinder();
-    channel->setToken(token);
-    EXPECT_EQ(token, channel->getToken());
+    sp<InputChannel> channel =
+            InputChannel::create("test channel", android::base::unique_fd(pipe.sendFd), token);
+
+    EXPECT_EQ(token, channel->getConnectionToken());
 }
 
 TEST_F(InputChannelTest, OpenInputChannelPair_ReturnsAPairOfConnectedChannels) {
@@ -86,7 +85,7 @@ TEST_F(InputChannelTest, OpenInputChannelPair_ReturnsAPairOfConnectedChannels) {
     // Server->Client communication
     InputMessage serverMsg;
     memset(&serverMsg, 0, sizeof(InputMessage));
-    serverMsg.header.type = InputMessage::TYPE_KEY;
+    serverMsg.header.type = InputMessage::Type::KEY;
     serverMsg.body.key.action = AKEY_EVENT_ACTION_DOWN;
     EXPECT_EQ(OK, serverChannel->sendMessage(&serverMsg))
             << "server channel should be able to send message to client channel";
@@ -102,7 +101,7 @@ TEST_F(InputChannelTest, OpenInputChannelPair_ReturnsAPairOfConnectedChannels) {
     // Client->Server communication
     InputMessage clientReply;
     memset(&clientReply, 0, sizeof(InputMessage));
-    clientReply.header.type = InputMessage::TYPE_FINISHED;
+    clientReply.header.type = InputMessage::Type::FINISHED;
     clientReply.body.finished.seq = 0x11223344;
     clientReply.body.finished.handled = true;
     EXPECT_EQ(OK, clientChannel->sendMessage(&clientReply))
@@ -161,7 +160,7 @@ TEST_F(InputChannelTest, SendSignal_WhenPeerClosed_ReturnsAnError) {
     serverChannel.clear(); // close server channel
 
     InputMessage msg;
-    msg.header.type = InputMessage::TYPE_KEY;
+    msg.header.type = InputMessage::Type::KEY;
     EXPECT_EQ(DEAD_OBJECT, clientChannel->sendMessage(&msg))
             << "sendMessage should have returned DEAD_OBJECT";
 }
@@ -180,7 +179,7 @@ TEST_F(InputChannelTest, SendAndReceive_MotionClassification) {
     };
 
     InputMessage serverMsg = {}, clientMsg;
-    serverMsg.header.type = InputMessage::TYPE_MOTION;
+    serverMsg.header.type = InputMessage::Type::MOTION;
     serverMsg.body.motion.seq = 1;
     serverMsg.body.motion.pointerCount = 1;
 

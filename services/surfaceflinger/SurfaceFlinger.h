@@ -37,6 +37,7 @@
 #include <input/ISetInputWindowsListener.h>
 #include <layerproto/LayerProtoHeader.h>
 #include <math/mat4.h>
+#include <renderengine/LayerSettings.h>
 #include <serviceutils/PriorityDumper.h>
 #include <system/graphics.h>
 #include <ui/FenceTime.h>
@@ -89,7 +90,6 @@ class EventThread;
 class HWComposer;
 class IGraphicBufferProducer;
 class IInputFlinger;
-class InjectVSyncSource;
 class Layer;
 class MessageBase;
 class RefreshRateOverlay;
@@ -175,7 +175,8 @@ class SurfaceFlinger : public BnSurfaceComposer,
                        public PriorityDumper,
                        public ClientCache::ErasedRecipient,
                        private IBinder::DeathRecipient,
-                       private HWC2::ComposerCallback {
+                       private HWC2::ComposerCallback,
+                       private ISchedulerCallback {
 public:
     SurfaceFlingerBE& getBE() { return mBE; }
     const SurfaceFlingerBE& getBE() const { return mBE; }
@@ -272,9 +273,6 @@ public:
     // force full composition on all displays
     void repaintEverything();
 
-    // force full composition on all displays without resetting the scheduler idle timer.
-    void repaintEverythingForHWC();
-
     surfaceflinger::Factory& getFactory() { return mFactory; }
 
     // The CompositionEngine encapsulates all composition related interfaces and actions.
@@ -311,11 +309,10 @@ public:
     bool authenticateSurfaceTextureLocked(
         const sp<IGraphicBufferProducer>& bufferProducer) const;
 
-    inline void onLayerCreated() { mNumLayers++; }
-    inline void onLayerDestroyed(Layer* layer) {
-        mNumLayers--;
-        mOffscreenLayers.erase(layer);
-    }
+    void onLayerFirstRef(Layer*);
+    void onLayerDestroyed(Layer*);
+
+    void removeFromOffscreenLayers(Layer* layer);
 
     TransactionCompletedThread& getTransactionCompletedThread() {
         return mTransactionCompletedThread;
@@ -339,6 +336,7 @@ private:
 
     // For unit tests
     friend class TestableSurfaceFlinger;
+    friend class TransactionApplicationTest;
 
     // This value is specified in number of frames.  Log frame stats at most
     // every half hour.
@@ -347,9 +345,11 @@ private:
     static const size_t MAX_LAYERS = 4096;
     static const int MAX_TRACING_MEMORY = 100 * 1024 * 1024; // 100MB
 
+protected:
     // We're reference counted, never destroy SurfaceFlinger directly
     virtual ~SurfaceFlinger();
 
+private:
     /* ------------------------------------------------------------------------
      * Internal data structures
      */
@@ -366,6 +366,8 @@ private:
             if (colorMatrixChanged) {
                 colorMatrix = other.colorMatrix;
             }
+            globalShadowSettings = other.globalShadowSettings;
+
             return *this;
         }
 
@@ -376,8 +378,21 @@ private:
         bool colorMatrixChanged = true;
         mat4 colorMatrix;
 
+        renderengine::ShadowSettings globalShadowSettings;
+
         void traverseInZOrder(const LayerVector::Visitor& visitor) const;
         void traverseInReverseZOrder(const LayerVector::Visitor& visitor) const;
+    };
+
+    struct DesiredDisplayConfigSpecs {
+        int32_t defaultModeId;
+        float minRefreshRate;
+        float maxRefreshRate;
+
+        bool operator==(const DesiredDisplayConfigSpecs& other) const {
+            return defaultModeId == other.defaultModeId && minRefreshRate == other.minRefreshRate &&
+                    maxRefreshRate == other.maxRefreshRate;
+        }
     };
 
     /* ------------------------------------------------------------------------
@@ -400,6 +415,7 @@ private:
                              const sp<IBinder>& applyToken,
                              const InputWindowCommands& inputWindowCommands,
                              int64_t desiredPresentTime, const client_cache_t& uncacheBuffer,
+                             bool hasListenerCallbacks,
                              const std::vector<ListenerCallbacks>& listenerCallbacks) override;
     void bootFinished() override;
     bool authenticateSurfaceTexture(
@@ -466,11 +482,17 @@ private:
                                       const std::vector<int32_t>& allowedConfigs) override;
     status_t getAllowedDisplayConfigs(const sp<IBinder>& displayToken,
                                       std::vector<int32_t>* outAllowedConfigs) override;
+    status_t setDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken, int32_t displayModeId,
+                                          float minRefreshRate, float maxRefreshRate) override;
+    status_t getDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken,
+                                          int32_t* outDefaultModeId, float* outMinRefreshRate,
+                                          float* outMaxRefreshRate) override;
     status_t getDisplayBrightnessSupport(const sp<IBinder>& displayToken,
                                          bool* outSupport) const override;
     status_t setDisplayBrightness(const sp<IBinder>& displayToken, float brightness) const override;
     status_t notifyPowerHint(int32_t hintId) override;
-
+    status_t setGlobalShadowSettings(const half4& ambientColor, const half4& spotColor,
+                                     float lightPosY, float lightPosZ, float lightRadius) override;
     /* ------------------------------------------------------------------------
      * DeathRecipient interface
      */
@@ -484,12 +506,21 @@ private:
     /* ------------------------------------------------------------------------
      * HWC2::ComposerCallback / HWComposer::EventHandler interface
      */
-    void onVsyncReceived(int32_t sequenceId, hwc2_display_t hwcDisplayId,
-                         int64_t timestamp) override;
+    void onVsyncReceived(int32_t sequenceId, hwc2_display_t hwcDisplayId, int64_t timestamp,
+                         std::optional<hwc2_vsync_period_t> vsyncPeriod) override;
     void onHotplugReceived(int32_t sequenceId, hwc2_display_t hwcDisplayId,
                            HWC2::Connection connection) override;
     void onRefreshReceived(int32_t sequenceId, hwc2_display_t hwcDisplayId) override;
+    void onVsyncPeriodTimingChangedReceived(
+            int32_t sequenceId, hwc2_display_t display,
+            const hwc_vsync_period_change_timeline_t& updatedTimeline) override;
 
+    /* ------------------------------------------------------------------------
+     * ISchedulerCallback
+     */
+    void changeRefreshRate(const Scheduler::RefreshRate&, Scheduler::ConfigEvent) override;
+    // force full composition on all displays without resetting the scheduler idle timer.
+    void repaintEverythingForHWC() override;
     /* ------------------------------------------------------------------------
      * Message handling
      */
@@ -500,15 +531,14 @@ private:
     void signalLayerUpdate();
     void signalRefresh();
 
-    using RefreshRateType = scheduler::RefreshRateConfigs::RefreshRateType;
+    using RefreshRate = scheduler::RefreshRateConfigs::RefreshRate;
 
     struct ActiveConfigInfo {
-        RefreshRateType type;
-        int configId;
-        Scheduler::ConfigEvent event;
+        HwcConfigIndexType configId;
+        Scheduler::ConfigEvent event = Scheduler::ConfigEvent::None;
 
         bool operator!=(const ActiveConfigInfo& other) const {
-            return type != other.type || configId != other.configId || event != other.event;
+            return configId != other.configId || event != other.event;
         }
     };
 
@@ -548,7 +578,6 @@ private:
     void updateInputFlinger();
     void updateInputWindowInfo();
     void commitInputWindowCommands() REQUIRES(mStateLock);
-    void executeInputWindowCommands();
     void setInputWindowsFinished();
     void updateCursorAsync();
     void initScheduler(DisplayId primaryDisplayId);
@@ -566,10 +595,10 @@ private:
                                const Vector<DisplayState>& displays, uint32_t flags,
                                const InputWindowCommands& inputWindowCommands,
                                const int64_t desiredPresentTime,
-                               const client_cache_t& uncacheBuffer,
+                               const client_cache_t& uncacheBuffer, const int64_t postTime,
+                               bool privileged, bool hasListenerCallbacks,
                                const std::vector<ListenerCallbacks>& listenerCallbacks,
-                               const int64_t postTime, bool privileged, bool isMainThread = false)
-            REQUIRES(mStateLock);
+                               bool isMainThread = false) REQUIRES(mStateLock);
     // Returns true if at least one transaction was flushed
     bool flushTransactionQueues();
     // Returns true if there is at least one transaction that needs to be flushed
@@ -584,39 +613,50 @@ private:
     bool transactionIsReadyToBeApplied(int64_t desiredPresentTime,
                                        bool useCachedExpectedPresentTime,
                                        const Vector<ComposerState>& states);
-    uint32_t setClientStateLocked(const ComposerState& composerState, int64_t desiredPresentTime,
-                                  const std::vector<ListenerCallbacks>& listenerCallbacks,
-                                  int64_t postTime, bool privileged) REQUIRES(mStateLock);
     uint32_t setDisplayStateLocked(const DisplayState& s) REQUIRES(mStateLock);
     uint32_t addInputWindowCommands(const InputWindowCommands& inputWindowCommands)
             REQUIRES(mStateLock);
 
+protected:
+    virtual uint32_t setClientStateLocked(
+            const ComposerState& composerState, int64_t desiredPresentTime, int64_t postTime,
+            bool privileged,
+            std::unordered_set<ListenerCallbacks, ListenerCallbacksHash>& listenerCallbacks)
+            REQUIRES(mStateLock);
+    virtual void commitTransactionLocked();
+
+private:
     /* ------------------------------------------------------------------------
      * Layer management
      */
     status_t createLayer(const String8& name, const sp<Client>& client, uint32_t w, uint32_t h,
                          PixelFormat format, uint32_t flags, LayerMetadata metadata,
                          sp<IBinder>* handle, sp<IGraphicBufferProducer>* gbp,
-                         const sp<IBinder>& parentHandle, const sp<Layer>& parentLayer = nullptr);
+                         const sp<IBinder>& parentHandle, const sp<Layer>& parentLayer = nullptr,
+                         uint32_t* outTransformHint = nullptr);
 
-    status_t createBufferQueueLayer(const sp<Client>& client, const String8& name, uint32_t w,
+    status_t createBufferQueueLayer(const sp<Client>& client, std::string name, uint32_t w,
                                     uint32_t h, uint32_t flags, LayerMetadata metadata,
                                     PixelFormat& format, sp<IBinder>* outHandle,
                                     sp<IGraphicBufferProducer>* outGbp, sp<Layer>* outLayer);
 
-    status_t createBufferStateLayer(const sp<Client>& client, const String8& name, uint32_t w,
+    status_t createBufferStateLayer(const sp<Client>& client, std::string name, uint32_t w,
                                     uint32_t h, uint32_t flags, LayerMetadata metadata,
-                                    sp<IBinder>* outHandle, sp<Layer>* outLayer);
+                                    sp<IBinder>* outHandle, uint32_t* outTransformHint,
+                                    sp<Layer>* outLayer);
 
-    status_t createColorLayer(const sp<Client>& client, const String8& name, uint32_t w, uint32_t h,
+    status_t createColorLayer(const sp<Client>& client, std::string name, uint32_t w, uint32_t h,
                               uint32_t flags, LayerMetadata metadata, sp<IBinder>* outHandle,
                               sp<Layer>* outLayer);
 
-    status_t createContainerLayer(const sp<Client>& client, const String8& name, uint32_t w,
+    status_t createContainerLayer(const sp<Client>& client, std::string name, uint32_t w,
                                   uint32_t h, uint32_t flags, LayerMetadata metadata,
                                   sp<IBinder>* outHandle, sp<Layer>* outLayer);
 
-    String8 getUniqueLayerName(const String8& name);
+    status_t mirrorLayer(const sp<Client>& client, const sp<IBinder>& mirrorFromHandle,
+                         sp<IBinder>* outHandle);
+
+    std::string getUniqueLayerName(const char* name);
 
     // called when all clients have released all their references to
     // this layer meaning it is entirely safe to destroy all
@@ -651,6 +691,7 @@ private:
                                  const sp<GraphicBuffer>& buffer, bool useIdentityTransform,
                                  bool& outCapturedSecureLayers);
     const sp<DisplayDevice> getDisplayByIdOrLayerStack(uint64_t displayOrLayerStack);
+    const sp<DisplayDevice> getDisplayByLayerStack(uint64_t layerStack);
     status_t captureScreenImplLocked(const RenderArea& renderArea,
                                      TraverseLayersFunction traverseLayers,
                                      ANativeWindowBuffer* buffer, bool useIdentityTransform,
@@ -743,9 +784,6 @@ private:
      * Compositing
      */
     void invalidateHwcGeometry();
-    void computeVisibleRegions(
-            const sp<const DisplayDevice>& display, Region& dirtyRegion, Region& opaqueRegion,
-            std::vector<std::unique_ptr<compositionengine::OutputLayer>>& outputLayers);
 
     void postComposition();
     void getCompositorTiming(CompositorTiming* compositorTiming);
@@ -753,7 +791,6 @@ private:
                                 std::shared_ptr<FenceTime>& presentFenceTime);
     void setCompositorTimingSnapped(const DisplayStatInfo& stats,
                                     nsecs_t compositeToPresentLatency);
-    void rebuildLayerStacks();
 
     void postFrame();
 
@@ -777,11 +814,12 @@ private:
 
     // Sets the refresh rate by switching active configs, if they are available for
     // the desired refresh rate.
-    void setRefreshRateTo(RefreshRateType, Scheduler::ConfigEvent event) REQUIRES(mStateLock);
+    void changeRefreshRateLocked(const RefreshRate&, Scheduler::ConfigEvent event)
+            REQUIRES(mStateLock);
 
-    bool isDisplayConfigAllowed(int32_t configId) const REQUIRES(mStateLock);
+    bool isDisplayConfigAllowed(HwcConfigIndexType configId) const REQUIRES(mStateLock);
 
-    bool previousFrameMissed();
+    bool previousFrameMissed(int graceTimeMs = 0);
 
     // Populates the expected present time for this frame. For negative offsets, performs a
     // correction using the predicted vsync for the next frame instead.
@@ -859,8 +897,8 @@ private:
     // Not const because each Layer needs to query Fences and cache timestamps.
     void dumpFrameEventsLocked(std::string& result);
 
-    void recordBufferingStats(const char* layerName,
-            std::vector<OccupancyTracker::Segment>&& history);
+    void recordBufferingStats(const std::string& layerName,
+                              std::vector<OccupancyTracker::Segment>&& history);
     void dumpBufferingStats(std::string& result) const;
     void dumpDisplayIdentificationData(std::string& result) const;
     void dumpRawDisplayIdentificationData(const DumpArgs&, std::string& result) const;
@@ -932,8 +970,6 @@ private:
     // constant members (no synchronization needed for access)
     const nsecs_t mBootTime = systemTime();
     bool mGpuToCpuSupported = false;
-    std::unique_ptr<EventThread> mInjectorEventThread;
-    std::unique_ptr<InjectVSyncSource> mVSyncInjector;
 
     // Can only accessed from the main thread, these members
     // don't need synchronization
@@ -983,6 +1019,7 @@ private:
     volatile nsecs_t mDebugInTransaction = 0;
     bool mForceFullDamage = false;
     bool mPropagateBackpressure = true;
+    bool mPropagateBackpressureClientComposition = false;
     std::unique_ptr<SurfaceInterceptor> mInterceptor;
     SurfaceTracing mTracing{*this};
     bool mTracingEnabled = false;
@@ -1022,33 +1059,33 @@ private:
         TransactionState(const Vector<ComposerState>& composerStates,
                          const Vector<DisplayState>& displayStates, uint32_t transactionFlags,
                          int64_t desiredPresentTime, const client_cache_t& uncacheBuffer,
-                         const std::vector<ListenerCallbacks>& listenerCallbacks, int64_t postTime,
-                         bool privileged)
+                         int64_t postTime, bool privileged, bool hasListenerCallbacks,
+                         std::vector<ListenerCallbacks> listenerCallbacks)
               : states(composerStates),
                 displays(displayStates),
                 flags(transactionFlags),
                 desiredPresentTime(desiredPresentTime),
                 buffer(uncacheBuffer),
-                callback(listenerCallbacks),
                 postTime(postTime),
-                privileged(privileged) {}
+                privileged(privileged),
+                hasListenerCallbacks(hasListenerCallbacks),
+                listenerCallbacks(listenerCallbacks) {}
 
         Vector<ComposerState> states;
         Vector<DisplayState> displays;
         uint32_t flags;
         const int64_t desiredPresentTime;
         client_cache_t buffer;
-        std::vector<ListenerCallbacks> callback;
         const int64_t postTime;
         bool privileged;
+        bool hasListenerCallbacks;
+        std::vector<ListenerCallbacks> listenerCallbacks;
     };
     std::unordered_map<sp<IBinder>, std::queue<TransactionState>, IListenerHash> mTransactionQueues;
 
     /* ------------------------------------------------------------------------
      * Feature prototyping
      */
-
-    bool mInjectVSyncs = false;
 
     // Static screen stats
     bool mHasPoweredOff = false;
@@ -1088,7 +1125,6 @@ private:
     /* ------------------------------------------------------------------------
      * Scheduler
      */
-    bool mUseSmart90ForVideo = false;
     std::unique_ptr<Scheduler> mScheduler;
     scheduler::ConnectionHandle mAppConnectionHandle;
     scheduler::ConnectionHandle mSfConnectionHandle;
@@ -1105,8 +1141,9 @@ private:
     std::atomic<nsecs_t> mExpectedPresentTime = 0;
 
     // All configs are allowed if the set is empty.
-    using DisplayConfigs = std::set<int32_t>;
+    using DisplayConfigs = std::set<HwcConfigIndexType>;
     DisplayConfigs mAllowedDisplayConfigs GUARDED_BY(mStateLock);
+    DesiredDisplayConfigSpecs mDesiredDisplayConfigSpecs GUARDED_BY(mStateLock);
 
     std::mutex mActiveConfigLock;
     // This bit is set once we start setting the config. We read from this bit during the
@@ -1143,6 +1180,9 @@ private:
 
     bool mPendingSyncInputWindows GUARDED_BY(mStateLock);
     Hwc2::impl::PowerAdvisor mPowerAdvisor;
+
+    // This should only be accessed on the main thread.
+    nsecs_t mFrameStartTime = 0;
 
     std::unique_ptr<RefreshRateOverlay> mRefreshRateOverlay;
 

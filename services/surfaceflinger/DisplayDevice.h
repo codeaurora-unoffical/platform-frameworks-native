@@ -31,6 +31,7 @@
 #include <math/mat4.h>
 #include <renderengine/RenderEngine.h>
 #include <system/window.h>
+#include <ui/DisplayInfo.h>
 #include <ui/GraphicTypes.h>
 #include <ui/HdrCapabilities.h>
 #include <ui/Region.h>
@@ -42,6 +43,7 @@
 #include "DisplayHardware/DisplayIdentification.h"
 #include "DisplayHardware/PowerAdvisor.h"
 #include "RenderArea.h"
+#include "Scheduler/HwcStrongTypes.h"
 
 namespace android {
 
@@ -64,10 +66,6 @@ class DisplayDevice : public LightRefBase<DisplayDevice> {
 public:
     constexpr static float sDefaultMinLumiance = 0.0;
     constexpr static float sDefaultMaxLumiance = 500.0;
-
-    enum {
-        NO_LAYER_STACK = 0xFFFFFFFF,
-    };
 
     explicit DisplayDevice(DisplayDeviceCreationArgs&& args);
     virtual ~DisplayDevice();
@@ -144,8 +142,8 @@ public:
     /* ------------------------------------------------------------------------
      * Display active config management.
      */
-    int getActiveConfig() const;
-    void setActiveConfig(int mode);
+    HwcConfigIndexType getActiveConfig() const;
+    void setActiveConfig(HwcConfigIndexType mode);
 
     // release HWC resources (if any) for removable displays
     void disconnect();
@@ -189,7 +187,7 @@ private:
     // Current power mode
     int mPowerMode;
     // Current active config
-    int mActiveConfig;
+    HwcConfigIndexType mActiveConfig;
 
     // TODO(b/74619554): Remove special cases for primary display.
     const bool mIsPrimary;
@@ -201,7 +199,7 @@ struct DisplayDeviceState {
     int32_t sequenceId = sNextSequenceId++;
     std::optional<DisplayId> displayId;
     sp<IGraphicBufferProducer> surface;
-    uint32_t layerStack = DisplayDevice::NO_LAYER_STACK;
+    uint32_t layerStack = NO_LAYER_STACK;
     Rect viewport;
     Rect frame;
     uint8_t orientation = 0;
@@ -249,6 +247,7 @@ public:
                       uint32_t reqHeight, ui::Dataspace reqDataSpace,
                       ui::Transform::orientation_flags rotation, bool allowSecureLayers = true)
           : RenderArea(reqWidth, reqHeight, CaptureFill::OPAQUE, reqDataSpace,
+                       device->getViewport(),
                        getDisplayRotation(rotation, device->getInstallOrientation())),
             mDevice(device),
             mSourceCrop(sourceCrop),

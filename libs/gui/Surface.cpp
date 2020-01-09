@@ -1084,6 +1084,15 @@ int Surface::perform(int operation, va_list args)
     case NATIVE_WINDOW_GET_LAST_DEQUEUE_START:
         res = dispatchGetLastDequeueStartTime(args);
         break;
+    case NATIVE_WINDOW_SET_DEQUEUE_TIMEOUT:
+        res = dispatchSetDequeueTimeout(args);
+        break;
+    case NATIVE_WINDOW_GET_LAST_DEQUEUE_DURATION:
+        res = dispatchGetLastDequeueDuration(args);
+        break;
+    case NATIVE_WINDOW_GET_LAST_QUEUE_DURATION:
+        res = dispatchGetLastQueueDuration(args);
+        break;
     default:
         res = NAME_NOT_FOUND;
         break;
@@ -1292,6 +1301,23 @@ int Surface::dispatchSetAutoPrerotation(va_list args) {
 int Surface::dispatchGetLastDequeueStartTime(va_list args) {
     int64_t* lastDequeueStartTime = va_arg(args, int64_t*);
     *lastDequeueStartTime = mLastDequeueStartTime;
+    return NO_ERROR;
+}
+
+int Surface::dispatchSetDequeueTimeout(va_list args) {
+    nsecs_t timeout = va_arg(args, int64_t);
+    return setDequeueTimeout(timeout);
+}
+
+int Surface::dispatchGetLastDequeueDuration(va_list args) {
+    int64_t* lastDequeueDuration = va_arg(args, int64_t*);
+    *lastDequeueDuration = mLastDequeueDuration;
+    return NO_ERROR;
+}
+
+int Surface::dispatchGetLastQueueDuration(va_list args) {
+    int64_t* lastQueueDuration = va_arg(args, int64_t*);
+    *lastQueueDuration = mLastQueueDuration;
     return NO_ERROR;
 }
 

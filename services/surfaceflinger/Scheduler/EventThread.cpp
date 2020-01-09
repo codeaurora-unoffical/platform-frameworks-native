@@ -36,6 +36,7 @@
 #include <utils/Trace.h>
 
 #include "EventThread.h"
+#include "HwcStrongTypes.h"
 
 using namespace std::chrono_literals;
 
@@ -101,10 +102,11 @@ DisplayEventReceiver::Event makeVSync(PhysicalDisplayId displayId, nsecs_t times
     return event;
 }
 
-DisplayEventReceiver::Event makeConfigChanged(PhysicalDisplayId displayId, int32_t configId) {
+DisplayEventReceiver::Event makeConfigChanged(PhysicalDisplayId displayId,
+                                              HwcConfigIndexType configId) {
     DisplayEventReceiver::Event event;
     event.header = {DisplayEventReceiver::DISPLAY_EVENT_CONFIG_CHANGED, displayId, systemTime()};
-    event.config.configId = configId;
+    event.config.configId = configId.value();
     return event;
 }
 
@@ -154,23 +156,11 @@ EventThread::~EventThread() = default;
 
 namespace impl {
 
-EventThread::EventThread(std::unique_ptr<VSyncSource> src,
-                         InterceptVSyncsCallback interceptVSyncsCallback, const char* threadName)
-      : EventThread(nullptr, std::move(src), std::move(interceptVSyncsCallback), threadName) {}
-
-EventThread::EventThread(VSyncSource* src, InterceptVSyncsCallback interceptVSyncsCallback,
-                         const char* threadName)
-      : EventThread(src, nullptr, std::move(interceptVSyncsCallback), threadName) {}
-
-EventThread::EventThread(VSyncSource* src, std::unique_ptr<VSyncSource> uniqueSrc,
-                         InterceptVSyncsCallback interceptVSyncsCallback, const char* threadName)
-      : mVSyncSource(src),
-        mVSyncSourceUnique(std::move(uniqueSrc)),
+EventThread::EventThread(std::unique_ptr<VSyncSource> vsyncSource,
+                         InterceptVSyncsCallback interceptVSyncsCallback)
+      : mVSyncSource(std::move(vsyncSource)),
         mInterceptVSyncsCallback(std::move(interceptVSyncsCallback)),
-        mThreadName(threadName) {
-    if (src == nullptr) {
-        mVSyncSource = mVSyncSourceUnique.get();
-    }
+        mThreadName(mVSyncSource->getName()) {
     mVSyncSource->setCallback(this);
 
     mThread = std::thread([this]() NO_THREAD_SAFETY_ANALYSIS {
@@ -178,7 +168,7 @@ EventThread::EventThread(VSyncSource* src, std::unique_ptr<VSyncSource> uniqueSr
         threadMain(lock);
     });
 
-    pthread_setname_np(mThread.native_handle(), threadName);
+    pthread_setname_np(mThread.native_handle(), mThreadName);
 
     pid_t tid = pthread_gettid_np(mThread.native_handle());
 
@@ -302,7 +292,7 @@ void EventThread::onHotplugReceived(PhysicalDisplayId displayId, bool connected)
     mCondition.notify_all();
 }
 
-void EventThread::onConfigChanged(PhysicalDisplayId displayId, int32_t configId) {
+void EventThread::onConfigChanged(PhysicalDisplayId displayId, HwcConfigIndexType configId) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     mPendingEvents.push_back(makeConfigChanged(displayId, configId));

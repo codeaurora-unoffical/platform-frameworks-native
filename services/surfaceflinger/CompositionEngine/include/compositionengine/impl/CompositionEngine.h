@@ -26,15 +26,18 @@ public:
     ~CompositionEngine() override;
 
     std::shared_ptr<compositionengine::Display> createDisplay(
-            compositionengine::DisplayCreationArgs&&) override;
+            const compositionengine::DisplayCreationArgs&) override;
     std::shared_ptr<compositionengine::Layer> createLayer(
-            compositionengine::LayerCreationArgs&&) override;
+            const compositionengine::LayerCreationArgs&) override;
 
     HWComposer& getHwComposer() const override;
     void setHwComposer(std::unique_ptr<HWComposer>) override;
 
     renderengine::RenderEngine& getRenderEngine() const override;
     void setRenderEngine(std::unique_ptr<renderengine::RenderEngine>) override;
+
+    TimeStats& getTimeStats() const override;
+    void setTimeStats(const std::shared_ptr<TimeStats>&) override;
 
     bool needsAnotherUpdate() const override;
     nsecs_t getLastFrameRefreshTimestamp() const override;
@@ -45,6 +48,9 @@ public:
 
     void preComposition(CompositionRefreshArgs&) override;
 
+    // Debugging
+    void dump(std::string&) const override;
+
     void updateLayerStateFromFE(CompositionRefreshArgs& args);
 
     // Testing
@@ -53,6 +59,7 @@ public:
 private:
     std::unique_ptr<HWComposer> mHwComposer;
     std::unique_ptr<renderengine::RenderEngine> mRenderEngine;
+    std::shared_ptr<TimeStats> mTimeStats;
     bool mNeedsAnotherUpdate = false;
     nsecs_t mRefreshStartTime = 0;
 };

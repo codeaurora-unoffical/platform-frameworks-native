@@ -33,6 +33,7 @@
 #include <private/gui/BitTube.h>
 
 #include <utils/Errors.h>
+#include "HwcStrongTypes.h"
 
 // ---------------------------------------------------------------------------
 namespace android {
@@ -62,6 +63,8 @@ public:
     };
 
     virtual ~VSyncSource() {}
+
+    virtual const char* getName() const = 0;
     virtual void setVSyncEnabled(bool enable) = 0;
     virtual void setCallback(Callback* callback) = 0;
     virtual void setPhaseOffset(nsecs_t phaseOffset) = 0;
@@ -107,7 +110,7 @@ public:
     virtual void onHotplugReceived(PhysicalDisplayId displayId, bool connected) = 0;
 
     // called when SF changes the active config and apps needs to be notified about the change
-    virtual void onConfigChanged(PhysicalDisplayId displayId, int32_t configId) = 0;
+    virtual void onConfigChanged(PhysicalDisplayId displayId, HwcConfigIndexType configId) = 0;
 
     virtual void dump(std::string& result) const = 0;
 
@@ -126,9 +129,7 @@ class EventThread : public android::EventThread, private VSyncSource::Callback {
 public:
     using InterceptVSyncsCallback = std::function<void(nsecs_t)>;
 
-    // TODO(b/128863962): Once the Scheduler is complete this constructor will become obsolete.
-    EventThread(VSyncSource*, InterceptVSyncsCallback, const char* threadName);
-    EventThread(std::unique_ptr<VSyncSource>, InterceptVSyncsCallback, const char* threadName);
+    EventThread(std::unique_ptr<VSyncSource>, InterceptVSyncsCallback);
     ~EventThread();
 
     sp<EventThreadConnection> createEventConnection(
@@ -146,7 +147,7 @@ public:
 
     void onHotplugReceived(PhysicalDisplayId displayId, bool connected) override;
 
-    void onConfigChanged(PhysicalDisplayId displayId, int32_t configId) override;
+    void onConfigChanged(PhysicalDisplayId displayId, HwcConfigIndexType configId) override;
 
     void dump(std::string& result) const override;
 
@@ -156,10 +157,6 @@ private:
     friend EventThreadTest;
 
     using DisplayEventConsumers = std::vector<sp<EventThreadConnection>>;
-
-    // TODO(b/128863962): Once the Scheduler is complete this constructor will become obsolete.
-    EventThread(VSyncSource* src, std::unique_ptr<VSyncSource> uniqueSrc,
-                InterceptVSyncsCallback interceptVSyncsCallback, const char* threadName);
 
     void threadMain(std::unique_lock<std::mutex>& lock) REQUIRES(mMutex);
 
@@ -174,9 +171,7 @@ private:
     // Implements VSyncSource::Callback
     void onVSyncEvent(nsecs_t timestamp) override;
 
-    // TODO(b/128863962): Once the Scheduler is complete this pointer will become obsolete.
-    VSyncSource* mVSyncSource GUARDED_BY(mMutex) = nullptr;
-    std::unique_ptr<VSyncSource> mVSyncSourceUnique GUARDED_BY(mMutex) = nullptr;
+    const std::unique_ptr<VSyncSource> mVSyncSource GUARDED_BY(mMutex);
 
     const InterceptVSyncsCallback mInterceptVSyncsCallback;
     const char* const mThreadName;

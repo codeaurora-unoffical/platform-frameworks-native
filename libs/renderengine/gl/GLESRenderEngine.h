@@ -49,13 +49,11 @@ class GLImage;
 
 class GLESRenderEngine : public impl::RenderEngine {
 public:
-    static std::unique_ptr<GLESRenderEngine> create(int hwcFormat, uint32_t featureFlags,
-                                                    uint32_t imageCacheSize);
+    static std::unique_ptr<GLESRenderEngine> create(const RenderEngineCreationArgs& args);
 
-    GLESRenderEngine(uint32_t featureFlags, // See RenderEngine::FeatureFlag
-                     EGLDisplay display, EGLConfig config, EGLContext ctxt, EGLSurface dummy,
-                     EGLContext protectedContext, EGLSurface protectedDummy,
-                     uint32_t imageCacheSize);
+    GLESRenderEngine(const RenderEngineCreationArgs& args, EGLDisplay display, EGLConfig config,
+                     EGLContext ctxt, EGLSurface dummy, EGLContext protectedContext,
+                     EGLSurface protectedDummy);
     ~GLESRenderEngine() override EXCLUDES(mRenderingMutex);
 
     void primeCache() const override;
@@ -150,6 +148,8 @@ private:
     bool waitFence(base::unique_fd fenceFd);
     void clearWithColor(float red, float green, float blue, float alpha);
     void fillRegionWithColor(const Region& region, float red, float green, float blue, float alpha);
+    void handleShadow(const FloatRect& casterRect, float casterCornerRadius,
+                      const ShadowSettings& shadowSettings);
     void setupLayerBlending(bool premultipliedAlpha, bool opaque, bool disableTexture,
                             const half4& color, float cornerRadius);
     void setupLayerTexturing(const Texture& texture);

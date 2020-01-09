@@ -124,7 +124,8 @@ class OverrideLayerNames {
     };
 
     void AddImplicitLayers() {
-        if (!is_instance_ || !driver::Debuggable())
+        if (!is_instance_ ||
+            !android::GraphicsEnv::getInstance().isDebuggable())
             return;
 
         GetLayersFromSettings();
@@ -144,7 +145,7 @@ class OverrideLayerNames {
     }
 
     void GetLayersFromSettings() {
-        // These will only be available if conditions are met in GraphicsEnvironemnt
+        // These will only be available if conditions are met in GraphicsEnvironment
         // gpu_debug_layers = layer1:layer2:layerN
         const std::string layers = android::GraphicsEnv::getInstance().getDebugLayers();
         if (!layers.empty()) {
@@ -370,7 +371,8 @@ class OverrideExtensionNames {
 
    private:
     bool EnableDebugCallback() const {
-        return (is_instance_ && driver::Debuggable() &&
+        return (is_instance_ &&
+                android::GraphicsEnv::getInstance().isDebuggable() &&
                 property_get_bool("debug.vulkan.enable_callback", false));
     }
 
@@ -519,7 +521,11 @@ LayerChain::LayerChain(bool is_instance,
       get_device_proc_addr_(nullptr),
       driver_extensions_(nullptr),
       driver_extension_count_(0) {
-    enabled_extensions_.set(driver::ProcHook::EXTENSION_CORE);
+    // advertise the loader supported core Vulkan API version at vulkan::api
+    for (uint32_t i = driver::ProcHook::EXTENSION_CORE_1_0;
+         i != driver::ProcHook::EXTENSION_COUNT; ++i) {
+        enabled_extensions_.set(i);
+    }
 }
 
 LayerChain::~LayerChain() {
@@ -1275,7 +1281,7 @@ VkResult EnumerateInstanceExtensionProperties(
         return *pPropertyCount < count ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
-    // TODO how about extensions from implicitly enabled layers?
+    // TODO(b/143293104): expose extensions from implicitly enabled layers
     return vulkan::driver::EnumerateInstanceExtensionProperties(
         nullptr, pPropertyCount, pProperties);
 }
@@ -1329,7 +1335,7 @@ VkResult EnumerateDeviceExtensionProperties(
         return *pPropertyCount < count ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
-    // TODO how about extensions from implicitly enabled layers?
+    // TODO(b/143293104): expose extensions from implicitly enabled layers
     const InstanceData& data = GetData(physicalDevice);
     return data.dispatch.EnumerateDeviceExtensionProperties(
         physicalDevice, nullptr, pPropertyCount, pProperties);

@@ -24,6 +24,8 @@
 #include <compositionengine/mock/DisplaySurface.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <gui/mock/GraphicBufferConsumer.h>
+#include <gui/mock/GraphicBufferProducer.h>
 #include <log/log.h>
 #include <renderengine/mock/RenderEngine.h>
 #include <ui/DebugUtils.h>
@@ -38,8 +40,6 @@
 #include "mock/MockMessageQueue.h"
 #include "mock/MockNativeWindowSurface.h"
 #include "mock/MockSurfaceInterceptor.h"
-#include "mock/gui/MockGraphicBufferConsumer.h"
-#include "mock/gui/MockGraphicBufferProducer.h"
 #include "mock/system/window/MockNativeWindow.h"
 
 namespace android {
@@ -445,10 +445,6 @@ struct HwcDisplayVariant {
     }
 
     static void setupHwcHotplugCallExpectations(DisplayTransactionTest* test) {
-        EXPECT_CALL(*test->mComposer, getDisplayType(HWC_DISPLAY_ID, _))
-                .WillOnce(DoAll(SetArgPointee<1>(static_cast<IComposerClient::DisplayType>(
-                                        HWC_DISPLAY_TYPE)),
-                                Return(Error::NONE)));
         EXPECT_CALL(*test->mComposer, setClientTargetSlotCount(_)).WillOnce(Return(Error::NONE));
         EXPECT_CALL(*test->mComposer, getDisplayConfigs(HWC_DISPLAY_ID, _))
                 .WillOnce(DoAll(SetArgPointee<1>(std::vector<unsigned>{HWC_ACTIVE_CONFIG_ID}),
@@ -473,6 +469,10 @@ struct HwcDisplayVariant {
                     getDisplayAttribute(HWC_DISPLAY_ID, HWC_ACTIVE_CONFIG_ID,
                                         IComposerClient::Attribute::DPI_Y, _))
                 .WillOnce(DoAll(SetArgPointee<3>(DEFAULT_DPI), Return(Error::NONE)));
+        EXPECT_CALL(*test->mComposer,
+                    getDisplayAttribute(HWC_DISPLAY_ID, HWC_ACTIVE_CONFIG_ID,
+                                        IComposerClient::Attribute::CONFIG_GROUP, _))
+                .WillOnce(DoAll(SetArgPointee<3>(-1), Return(Error::NONE)));
 
         if (PhysicalDisplay::HAS_IDENTIFICATION_DATA) {
             EXPECT_CALL(*test->mComposer, getDisplayIdentificationData(HWC_DISPLAY_ID, _, _))
@@ -1427,7 +1427,7 @@ void SetupNewDisplayDeviceInternalTest::setupNewDisplayDeviceInternalTest() {
     // Note: This is not Case::Display::HWC_ACTIVE_CONFIG_ID as the ids are
     // remapped, and the test only ever sets up one config. If there were an error
     // looking up the remapped index, device->getActiveConfig() would be -1 instead.
-    EXPECT_EQ(0, device->getActiveConfig());
+    EXPECT_EQ(0, device->getActiveConfig().value());
     EXPECT_EQ(Case::PerFrameMetadataSupport::PER_FRAME_METADATA_KEYS,
               device->getSupportedPerFrameMetadata());
 }

@@ -20,11 +20,11 @@
 #include <TimeStats/TimeStats.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-
 #include <log/log.h>
 #include <utils/String16.h>
 #include <utils/Vector.h>
 
+#include <chrono>
 #include <random>
 #include <unordered_set>
 
@@ -170,8 +170,8 @@ std::string TimeStatsTest::inputCommand(InputCommand cmd, bool useProto) {
     return result;
 }
 
-static std::string genLayerName(int32_t layerID) {
-    return (layerID < 0 ? "invalid.dummy" : "com.dummy#") + std::to_string(layerID);
+static std::string genLayerName(int32_t layerId) {
+    return (layerId < 0 ? "PopupWindow:b54fcd1#0" : "com.dummy#") + std::to_string(layerId);
 }
 
 void TimeStatsTest::setTimeStamp(TimeStamp type, int32_t id, uint64_t frameNumber, nsecs_t ts) {
@@ -275,6 +275,69 @@ TEST_F(TimeStatsTest, canInsertGlobalPresentToPresent) {
     ASSERT_EQ(1, globalProto.present_to_present_size());
     const SFTimeStatsHistogramBucketProto& histogramProto = globalProto.present_to_present().Get(0);
     EXPECT_EQ(1, histogramProto.frame_count());
+    EXPECT_EQ(2, histogramProto.time_millis());
+}
+
+TEST_F(TimeStatsTest, canInsertGlobalFrameDuration) {
+    EXPECT_TRUE(inputCommand(InputCommand::ENABLE, FMT_STRING).empty());
+
+    using namespace std::chrono_literals;
+
+    mTimeStats->setPowerMode(HWC_POWER_MODE_OFF);
+    mTimeStats
+            ->recordFrameDuration(std::chrono::duration_cast<std::chrono::nanoseconds>(1ms).count(),
+                                  std::chrono::duration_cast<std::chrono::nanoseconds>(5ms)
+                                          .count());
+    mTimeStats->setPowerMode(HWC_POWER_MODE_NORMAL);
+    mTimeStats
+            ->recordFrameDuration(std::chrono::duration_cast<std::chrono::nanoseconds>(3ms).count(),
+                                  std::chrono::duration_cast<std::chrono::nanoseconds>(6ms)
+                                          .count());
+
+    SFTimeStatsGlobalProto globalProto;
+    ASSERT_TRUE(globalProto.ParseFromString(inputCommand(InputCommand::DUMP_ALL, FMT_PROTO)));
+
+    ASSERT_EQ(1, globalProto.frame_duration_size());
+    const SFTimeStatsHistogramBucketProto& histogramProto = globalProto.frame_duration().Get(0);
+    EXPECT_EQ(1, histogramProto.frame_count());
+    EXPECT_EQ(3, histogramProto.time_millis());
+}
+
+TEST_F(TimeStatsTest, canInsertGlobalRenderEngineTiming) {
+    EXPECT_TRUE(inputCommand(InputCommand::ENABLE, FMT_STRING).empty());
+
+    using namespace std::chrono_literals;
+
+    mTimeStats->recordRenderEngineDuration(std::chrono::duration_cast<std::chrono::nanoseconds>(1ms)
+                                                   .count(),
+                                           std::make_shared<FenceTime>(
+                                                   std::chrono::duration_cast<
+                                                           std::chrono::nanoseconds>(3ms)
+                                                           .count()));
+
+    mTimeStats->recordRenderEngineDuration(std::chrono::duration_cast<std::chrono::nanoseconds>(4ms)
+                                                   .count(),
+                                           std::chrono::duration_cast<std::chrono::nanoseconds>(6ms)
+                                                   .count());
+
+    // First verify that flushing RenderEngine durations did not occur yet.
+    SFTimeStatsGlobalProto preFlushProto;
+    ASSERT_TRUE(preFlushProto.ParseFromString(inputCommand(InputCommand::DUMP_ALL, FMT_PROTO)));
+    ASSERT_EQ(0, preFlushProto.render_engine_timing_size());
+
+    // Push a dummy present fence to trigger flushing the RenderEngine timings.
+    mTimeStats->setPowerMode(HWC_POWER_MODE_NORMAL);
+    mTimeStats->setPresentFenceGlobal(std::make_shared<FenceTime>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(1ms).count()));
+
+    // Now we can verify that RenderEngine durations were flushed now.
+    SFTimeStatsGlobalProto postFlushProto;
+    ASSERT_TRUE(postFlushProto.ParseFromString(inputCommand(InputCommand::DUMP_ALL, FMT_PROTO)));
+
+    ASSERT_EQ(1, postFlushProto.render_engine_timing_size());
+    const SFTimeStatsHistogramBucketProto& histogramProto =
+            postFlushProto.render_engine_timing().Get(0);
+    EXPECT_EQ(2, histogramProto.frame_count());
     EXPECT_EQ(2, histogramProto.time_millis());
 }
 
@@ -560,22 +623,22 @@ TEST_F(TimeStatsTest, canSurviveMonkey) {
     EXPECT_TRUE(inputCommand(InputCommand::ENABLE, FMT_STRING).empty());
 
     for (size_t i = 0; i < 10000000; ++i) {
-        const int32_t layerID = genRandomInt32(-1, 10);
+        const int32_t layerId = genRandomInt32(-1, 10);
         const int32_t frameNumber = genRandomInt32(1, 10);
         switch (genRandomInt32(0, 100)) {
             case 0:
                 ALOGV("removeTimeRecord");
-                ASSERT_NO_FATAL_FAILURE(mTimeStats->removeTimeRecord(layerID, frameNumber));
+                ASSERT_NO_FATAL_FAILURE(mTimeStats->removeTimeRecord(layerId, frameNumber));
                 continue;
             case 1:
                 ALOGV("onDestroy");
-                ASSERT_NO_FATAL_FAILURE(mTimeStats->onDestroy(layerID));
+                ASSERT_NO_FATAL_FAILURE(mTimeStats->onDestroy(layerId));
                 continue;
         }
         TimeStamp type = static_cast<TimeStamp>(genRandomInt32(TIME_STAMP_BEGIN, TIME_STAMP_END));
         const int32_t ts = genRandomInt32(1, 1000000000);
-        ALOGV("type[%d], layerID[%d], frameNumber[%d], ts[%d]", type, layerID, frameNumber, ts);
-        setTimeStamp(type, layerID, frameNumber, ts);
+        ALOGV("type[%d], layerId[%d], frameNumber[%d], ts[%d]", type, layerId, frameNumber, ts);
+        setTimeStamp(type, layerId, frameNumber, ts);
     }
 }
 

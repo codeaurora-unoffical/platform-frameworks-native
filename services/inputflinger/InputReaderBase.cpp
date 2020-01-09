@@ -33,20 +33,6 @@ using android::base::StringPrintf;
 
 namespace android {
 
-// --- InputReaderThread ---
-
-InputReaderThread::InputReaderThread(const sp<InputReaderInterface>& reader) :
-        Thread(/*canCallJava*/ true), mReader(reader) {
-}
-
-InputReaderThread::~InputReaderThread() {
-}
-
-bool InputReaderThread::threadLoop() {
-    mReader->loopOnce();
-    return true;
-}
-
 // --- InputReaderConfiguration ---
 
 std::string InputReaderConfiguration::changesToString(uint32_t changes) {
@@ -114,8 +100,10 @@ std::optional<DisplayViewport> InputReaderConfiguration::getDisplayViewportByTyp
     std::optional<DisplayViewport> result = std::nullopt;
     for (const DisplayViewport& currentViewport : mDisplays) {
         // Return the first match
-        if (currentViewport.type == type && !result) {
-            result = std::make_optional(currentViewport);
+        if (currentViewport.type == type) {
+            if (!result) {
+                result = std::make_optional(currentViewport);
+            }
             count++;
         }
     }

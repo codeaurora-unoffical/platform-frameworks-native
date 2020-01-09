@@ -18,10 +18,11 @@
 
 #include <compositionengine/Display.h>
 #include <compositionengine/Layer.h>
+#include <compositionengine/LayerFECompositionState.h>
 #include <compositionengine/OutputLayer.h>
 #include <compositionengine/impl/CompositionEngine.h>
-#include <compositionengine/impl/LayerCompositionState.h>
 #include <compositionengine/impl/OutputLayerCompositionState.h>
+#include <compositionengine/mock/DisplaySurface.h>
 
 #include "BufferQueueLayer.h"
 #include "BufferStateLayer.h"
@@ -35,10 +36,9 @@
 #include "Scheduler/RefreshRateConfigs.h"
 #include "StartPropertySetThread.h"
 #include "SurfaceFlinger.h"
-#include "SurfaceFlingerFactory.h"
+#include "SurfaceFlingerDefaultFactory.h"
 #include "SurfaceInterceptor.h"
 #include "TestableScheduler.h"
-#include "TimeStats/TimeStats.h"
 
 namespace android {
 
@@ -63,23 +63,19 @@ public:
     ~Factory() = default;
 
     std::unique_ptr<DispSync> createDispSync(const char*, bool) override {
-        // TODO: Use test-fixture controlled factory
         return nullptr;
     }
 
     std::unique_ptr<EventControlThread> createEventControlThread(
             std::function<void(bool)>) override {
-        // TODO: Use test-fixture controlled factory
         return nullptr;
     }
 
     std::unique_ptr<HWComposer> createHWComposer(const std::string&) override {
-        // TODO: Use test-fixture controlled factory
         return nullptr;
     }
 
     std::unique_ptr<MessageQueue> createMessageQueue() override {
-        // TODO: Use test-fixture controlled factory
         return std::make_unique<android::impl::MessageQueue>();
     }
 
@@ -88,38 +84,49 @@ public:
     }
 
     std::unique_ptr<Scheduler> createScheduler(std::function<void(bool)>,
-                                               const scheduler::RefreshRateConfigs&) override {
-        // TODO: Use test-fixture controlled factory
+                                               const scheduler::RefreshRateConfigs&,
+                                               ISchedulerCallback&) override {
         return nullptr;
     }
 
     std::unique_ptr<SurfaceInterceptor> createSurfaceInterceptor(SurfaceFlinger* flinger) override {
-        // TODO: Use test-fixture controlled factory
         return std::make_unique<android::impl::SurfaceInterceptor>(flinger);
     }
 
     sp<StartPropertySetThread> createStartPropertySetThread(bool timestampPropertyValue) override {
-        // TODO: Use test-fixture controlled factory
         return new StartPropertySetThread(timestampPropertyValue);
     }
 
     sp<DisplayDevice> createDisplayDevice(DisplayDeviceCreationArgs&& creationArgs) override {
-        // TODO: Use test-fixture controlled factory
         return new DisplayDevice(std::move(creationArgs));
     }
 
     sp<GraphicBuffer> createGraphicBuffer(uint32_t width, uint32_t height, PixelFormat format,
                                           uint32_t layerCount, uint64_t usage,
                                           std::string requestorName) override {
-        // TODO: Use test-fixture controlled factory
         return new GraphicBuffer(width, height, format, layerCount, usage, requestorName);
     }
 
     void createBufferQueue(sp<IGraphicBufferProducer>* outProducer,
                            sp<IGraphicBufferConsumer>* outConsumer,
                            bool consumerIsSurfaceFlinger) override {
-        if (!mCreateBufferQueue) return;
+        if (!mCreateBufferQueue) {
+            BufferQueue::createBufferQueue(outProducer, outConsumer, consumerIsSurfaceFlinger);
+            return;
+        }
         mCreateBufferQueue(outProducer, outConsumer, consumerIsSurfaceFlinger);
+    }
+
+    sp<IGraphicBufferProducer> createMonitoredProducer(const sp<IGraphicBufferProducer>& producer,
+                                                       const sp<SurfaceFlinger>& flinger,
+                                                       const wp<Layer>& layer) override {
+        return new MonitoredProducer(producer, flinger, layer);
+    }
+
+    sp<BufferLayerConsumer> createBufferLayerConsumer(const sp<IGraphicBufferConsumer>& consumer,
+                                                      renderengine::RenderEngine& renderEngine,
+                                                      uint32_t textureName, Layer* layer) override {
+        return new BufferLayerConsumer(consumer, renderEngine, textureName, layer);
     }
 
     std::unique_ptr<surfaceflinger::NativeWindowSurface> createNativeWindowSurface(
@@ -133,28 +140,19 @@ public:
     }
 
     sp<BufferQueueLayer> createBufferQueueLayer(const LayerCreationArgs&) override {
-        // TODO: Use test-fixture controlled factory
         return nullptr;
     }
 
     sp<BufferStateLayer> createBufferStateLayer(const LayerCreationArgs&) override {
-        // TODO: Use test-fixture controlled factory
         return nullptr;
     }
 
     sp<ColorLayer> createColorLayer(const LayerCreationArgs&) override {
-        // TODO: Use test-fixture controlled factory
         return nullptr;
     }
 
     sp<ContainerLayer> createContainerLayer(const LayerCreationArgs&) override {
-        // TODO: Use test-fixture controlled factory
         return nullptr;
-    }
-
-    std::shared_ptr<TimeStats> createTimeStats() override {
-        // TODO: Use test-fixture controlled factory
-        return std::make_shared<android::impl::TimeStats>();
     }
 
     using CreateBufferQueueFunction =
@@ -177,6 +175,7 @@ public:
 
 class TestableSurfaceFlinger {
 public:
+    SurfaceFlinger* flinger() { return mFlinger.get(); }
     TestableScheduler* scheduler() { return mScheduler; }
 
     // Extend this as needed for accessing SurfaceFlinger private (and public)
@@ -191,19 +190,23 @@ public:
                 std::make_unique<impl::HWComposer>(std::move(composer)));
     }
 
+    void setupTimeStats(const std::shared_ptr<TimeStats>& timeStats) {
+        mFlinger->mCompositionEngine->setTimeStats(timeStats);
+    }
+
     void setupScheduler(std::unique_ptr<DispSync> primaryDispSync,
                         std::unique_ptr<EventControlThread> eventControlThread,
                         std::unique_ptr<EventThread> appEventThread,
                         std::unique_ptr<EventThread> sfEventThread) {
-        std::vector<scheduler::RefreshRateConfigs::InputConfig> configs{{/*hwcId=*/0, 16666667}};
-        mFlinger->mRefreshRateConfigs =
-                std::make_unique<scheduler::RefreshRateConfigs>(/*refreshRateSwitching=*/false,
-                                                                configs, /*currentConfig=*/0);
-        mFlinger->mRefreshRateStats =
-                std::make_unique<scheduler::RefreshRateStats>(*mFlinger->mRefreshRateConfigs,
-                                                              *mFlinger->mTimeStats,
-                                                              /*currentConfig=*/0,
-                                                              /*powerMode=*/HWC_POWER_MODE_OFF);
+        std::vector<scheduler::RefreshRateConfigs::InputConfig> configs{
+                {{HwcConfigIndexType(0), HwcConfigGroupType(0), 16666667}}};
+        mFlinger->mRefreshRateConfigs = std::make_unique<
+                scheduler::RefreshRateConfigs>(/*refreshRateSwitching=*/false, configs,
+                                               /*currentConfig=*/HwcConfigIndexType(0));
+        mFlinger->mRefreshRateStats = std::make_unique<
+                scheduler::RefreshRateStats>(*mFlinger->mRefreshRateConfigs, *mFlinger->mTimeStats,
+                                             /*currentConfig=*/HwcConfigIndexType(0),
+                                             /*powerMode=*/HWC_POWER_MODE_OFF);
 
         mScheduler =
                 new TestableScheduler(std::move(primaryDispSync), std::move(eventControlThread),
@@ -211,12 +214,14 @@ public:
 
         mFlinger->mAppConnectionHandle = mScheduler->createConnection(std::move(appEventThread));
         mFlinger->mSfConnectionHandle = mScheduler->createConnection(std::move(sfEventThread));
+        resetScheduler(mScheduler);
 
-        mFlinger->mScheduler.reset(mScheduler);
         mFlinger->mVSyncModulator.emplace(*mScheduler, mFlinger->mAppConnectionHandle,
                                           mFlinger->mSfConnectionHandle,
                                           mFlinger->mPhaseOffsets->getCurrentOffsets());
     }
+
+    void resetScheduler(Scheduler* scheduler) { mFlinger->mScheduler.reset(scheduler); }
 
     using CreateBufferQueueFunction = surfaceflinger::test::Factory::CreateBufferQueueFunction;
     void setCreateBufferQueueFunction(CreateBufferQueueFunction f) {
@@ -238,10 +243,12 @@ public:
     auto& mutableLayerCurrentState(sp<Layer> layer) { return layer->mCurrentState; }
     auto& mutableLayerDrawingState(sp<Layer> layer) { return layer->mDrawingState; }
 
+    auto& mutableStateLock() { return mFlinger->mStateLock; }
+
     void setLayerSidebandStream(sp<Layer> layer, sp<NativeHandle> sidebandStream) {
         layer->mDrawingState.sidebandStream = sidebandStream;
         layer->mSidebandStream = sidebandStream;
-        layer->getCompositionLayer()->editState().frontEnd.sidebandStream = sidebandStream;
+        layer->getCompositionLayer()->editFEState().sidebandStream = sidebandStream;
     }
 
     void setLayerCompositionType(sp<Layer> layer, HWC2::Composition type) {
@@ -326,6 +333,22 @@ public:
         return mFlinger->SurfaceFlinger::getDisplayNativePrimaries(displayToken, primaries);
     }
 
+    auto& getTransactionQueue() { return mFlinger->mTransactionQueues; }
+
+    auto setTransactionState(const Vector<ComposerState>& states,
+                             const Vector<DisplayState>& displays, uint32_t flags,
+                             const sp<IBinder>& applyToken,
+                             const InputWindowCommands& inputWindowCommands,
+                             int64_t desiredPresentTime, const client_cache_t& uncacheBuffer,
+                             bool hasListenerCallbacks,
+                             std::vector<ListenerCallbacks>& listenerCallbacks) {
+        return mFlinger->setTransactionState(states, displays, flags, applyToken,
+                                             inputWindowCommands, desiredPresentTime, uncacheBuffer,
+                                             hasListenerCallbacks, listenerCallbacks);
+    }
+
+    auto flushTransactionQueues() { return mFlinger->flushTransactionQueues(); };
+
     /* ------------------------------------------------------------------------
      * Read-only access to private data to assert post-conditions.
      */
@@ -362,12 +385,18 @@ public:
     auto& mutableTransactionFlags() { return mFlinger->mTransactionFlags; }
     auto& mutableUseHwcVirtualDisplays() { return mFlinger->mUseHwcVirtualDisplays; }
     auto& mutablePowerAdvisor() { return mFlinger->mPowerAdvisor; }
+    auto& mutableDebugDisableHWC() { return mFlinger->mDebugDisableHWC; }
 
     auto& mutableComposerSequenceId() { return mFlinger->getBE().mComposerSequenceId; }
     auto& mutableHwcDisplayData() { return getHwComposer().mDisplayData; }
     auto& mutableHwcPhysicalDisplayIdMap() { return getHwComposer().mPhysicalDisplayIdMap; }
     auto& mutableInternalHwcDisplayId() { return getHwComposer().mInternalHwcDisplayId; }
     auto& mutableExternalHwcDisplayId() { return getHwComposer().mExternalHwcDisplayId; }
+
+    auto fromHandle(const sp<IBinder>& handle) {
+        Mutex::Autolock _l(mFlinger->mStateLock);
+        return mFlinger->fromHandle(handle);
+    }
 
     ~TestableSurfaceFlinger() {
         // All these pointer and container clears help ensure that GMock does
@@ -410,6 +439,7 @@ public:
         static constexpr int32_t DEFAULT_WIDTH = 1920;
         static constexpr int32_t DEFAULT_HEIGHT = 1280;
         static constexpr int32_t DEFAULT_REFRESH_RATE = 16'666'666;
+        static constexpr int32_t DEFAULT_CONFIG_GROUP = 7;
         static constexpr int32_t DEFAULT_DPI = 320;
         static constexpr int32_t DEFAULT_ACTIVE_CONFIG = 0;
         static constexpr int32_t DEFAULT_POWER_MODE = 2;
@@ -433,7 +463,7 @@ public:
             return *this;
         }
 
-        auto& setRefreshRate(int32_t refreshRate) {
+        auto& setRefreshRate(uint32_t refreshRate) {
             mRefreshRate = refreshRate;
             return *this;
         }
@@ -480,6 +510,7 @@ public:
             config.setVsyncPeriod(mRefreshRate);
             config.setDpiX(mDpiX);
             config.setDpiY(mDpiY);
+            config.setConfigGroup(mConfigGroup);
             display->mutableConfigs().emplace(mActiveConfig, config.build());
             display->mutableIsConnected() = true;
             display->setPowerMode(static_cast<HWC2::PowerMode>(mPowerMode));
@@ -503,8 +534,9 @@ public:
         hwc2_display_t mHwcDisplayId = DEFAULT_HWC_DISPLAY_ID;
         int32_t mWidth = DEFAULT_WIDTH;
         int32_t mHeight = DEFAULT_HEIGHT;
-        int32_t mRefreshRate = DEFAULT_REFRESH_RATE;
+        uint32_t mRefreshRate = DEFAULT_REFRESH_RATE;
         int32_t mDpiX = DEFAULT_DPI;
+        int32_t mConfigGroup = DEFAULT_CONFIG_GROUP;
         int32_t mDpiY = DEFAULT_DPI;
         int32_t mActiveConfig = DEFAULT_ACTIVE_CONFIG;
         int32_t mPowerMode = DEFAULT_POWER_MODE;

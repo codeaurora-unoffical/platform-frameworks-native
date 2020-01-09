@@ -19,18 +19,16 @@
 #define LOG_TAG "BufferStateLayer"
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
+#include "BufferStateLayer.h"
+
 #include <limits>
 
-#include <compositionengine/Display.h>
 #include <compositionengine/Layer.h>
-#include <compositionengine/OutputLayer.h>
-#include <compositionengine/impl/LayerCompositionState.h>
-#include <compositionengine/impl/OutputLayerCompositionState.h>
+#include <compositionengine/LayerFECompositionState.h>
 #include <gui/BufferQueue.h>
 #include <private/gui/SyncFeatures.h>
 #include <renderengine/Image.h>
 
-#include "BufferStateLayer.h"
 #include "ColorLayer.h"
 #include "FrameTracer/FrameTracer.h"
 #include "TimeStats/TimeStats.h"
@@ -50,10 +48,17 @@ BufferStateLayer::BufferStateLayer(const LayerCreationArgs& args)
       : BufferLayer(args), mHwcSlotGenerator(new HwcSlotGenerator()) {
     mOverrideScalingMode = NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW;
     mCurrentState.dataspace = ui::Dataspace::V0_SRGB;
+    if (const auto display = args.displayDevice) {
+        updateTransformHint(display);
+    }
 }
 
 BufferStateLayer::~BufferStateLayer() {
-    if (mBufferInfo.mBuffer != nullptr) {
+    // The original layer and the clone layer share the same texture and buffer. Therefore, only
+    // one of the layers, in this case the original layer, needs to handle the deletion. The
+    // original layer and the clone should be removed at the same time so there shouldn't be any
+    // issue with the clone layer trying to use the texture.
+    if (mBufferInfo.mBuffer != nullptr && !isClone()) {
         // Ensure that mBuffer is uncached from RenderEngine here, as
         // RenderEngine may have been using the buffer as an external texture
         // after the client uncached the buffer.
@@ -98,12 +103,15 @@ void BufferStateLayer::onLayerDisplayed(const sp<Fence>& releaseFence) {
     }
 }
 
-void BufferStateLayer::setTransformHint(uint32_t /*orientation*/) const {
-    // TODO(marissaw): send the transform hint to buffer owner
-    return;
+void BufferStateLayer::setTransformHint(uint32_t orientation) const {
+    mTransformHint = orientation;
 }
 
 void BufferStateLayer::releasePendingBuffer(nsecs_t /*dequeueReadyTime*/) {
+    for (const auto& handle : mDrawingState.callbackHandles) {
+        handle->transformHint = mTransformHint;
+    }
+
     mFlinger->getTransactionCompletedThread().finalizePendingCallbackHandles(
             mDrawingState.callbackHandles);
 
@@ -120,9 +128,10 @@ bool BufferStateLayer::shouldPresentNow(nsecs_t /*expectedPresentTime*/) const {
 
 bool BufferStateLayer::willPresentCurrentTransaction() const {
     // Returns true if the most recent Transaction applied to CurrentState will be presented.
-    return getSidebandStreamChanged() || getAutoRefresh() ||
+    return (getSidebandStreamChanged() || getAutoRefresh() ||
             (mCurrentState.modified &&
-             (mCurrentState.buffer != nullptr || mCurrentState.bgColorLayer != nullptr));
+             (mCurrentState.buffer != nullptr || mCurrentState.bgColorLayer != nullptr))) &&
+        !mLayerDetached;
 }
 
 void BufferStateLayer::pushPendingState() {
@@ -130,7 +139,7 @@ void BufferStateLayer::pushPendingState() {
         return;
     }
     mPendingStates.push_back(mCurrentState);
-    ATRACE_INT(mTransactionName.string(), mPendingStates.size());
+    ATRACE_INT(mTransactionName.c_str(), mPendingStates.size());
 }
 
 bool BufferStateLayer::applyPendingStates(Layer::State* stateToCommit) {
@@ -231,18 +240,14 @@ bool BufferStateLayer::setBuffer(const sp<GraphicBuffer>& buffer, nsecs_t postTi
     mCurrentState.modified = true;
     setTransactionFlags(eTransactionNeeded);
 
-    const int32_t layerID = getSequence();
-    mFlinger->mTimeStats->setPostTime(layerID, mFrameNumber, getName().c_str(), postTime);
-    mFlinger->mFrameTracer->traceNewLayer(layerID, getName().c_str());
-    mFlinger->mFrameTracer->traceTimestamp(layerID, buffer->getId(), mFrameNumber, postTime,
+    const int32_t layerId = getSequence();
+    mFlinger->mTimeStats->setPostTime(layerId, mFrameNumber, getName().c_str(), postTime);
+    mFlinger->mFrameTracer->traceNewLayer(layerId, getName().c_str());
+    mFlinger->mFrameTracer->traceTimestamp(layerId, buffer->getId(), mFrameNumber, postTime,
                                            FrameTracer::FrameEvent::POST);
     mCurrentState.desiredPresentTime = desiredPresentTime;
 
-    if (mFlinger->mUseSmart90ForVideo) {
-        const nsecs_t presentTime = (desiredPresentTime == -1) ? 0 : desiredPresentTime;
-        mFlinger->mScheduler->addLayerPresentTimeAndHDR(mSchedulerLayerHandle, presentTime,
-                                                        mCurrentState.hdrMetadata.validTypes != 0);
-    }
+    mFlinger->mScheduler->recordLayerHistory(this, desiredPresentTime);
 
     return true;
 }
@@ -415,7 +420,7 @@ bool BufferStateLayer::latchSidebandStream(bool& recomputeVisibleRegions) {
         // mSidebandStreamChanged was true
         LOG_ALWAYS_FATAL_IF(!getCompositionLayer());
         mSidebandStream = s.sidebandStream;
-        getCompositionLayer()->editState().frontEnd.sidebandStream = mSidebandStream;
+        getCompositionLayer()->editFEState().sidebandStream = mSidebandStream;
         if (mSidebandStream != nullptr) {
             setTransactionFlags(eTransactionNeeded);
             mFlinger->setTransactionFlags(eTraversalNeeded);
@@ -452,7 +457,7 @@ status_t BufferStateLayer::updateTexImage(bool& /*recomputeVisibleRegions*/, nse
         return NO_ERROR;
     }
 
-    const int32_t layerID = getSequence();
+    const int32_t layerId = getSequence();
 
     // Reject if the layer is invalid
     uint32_t bufferWidth = s.buffer->width;
@@ -473,8 +478,8 @@ status_t BufferStateLayer::updateTexImage(bool& /*recomputeVisibleRegions*/, nse
         (s.active.w != bufferWidth || s.active.h != bufferHeight)) {
         ALOGE("[%s] rejecting buffer: "
               "bufferWidth=%d, bufferHeight=%d, front.active.{w=%d, h=%d}",
-              mName.string(), bufferWidth, bufferHeight, s.active.w, s.active.h);
-        mFlinger->mTimeStats->removeTimeRecord(layerID, mFrameNumber);
+              getDebugName(), bufferWidth, bufferHeight, s.active.w, s.active.h);
+        mFlinger->mTimeStats->removeTimeRecord(layerId, mFrameNumber);
         return BAD_VALUE;
     }
 
@@ -491,18 +496,18 @@ status_t BufferStateLayer::updateTexImage(bool& /*recomputeVisibleRegions*/, nse
         // a GL-composited layer) not at all.
         status_t err = bindTextureImage();
         if (err != NO_ERROR) {
-            mFlinger->mTimeStats->onDestroy(layerID);
-            mFlinger->mFrameTracer->onDestroy(layerID);
+            mFlinger->mTimeStats->onDestroy(layerId);
+            mFlinger->mFrameTracer->onDestroy(layerId);
             return BAD_VALUE;
         }
     }
 
     const uint64_t bufferID = getCurrentBufferId();
-    mFlinger->mTimeStats->setAcquireFence(layerID, mFrameNumber, mBufferInfo.mFenceTime);
-    mFlinger->mFrameTracer->traceFence(layerID, bufferID, mFrameNumber, mBufferInfo.mFenceTime,
+    mFlinger->mTimeStats->setAcquireFence(layerId, mFrameNumber, mBufferInfo.mFenceTime);
+    mFlinger->mFrameTracer->traceFence(layerId, bufferID, mFrameNumber, mBufferInfo.mFenceTime,
                                        FrameTracer::FrameEvent::ACQUIRE_FENCE);
-    mFlinger->mTimeStats->setLatchTime(layerID, mFrameNumber, latchTime);
-    mFlinger->mFrameTracer->traceTimestamp(layerID, bufferID, mFrameNumber, latchTime,
+    mFlinger->mTimeStats->setLatchTime(layerId, mFrameNumber, latchTime);
+    mFlinger->mFrameTracer->traceTimestamp(layerId, bufferID, mFrameNumber, latchTime,
                                            FrameTracer::FrameEvent::LATCH);
 
     mCurrentStateModified = false;
@@ -520,7 +525,7 @@ status_t BufferStateLayer::updateActiveBuffer() {
     mPreviousBufferId = getCurrentBufferId();
     mBufferInfo.mBuffer = s.buffer;
     mBufferInfo.mFence = s.acquireFence;
-    auto& layerCompositionState = getCompositionLayer()->editState().frontEnd;
+    auto& layerCompositionState = getCompositionLayer()->editFEState();
     layerCompositionState.buffer = mBufferInfo.mBuffer;
 
     return NO_ERROR;
@@ -545,14 +550,6 @@ void BufferStateLayer::latchPerFrameState(
     compositionState.acquireFence = mBufferInfo.mFence;
 
     mFrameNumber++;
-}
-
-void BufferStateLayer::onFirstRef() {
-    BufferLayer::onFirstRef();
-
-    if (const auto display = mFlinger->getDefaultDisplayDevice()) {
-        updateTransformHint(display);
-    }
 }
 
 void BufferStateLayer::HwcSlotGenerator::bufferErased(const client_cache_t& clientCacheId) {
@@ -670,4 +667,12 @@ Rect BufferStateLayer::computeCrop(const State& s) {
     return s.crop;
 }
 
+sp<Layer> BufferStateLayer::createClone() {
+    LayerCreationArgs args(mFlinger.get(), nullptr, mName + " (Mirror)", 0, 0, 0, LayerMetadata());
+    args.textureName = mTextureName;
+    sp<BufferStateLayer> layer = mFlinger->getFactory().createBufferStateLayer(args);
+    layer->mHwcSlotGenerator = mHwcSlotGenerator;
+    layer->setInitialValuesForClone(this);
+    return layer;
+}
 } // namespace android

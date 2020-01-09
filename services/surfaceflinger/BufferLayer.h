@@ -78,7 +78,7 @@ public:
 
     bool isHdrY410() const override;
 
-    bool onPostComposition(const std::optional<DisplayId>& displayId,
+    bool onPostComposition(sp<const DisplayDevice> displayDevice,
                            const std::shared_ptr<FenceTime>& glDoneFence,
                            const std::shared_ptr<FenceTime>& presentFence,
                            const CompositorTiming& compositorTiming) override;
@@ -165,6 +165,8 @@ protected:
 
         sp<GraphicBuffer> mBuffer;
         int mBufferSlot{BufferQueue::INVALID_BUFFER_SLOT};
+
+        bool mFrameLatencyNeeded{false};
     };
 
     BufferInfo mBufferInfo;
@@ -188,12 +190,15 @@ protected:
 
     static bool getOpacityForFormat(uint32_t format);
 
-    // from GLES
+    // from graphics API
     const uint32_t mTextureName;
 
     bool mRefreshPending{false};
 
     ui::Dataspace translateDataspace(ui::Dataspace dataspace);
+    void setInitialValuesForClone(const sp<Layer>& clonedFrom);
+    void updateCloneBufferInfo() override;
+    uint64_t mPreviousFrameNumber = 0;
 
 private:
     // Returns true if this layer requires filtering

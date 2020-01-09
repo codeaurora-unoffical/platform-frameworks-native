@@ -17,15 +17,13 @@
 #undef LOG_TAG
 #define LOG_TAG "BufferQueueLayer"
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
-#include <compositionengine/Display.h>
+#include "BufferQueueLayer.h"
+
 #include <compositionengine/Layer.h>
-#include <compositionengine/OutputLayer.h>
-#include <compositionengine/impl/LayerCompositionState.h>
-#include <compositionengine/impl/OutputLayerCompositionState.h>
+#include <compositionengine/LayerFECompositionState.h>
 #include <gui/BufferQueueConsumer.h>
 #include <system/window.h>
 
-#include "BufferQueueLayer.h"
 #include "LayerRejecter.h"
 #include "SurfaceInterceptor.h"
 
@@ -37,6 +35,7 @@ namespace android {
 BufferQueueLayer::BufferQueueLayer(const LayerCreationArgs& args) : BufferLayer(args) {}
 
 BufferQueueLayer::~BufferQueueLayer() {
+    mContentsChangedListener->abandon();
     mConsumer->abandon();
 }
 
@@ -64,7 +63,7 @@ std::vector<OccupancyTracker::Segment> BufferQueueLayer::getOccupancyHistory(boo
     std::vector<OccupancyTracker::Segment> history;
     status_t result = mConsumer->getOccupancyHistory(forceFlush, &history);
     if (result != NO_ERROR) {
-        ALOGW("[%s] Failed to obtain occupancy history (%d)", mName.string(), result);
+        ALOGW("[%s] Failed to obtain occupancy history (%d)", getDebugName(), result);
         return {};
     }
     return history;
@@ -112,7 +111,7 @@ bool BufferQueueLayer::shouldPresentNow(nsecs_t expectedPresentTime) const {
     ALOGW_IF(!isPlausible,
              "[%s] Timestamp %" PRId64 " seems implausible "
              "relative to expectedPresent %" PRId64,
-             mName.string(), addedTime, expectedPresentTime);
+             getDebugName(), addedTime, expectedPresentTime);
 
     const bool isDue = addedTime < expectedPresentTime;
     return isDue || !isPlausible;
@@ -197,7 +196,7 @@ bool BufferQueueLayer::latchSidebandStream(bool& recomputeVisibleRegions) {
     if (mSidebandStreamChanged.compare_exchange_strong(sidebandStreamChanged, false)) {
         // mSidebandStreamChanged was changed to false
         mSidebandStream = mConsumer->getSidebandStream();
-        auto& layerCompositionState = getCompositionLayer()->editState().frontEnd;
+        auto& layerCompositionState = getCompositionLayer()->editFEState();
         layerCompositionState.sidebandStream = mSidebandStream;
         if (layerCompositionState.sidebandStream != nullptr) {
             setTransactionFlags(eTransactionNeeded);
@@ -225,9 +224,9 @@ status_t BufferQueueLayer::updateTexImage(bool& recomputeVisibleRegions, nsecs_t
     // BufferItem's that weren't actually queued. This can happen in shared
     // buffer mode.
     bool queuedBuffer = false;
-    const int32_t layerID = getSequence();
+    const int32_t layerId = getSequence();
     LayerRejecter r(mDrawingState, getCurrentState(), recomputeVisibleRegions,
-                    getProducerStickyTransform() != 0, mName.string(), mOverrideScalingMode,
+                    getProducerStickyTransform() != 0, mName, mOverrideScalingMode,
                     getTransformToDisplayInverse());
 
     if (isRemovedFromCurrentState()) {
@@ -266,7 +265,7 @@ status_t BufferQueueLayer::updateTexImage(bool& recomputeVisibleRegions, nsecs_t
         if (queuedBuffer) {
             Mutex::Autolock lock(mQueueItemLock);
             mConsumer->mergeSurfaceDamage(mQueueItems[0].mSurfaceDamage);
-            mFlinger->mTimeStats->removeTimeRecord(layerID, mQueueItems[0].mFrameNumber);
+            mFlinger->mTimeStats->removeTimeRecord(layerId, mQueueItems[0].mFrameNumber);
             mQueueItems.removeAt(0);
             mQueuedFrames--;
         }
@@ -280,8 +279,8 @@ status_t BufferQueueLayer::updateTexImage(bool& recomputeVisibleRegions, nsecs_t
             Mutex::Autolock lock(mQueueItemLock);
             mQueueItems.clear();
             mQueuedFrames = 0;
-            mFlinger->mTimeStats->onDestroy(layerID);
-            mFlinger->mFrameTracer->onDestroy(layerID);
+            mFlinger->mTimeStats->onDestroy(layerId);
+            mFlinger->mFrameTracer->onDestroy(layerId);
         }
 
         // Once we have hit this state, the shadow queue may no longer
@@ -303,19 +302,17 @@ status_t BufferQueueLayer::updateTexImage(bool& recomputeVisibleRegions, nsecs_t
         // updateTexImage
         while (mQueueItems[0].mFrameNumber != currentFrameNumber) {
             mConsumer->mergeSurfaceDamage(mQueueItems[0].mSurfaceDamage);
-            mFlinger->mTimeStats->removeTimeRecord(layerID, mQueueItems[0].mFrameNumber);
+            mFlinger->mTimeStats->removeTimeRecord(layerId, mQueueItems[0].mFrameNumber);
             mQueueItems.removeAt(0);
             mQueuedFrames--;
         }
 
         uint64_t bufferID = mQueueItems[0].mGraphicBuffer->getId();
-        mFlinger->mTimeStats->setAcquireFence(layerID, currentFrameNumber,
-                                              mQueueItems[0].mFenceTime);
-        mFlinger->mFrameTracer->traceFence(layerID, bufferID, currentFrameNumber,
+        mFlinger->mFrameTracer->traceFence(layerId, bufferID, currentFrameNumber,
                                            mQueueItems[0].mFenceTime,
                                            FrameTracer::FrameEvent::ACQUIRE_FENCE);
-        mFlinger->mTimeStats->setLatchTime(layerID, currentFrameNumber, latchTime);
-        mFlinger->mFrameTracer->traceTimestamp(layerID, bufferID, currentFrameNumber, latchTime,
+        mFlinger->mTimeStats->setLatchTime(layerId, currentFrameNumber, latchTime);
+        mFlinger->mFrameTracer->traceTimestamp(layerId, bufferID, currentFrameNumber, latchTime,
                                                FrameTracer::FrameEvent::LATCH);
 
         mQueueItems.removeAt(0);
@@ -335,7 +332,7 @@ status_t BufferQueueLayer::updateActiveBuffer() {
     mPreviousBufferId = getCurrentBufferId();
     mBufferInfo.mBuffer =
             mConsumer->getCurrentBuffer(&mBufferInfo.mBufferSlot, &mBufferInfo.mFence);
-    auto& layerCompositionState = getCompositionLayer()->editState().frontEnd;
+    auto& layerCompositionState = getCompositionLayer()->editFEState();
     layerCompositionState.buffer = mBufferInfo.mBuffer;
 
     if (mBufferInfo.mBuffer == nullptr) {
@@ -374,20 +371,36 @@ void BufferQueueLayer::latchPerFrameState(
 // Interface implementation for BufferLayerConsumer::ContentsChangedListener
 // -----------------------------------------------------------------------
 
+void BufferQueueLayer::onFrameDequeued(const uint64_t bufferId) {
+    const int32_t layerId = getSequence();
+    mFlinger->mFrameTracer->traceNewLayer(layerId, getName().c_str());
+    mFlinger->mFrameTracer->traceTimestamp(layerId, bufferId, FrameTracer::UNSPECIFIED_FRAME_NUMBER,
+                                           systemTime(), FrameTracer::FrameEvent::DEQUEUE);
+}
+
+void BufferQueueLayer::onFrameDetached(const uint64_t bufferId) {
+    const int32_t layerId = getSequence();
+    mFlinger->mFrameTracer->traceNewLayer(layerId, getName().c_str());
+    mFlinger->mFrameTracer->traceTimestamp(layerId, bufferId, FrameTracer::UNSPECIFIED_FRAME_NUMBER,
+                                           systemTime(), FrameTracer::FrameEvent::DETACH);
+}
+
+void BufferQueueLayer::onFrameCancelled(const uint64_t bufferId) {
+    const int32_t layerId = getSequence();
+    mFlinger->mFrameTracer->traceTimestamp(layerId, bufferId, FrameTracer::UNSPECIFIED_FRAME_NUMBER,
+                                           systemTime(), FrameTracer::FrameEvent::CANCEL);
+}
+
 void BufferQueueLayer::onFrameAvailable(const BufferItem& item) {
-    const int32_t layerID = getSequence();
-    mFlinger->mFrameTracer->traceNewLayer(layerID, getName().c_str());
-    mFlinger->mFrameTracer->traceTimestamp(layerID, item.mGraphicBuffer->getId(), item.mFrameNumber,
-                                           systemTime(), FrameTracer::FrameEvent::POST);
+    const int32_t layerId = getSequence();
+    mFlinger->mFrameTracer->traceTimestamp(layerId, item.mGraphicBuffer->getId(), item.mFrameNumber,
+                                           systemTime(), FrameTracer::FrameEvent::QUEUE);
 
     ATRACE_CALL();
     // Add this buffer from our internal queue tracker
     { // Autolock scope
-        if (mFlinger->mUseSmart90ForVideo) {
-            const nsecs_t presentTime = item.mIsAutoTimestamp ? 0 : item.mTimestamp;
-            mFlinger->mScheduler->addLayerPresentTimeAndHDR(mSchedulerLayerHandle, presentTime,
-                                                            item.mHdrMetadata.validTypes != 0);
-        }
+        const nsecs_t presentTime = item.mIsAutoTimestamp ? 0 : item.mTimestamp;
+        mFlinger->mScheduler->recordLayerHistory(this, presentTime);
 
         Mutex::Autolock lock(mQueueItemLock);
         // Reset the frame number tracker when we receive the first buffer after
@@ -400,7 +413,7 @@ void BufferQueueLayer::onFrameAvailable(const BufferItem& item) {
         while (item.mFrameNumber != mLastFrameNumberReceived + 1) {
             status_t result = mQueueItemCondition.waitRelative(mQueueItemLock, ms2ns(500));
             if (result != NO_ERROR) {
-                ALOGE("[%s] Timed out waiting on callback", mName.string());
+                ALOGE("[%s] Timed out waiting on callback", getDebugName());
             }
         }
 
@@ -428,7 +441,7 @@ void BufferQueueLayer::onFrameReplaced(const BufferItem& item) {
         while (item.mFrameNumber != mLastFrameNumberReceived + 1) {
             status_t result = mQueueItemCondition.waitRelative(mQueueItemLock, ms2ns(500));
             if (result != NO_ERROR) {
-                ALOGE("[%s] Timed out waiting on callback", mName.string());
+                ALOGE("[%s] Timed out waiting on callback", getDebugName());
             }
         }
 
@@ -461,24 +474,23 @@ void BufferQueueLayer::onFirstRef() {
     // Creates a custom BufferQueue for SurfaceFlingerConsumer to use
     sp<IGraphicBufferProducer> producer;
     sp<IGraphicBufferConsumer> consumer;
-    BufferQueue::createBufferQueue(&producer, &consumer, true);
-    mProducer = new MonitoredProducer(producer, mFlinger, this);
-    {
-        // Grab the SF state lock during this since it's the only safe way to access RenderEngine
-        Mutex::Autolock lock(mFlinger->mStateLock);
-        mConsumer =
-                new BufferLayerConsumer(consumer, mFlinger->getRenderEngine(), mTextureName, this);
-    }
+    mFlinger->getFactory().createBufferQueue(&producer, &consumer, true);
+    mProducer = mFlinger->getFactory().createMonitoredProducer(producer, mFlinger, this);
+    mConsumer =
+            mFlinger->getFactory().createBufferLayerConsumer(consumer, mFlinger->getRenderEngine(),
+                                                             mTextureName, this);
     mConsumer->setConsumerUsageBits(getEffectiveUsage(0));
-    mConsumer->setContentsChangedListener(this);
-    mConsumer->setName(mName);
+
+    mContentsChangedListener = new ContentsChangedListener(this);
+    mConsumer->setContentsChangedListener(mContentsChangedListener);
+    mConsumer->setName(String8(mName.data(), mName.size()));
 
     // BufferQueueCore::mMaxDequeuedBufferCount is default to 1
     if (!mFlinger->isLayerTripleBufferingDisabled()) {
         mProducer->setMaxDequeuedBufferCount(2);
     }
 
-    if (const auto display = mFlinger->getDefaultDisplayDevice()) {
+    if (const auto display = mFlinger->getDefaultDisplayDeviceLocked()) {
         updateTransformHint(display);
     }
 }
@@ -532,5 +544,67 @@ void BufferQueueLayer::gatherBufferInfo() {
     mBufferInfo.mPixelFormat = mFormat;
     mBufferInfo.mTransformToDisplayInverse = mConsumer->getTransformToDisplayInverse();
 }
+
+sp<Layer> BufferQueueLayer::createClone() {
+    LayerCreationArgs args(mFlinger.get(), nullptr, mName + " (Mirror)", 0, 0, 0, LayerMetadata());
+    args.textureName = mTextureName;
+    sp<BufferQueueLayer> layer = mFlinger->getFactory().createBufferQueueLayer(args);
+    layer->setInitialValuesForClone(this);
+
+    return layer;
+}
+
+// -----------------------------------------------------------------------
+// Interface implementation for BufferLayerConsumer::ContentsChangedListener
+// -----------------------------------------------------------------------
+
+void BufferQueueLayer::ContentsChangedListener::onFrameAvailable(const BufferItem& item) {
+    Mutex::Autolock lock(mMutex);
+    if (mBufferQueueLayer != nullptr) {
+        mBufferQueueLayer->onFrameAvailable(item);
+    }
+}
+
+void BufferQueueLayer::ContentsChangedListener::onFrameReplaced(const BufferItem& item) {
+    Mutex::Autolock lock(mMutex);
+    if (mBufferQueueLayer != nullptr) {
+        mBufferQueueLayer->onFrameReplaced(item);
+    }
+}
+
+void BufferQueueLayer::ContentsChangedListener::onSidebandStreamChanged() {
+    Mutex::Autolock lock(mMutex);
+    if (mBufferQueueLayer != nullptr) {
+        mBufferQueueLayer->onSidebandStreamChanged();
+    }
+}
+
+void BufferQueueLayer::ContentsChangedListener::onFrameDequeued(const uint64_t bufferId) {
+    Mutex::Autolock lock(mMutex);
+    if (mBufferQueueLayer != nullptr) {
+        mBufferQueueLayer->onFrameDequeued(bufferId);
+    }
+}
+
+void BufferQueueLayer::ContentsChangedListener::onFrameDetached(const uint64_t bufferId) {
+    Mutex::Autolock lock(mMutex);
+    if (mBufferQueueLayer != nullptr) {
+        mBufferQueueLayer->onFrameDetached(bufferId);
+    }
+}
+
+void BufferQueueLayer::ContentsChangedListener::onFrameCancelled(const uint64_t bufferId) {
+    Mutex::Autolock lock(mMutex);
+    if (mBufferQueueLayer != nullptr) {
+        mBufferQueueLayer->onFrameCancelled(bufferId);
+    }
+}
+
+void BufferQueueLayer::ContentsChangedListener::abandon() {
+    Mutex::Autolock lock(mMutex);
+    mBufferQueueLayer = nullptr;
+}
+
+// -----------------------------------------------------------------------
 
 } // namespace android

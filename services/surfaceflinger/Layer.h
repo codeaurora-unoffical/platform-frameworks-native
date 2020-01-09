@@ -34,7 +34,6 @@
 #include <ui/Region.h>
 #include <ui/Transform.h>
 #include <utils/RefBase.h>
-#include <utils/String8.h>
 #include <utils/Timers.h>
 
 #include <cstdint>
@@ -79,18 +78,20 @@ class SurfaceInterceptor;
 // ---------------------------------------------------------------------------
 
 struct LayerCreationArgs {
-    LayerCreationArgs(SurfaceFlinger* flinger, const sp<Client>& client, const String8& name,
+    LayerCreationArgs(SurfaceFlinger* flinger, const sp<Client>& client, std::string name,
                       uint32_t w, uint32_t h, uint32_t flags, LayerMetadata metadata);
 
     SurfaceFlinger* flinger;
     const sp<Client>& client;
-    const String8& name;
+    std::string name;
     uint32_t w;
     uint32_t h;
     uint32_t flags;
     LayerMetadata metadata;
     pid_t callingPid;
     uid_t callingUid;
+    sp<const DisplayDevice> displayDevice;
+    uint32_t textureName;
 };
 
 class Layer : public compositionengine::LayerFE {
@@ -170,6 +171,7 @@ public:
 
         // If non-null, a Surface this Surface's Z-order is interpreted relative to.
         wp<Layer> zOrderRelativeOf;
+        bool isRelativeOf{false};
 
         // A list of surfaces whose Z-order is interpreted relative to ours.
         SortedVector<wp<Layer>> zOrderRelatives;
@@ -214,10 +216,18 @@ public:
         std::deque<sp<CallbackHandle>> callbackHandles;
         bool colorSpaceAgnostic;
         nsecs_t desiredPresentTime = -1;
+
+        // Length of the cast shadow. If the radius is > 0, a shadow of length shadowRadius will
+        // be rendered around the layer.
+        float shadowRadius;
     };
 
     explicit Layer(const LayerCreationArgs& args);
     virtual ~Layer();
+
+    void onFirstRef() override;
+
+    int getWindowType() const { return mWindowType; }
 
     void setPrimaryDisplayOnly() { mPrimaryDisplayOnly = true; }
     bool getPrimaryDisplayOnly() const { return mPrimaryDisplayOnly; }
@@ -325,6 +335,7 @@ public:
     };
     virtual bool setBackgroundColor(const half3& color, float alpha, ui::Dataspace dataspace);
     virtual bool setColorSpaceAgnostic(const bool agnostic);
+    bool setShadowRadius(float shadowRadius);
 
     virtual ui::Dataspace getDataSpace() const { return ui::Dataspace::UNKNOWN; }
 
@@ -358,7 +369,7 @@ public:
     FloatRect getBounds() const;
 
     // Compute bounds for the layer and cache the results.
-    void computeBounds(FloatRect parentBounds, ui::Transform parentTransform);
+    void computeBounds(FloatRect parentBounds, ui::Transform parentTransform, float shadowRadius);
 
     // Returns the buffer scale transform if a scaling mode is set.
     ui::Transform getBufferScaleTransform() const;
@@ -465,6 +476,30 @@ public:
     virtual Rect getCrop(const Layer::State& s) const { return s.crop_legacy; }
     virtual bool needsFiltering(const sp<const DisplayDevice>&) const { return false; }
 
+    // This layer is not a clone, but it's the parent to the cloned hierarchy. The
+    // variable mClonedChild represents the top layer that will be cloned so this
+    // layer will be the parent of mClonedChild.
+    // The layers in the cloned hierarchy will match the lifetime of the real layers. That is
+    // if the real layer is destroyed, then the clone layer will also be destroyed.
+    sp<Layer> mClonedChild;
+
+    virtual sp<Layer> createClone() = 0;
+    void updateMirrorInfo();
+    virtual void updateCloneBufferInfo(){};
+
+protected:
+    sp<Layer> getClonedFrom() { return mClonedFrom != nullptr ? mClonedFrom.promote() : nullptr; }
+    bool isClone() { return mClonedFrom != nullptr; }
+    bool isClonedFromAlive() { return getClonedFrom() != nullptr; }
+
+    virtual void setInitialValuesForClone(const sp<Layer>& clonedFrom);
+
+    void updateClonedDrawingState(std::map<sp<Layer>, sp<Layer>>& clonedLayersMap);
+    void updateClonedChildren(const sp<Layer>& mirrorRoot,
+                              std::map<sp<Layer>, sp<Layer>>& clonedLayersMap);
+    void updateClonedRelatives(std::map<sp<Layer>, sp<Layer>> clonedLayersMap);
+    void addChildToDrawing(const sp<Layer>& layer);
+
 public:
     /*
      * compositionengine::LayerFE overrides
@@ -475,6 +510,9 @@ public:
     void latchCursorCompositionState(compositionengine::LayerFECompositionState&) const override;
     std::optional<renderengine::LayerSettings> prepareClientComposition(
             compositionengine::LayerFE::ClientCompositionTargetSettings&) override;
+    std::optional<renderengine::LayerSettings> prepareShadowClientComposition(
+            const renderengine::LayerSettings& layerSettings, const Rect& displayViewport,
+            ui::Dataspace outputDataspace) override;
     void onLayerDisplayed(const sp<Fence>& releaseFence) override;
     const char* getDebugName() const override;
 
@@ -499,7 +537,7 @@ public:
      * called after composition.
      * returns true if the layer latched a new buffer this frame.
      */
-    virtual bool onPostComposition(const std::optional<DisplayId>& /*displayId*/,
+    virtual bool onPostComposition(sp<const DisplayDevice> /*displayDevice*/,
                                    const std::shared_ptr<FenceTime>& /*glDoneFence*/,
                                    const std::shared_ptr<FenceTime>& /*presentFence*/,
                                    const CompositorTiming& /*compositorTiming*/) {
@@ -618,6 +656,8 @@ public:
     // ignored.
     RoundedCornerState getRoundedCornerState() const;
 
+    renderengine::ShadowSettings getShadowSettings(const Rect& viewport) const;
+
     void traverseInReverseZOrder(LayerVector::StateSet stateSet,
                                  const LayerVector::Visitor& visitor);
     void traverseInZOrder(LayerVector::StateSet stateSet, const LayerVector::Visitor& visitor);
@@ -630,6 +670,15 @@ public:
                                   const LayerVector::Visitor& visitor);
 
     size_t getChildrenCount() const;
+
+    // ONLY CALL THIS FROM THE LAYER DTOR!
+    // See b/141111965.  We need to add current children to offscreen layers in
+    // the layer dtor so as not to dangle layers.  Since the layer has not
+    // committed its transaction when the layer is destroyed, we must add
+    // current children.  This is safe in the dtor as we will no longer update
+    // the current state, but should not be called anywhere else!
+    LayerVector& getCurrentChildren() { return mCurrentChildren; }
+
     void addChild(const sp<Layer>& layer);
     // Returns index if removed, or negative value otherwise
     // for symmetry with Vector::remove
@@ -644,7 +693,7 @@ public:
     // Copy the current list of children to the drawing state. Called by
     // SurfaceFlinger to complete a transaction.
     void commitChildList();
-    int32_t getZ() const;
+    int32_t getZ(LayerVector::StateSet stateSet) const;
     virtual void pushPendingState();
 
     /**
@@ -666,6 +715,14 @@ public:
             const sp<const DisplayDevice>& display) const;
 
     Region debugGetVisibleRegionOnDefaultDisplay() const;
+
+    /**
+     * Returns the cropped buffer size or the layer crop if the layer has no buffer. Return
+     * INVALID_RECT if the layer has no buffer and no crop.
+     * A layer with an invalid buffer size and no crop is considered to be boundless. The layer
+     * bounds are constrained by its parent bounds.
+     */
+    Rect getCroppedBufferSize(const Layer::State& s) const;
 
 protected:
     // constant
@@ -777,7 +834,7 @@ public:
     // Creates a new handle each time, so we only expect
     // this to be called once.
     sp<IBinder> getHandle();
-    const String8& getName() const;
+    const std::string& getName() const { return mName; }
     virtual void notifyAvailableFrames(nsecs_t /*expectedPresentTime*/) {}
     virtual PixelFormat getPixelFormat() const { return PIXEL_FORMAT_NONE; }
     bool getPremultipledAlpha() const;
@@ -793,8 +850,8 @@ protected:
     bool usingRelativeZ(LayerVector::StateSet stateSet) const;
 
     bool mPremultipliedAlpha{true};
-    String8 mName;
-    String8 mTransactionName; // A cached version of "TX - " + mName for systraces
+    const std::string mName;
+    const std::string mTransactionName{"TX - " + mName};
 
     bool mPrimaryDisplayOnly = false;
 
@@ -828,7 +885,6 @@ protected:
     // We encode unset as -1.
     int32_t mOverrideScalingMode{-1};
     std::atomic<uint64_t> mCurrentFrameNumber{0};
-    bool mFrameLatencyNeeded{false};
     // Whether filtering is needed b/c of the drawingstate
     bool mNeedsFiltering{false};
 
@@ -861,9 +917,6 @@ protected:
     // Window types from WindowManager.LayoutParams
     const int mWindowType;
 
-    // This is populated if the layer is registered with Scheduler for tracking purposes.
-    std::unique_ptr<scheduler::LayerHistory::LayerHandle> mSchedulerLayerHandle;
-
 private:
     /**
      * Returns an unsorted vector of all layers that are part of this tree.
@@ -879,13 +932,6 @@ private:
                                        const LayerVector::Visitor& visitor);
     LayerVector makeChildrenTraversalList(LayerVector::StateSet stateSet,
                                           const std::vector<Layer*>& layersInTree);
-    /**
-     * Returns the cropped buffer size or the layer crop if the layer has no buffer. Return
-     * INVALID_RECT if the layer has no buffer and no crop.
-     * A layer with an invalid buffer size and no crop is considered to be boundless. The layer
-     * bounds are constrained by its parent bounds.
-     */
-    Rect getCroppedBufferSize(const Layer::State& s) const;
 
     // Cached properties computed from drawing state
     // Effective transform taking into account parent transforms and any parent scaling.
@@ -912,6 +958,20 @@ private:
     // to help debugging.
     pid_t mCallingPid;
     uid_t mCallingUid;
+
+    // The current layer is a clone of mClonedFrom. This means that this layer will update it's
+    // properties based on mClonedFrom. When mClonedFrom latches a new buffer for BufferLayers,
+    // this layer will update it's buffer. When mClonedFrom updates it's drawing state, children,
+    // and relatives, this layer will update as well.
+    wp<Layer> mClonedFrom;
+
+    // The inherited shadow radius after taking into account the layer hierarchy. This is the
+    // final shadow radius for this layer. If a shadow is specified for a layer, then effective
+    // shadow radius is the set shadow radius, otherwise its the parent's shadow radius.
+    float mEffectiveShadowRadius = 0.f;
+
+    // Returns true if the layer can draw shadows on its border.
+    virtual bool canDrawShadows() const { return true; }
 };
 
 } // namespace android

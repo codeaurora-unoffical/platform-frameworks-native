@@ -63,6 +63,7 @@ public:
     }
     Rect getCrop(const Layer::State& s) const;
 
+    uint32_t getTransformHint() const { return mTransformHint; }
     bool setTransform(uint32_t transform) override;
     bool setTransformToDisplayInverse(bool transformToDisplayInverse) override;
     bool setCrop(const Rect& crop) override;
@@ -124,13 +125,13 @@ private:
     status_t updateFrameNumber(nsecs_t latchTime) override;
 
     void latchPerFrameState(compositionengine::LayerFECompositionState&) const override;
+    sp<Layer> createClone() override;
 
     // Crop that applies to the buffer
     Rect computeCrop(const State& s);
 
 private:
     friend class SlotGenerationTest;
-    void onFirstRef() override;
     bool willPresentCurrentTransaction() const;
 
     static const std::array<float, 16> IDENTITY_MATRIX;
@@ -143,12 +144,13 @@ private:
 
     sp<Fence> mPreviousReleaseFence;
     uint64_t mPreviousBufferId = 0;
-    uint64_t mPreviousFrameNumber = 0;
     uint64_t mPreviousReleasedFrameNumber = 0;
 
     mutable bool mCurrentStateModified = false;
     bool mReleasePreviousBuffer = false;
     nsecs_t mCallbackHandleAcquireTime = -1;
+
+    mutable uint32_t mTransformHint = 0;
 
     // TODO(marissaw): support sticky transform for LEGACY camera mode
 
