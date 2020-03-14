@@ -27,7 +27,6 @@
 #include <compositionengine/Layer.h>
 #include <compositionengine/LayerFECompositionState.h>
 #include <compositionengine/OutputLayer.h>
-#include <compositionengine/impl/LayerCompositionState.h>
 #include <compositionengine/impl/OutputLayerCompositionState.h>
 #include <cutils/compiler.h>
 #include <cutils/native_handle.h>
@@ -84,8 +83,6 @@ Layer::Layer(const LayerCreationArgs& args)
     if (args.flags & ISurfaceComposerClient::eOpaque) layerFlags |= layer_state_t::eLayerOpaque;
     if (args.flags & ISurfaceComposerClient::eSecure) layerFlags |= layer_state_t::eLayerSecure;
 
-    mTransactionName = String8("TX - ") + mName;
-
     mCurrentState.active_legacy.w = args.w;
     mCurrentState.active_legacy.h = args.h;
     mCurrentState.flags = layerFlags;
@@ -112,6 +109,7 @@ Layer::Layer(const LayerCreationArgs& args)
     mCurrentState.hasColorTransform = false;
     mCurrentState.colorSpaceAgnostic = false;
     mCurrentState.metadata = args.metadata;
+    mCurrentState.shadowRadius = 0.f;
 
     // drawing state & current state are identical
     mDrawingState = mCurrentState;
@@ -121,10 +119,12 @@ Layer::Layer(const LayerCreationArgs& args)
     mFrameEventHistory.initializeCompositorTiming(compositorTiming);
     mFrameTracker.setDisplayRefreshPeriod(compositorTiming.interval);
 
-    mSchedulerLayerHandle = mFlinger->mScheduler->registerLayer(mName.c_str(), mWindowType);
     mCallingPid = args.callingPid;
     mCallingUid = args.callingUid;
-    mFlinger->onLayerCreated();
+}
+
+void Layer::onFirstRef() {
+    mFlinger->onLayerFirstRef(this);
 }
 
 Layer::~Layer() {
@@ -138,11 +138,11 @@ Layer::~Layer() {
 }
 
 LayerCreationArgs::LayerCreationArgs(SurfaceFlinger* flinger, const sp<Client>& client,
-                                     const String8& name, uint32_t w, uint32_t h, uint32_t flags,
+                                     std::string name, uint32_t w, uint32_t h, uint32_t flags,
                                      LayerMetadata metadata)
       : flinger(flinger),
         client(client),
-        name(name),
+        name(std::move(name)),
         w(w),
         h(h),
         flags(flags),
@@ -235,10 +235,6 @@ void Layer::addToCurrentState() {
 // ---------------------------------------------------------------------------
 // set-up
 // ---------------------------------------------------------------------------
-
-const String8& Layer::getName() const {
-    return mName;
-}
 
 bool Layer::getPremultipledAlpha() const {
     return mPremultipliedAlpha;
@@ -347,7 +343,8 @@ FloatRect Layer::getBoundsPreScaling(const ui::Transform& bufferScaleTransform) 
     return bufferScaleTransform.inverse().transform(mBounds);
 }
 
-void Layer::computeBounds(FloatRect parentBounds, ui::Transform parentTransform) {
+void Layer::computeBounds(FloatRect parentBounds, ui::Transform parentTransform,
+                          float parentShadowRadius) {
     const State& s(getDrawingState());
 
     // Calculate effective layer transform
@@ -370,11 +367,23 @@ void Layer::computeBounds(FloatRect parentBounds, ui::Transform parentTransform)
     mBounds = bounds;
     mScreenBounds = mEffectiveTransform.transform(mBounds);
 
+    // Use the layer's own shadow radius if set. Otherwise get the radius from
+    // parent.
+    if (s.shadowRadius > 0.f) {
+        mEffectiveShadowRadius = s.shadowRadius;
+    } else {
+        mEffectiveShadowRadius = parentShadowRadius;
+    }
+
+    // Shadow radius is passed down to only one layer so if the layer can draw shadows,
+    // don't pass it to its children.
+    const float childShadowRadius = canDrawShadows() ? 0.f : mEffectiveShadowRadius;
+
     // Add any buffer scaling to the layer's children.
     ui::Transform bufferScaleTransform = getBufferScaleTransform();
     for (const sp<Layer>& child : mDrawingChildren) {
         child->computeBounds(getBoundsPreScaling(bufferScaleTransform),
-                             getTransformWithScale(bufferScaleTransform));
+                             getTransformWithScale(bufferScaleTransform), childShadowRadius);
     }
 }
 
@@ -474,11 +483,13 @@ void Layer::latchPerFrameState(compositionengine::LayerFECompositionState& compo
     compositionState.hasProtectedContent = isProtected();
 
     const bool usesRoundedCorners = getRoundedCornerState().radius != 0.f;
+    const bool drawsShadows = mEffectiveShadowRadius != 0.f;
+
     compositionState.isOpaque =
             isOpaque(drawingState) && !usesRoundedCorners && getAlpha() == 1.0_hf;
 
     // Force client composition for special cases known only to the front-end.
-    if (isHdrY410() || usesRoundedCorners) {
+    if (isHdrY410() || usesRoundedCorners || drawsShadows) {
         compositionState.forceClientComposition = true;
     }
 }
@@ -524,7 +535,7 @@ void Layer::latchCompositionState(compositionengine::LayerFECompositionState& co
 }
 
 const char* Layer::getDebugName() const {
-    return mName.string();
+    return mName.c_str();
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +569,53 @@ std::optional<renderengine::LayerSettings> Layer::prepareClientComposition(
     layerSettings.alpha = alpha;
     layerSettings.sourceDataspace = getDataSpace();
     return layerSettings;
+}
+
+std::optional<renderengine::LayerSettings> Layer::prepareShadowClientComposition(
+        const renderengine::LayerSettings& casterLayerSettings, const Rect& displayViewport,
+        ui::Dataspace outputDataspace) {
+    renderengine::ShadowSettings shadow = getShadowSettings(displayViewport);
+    if (shadow.length <= 0.f) {
+        return {};
+    }
+
+    const float casterAlpha = casterLayerSettings.alpha;
+    const bool casterIsOpaque = ((casterLayerSettings.source.buffer.buffer != nullptr) &&
+                                 casterLayerSettings.source.buffer.isOpaque);
+
+    renderengine::LayerSettings shadowLayer = casterLayerSettings;
+    shadowLayer.shadow = shadow;
+
+    // If the casting layer is translucent, we need to fill in the shadow underneath the layer.
+    // Otherwise the generated shadow will only be shown around the casting layer.
+    shadowLayer.shadow.casterIsTranslucent = !casterIsOpaque || (casterAlpha < 1.0f);
+    shadowLayer.shadow.ambientColor *= casterAlpha;
+    shadowLayer.shadow.spotColor *= casterAlpha;
+    shadowLayer.sourceDataspace = outputDataspace;
+    shadowLayer.source.buffer.buffer = nullptr;
+
+    if (shadowLayer.shadow.ambientColor.a <= 0.f && shadowLayer.shadow.spotColor.a <= 0.f) {
+        return {};
+    }
+
+    float casterCornerRadius = shadowLayer.geometry.roundedCornersRadius;
+    const FloatRect& cornerRadiusCropRect = casterLayerSettings.geometry.roundedCornersCrop;
+    const FloatRect& casterRect = shadowLayer.geometry.boundaries;
+
+    // crop used to set the corner radius may be larger than the content rect. Adjust the corner
+    // radius accordingly.
+    if (casterCornerRadius > 0.f) {
+        float cropRectOffset = std::max(std::abs(cornerRadiusCropRect.top - casterRect.top),
+                                        std::abs(cornerRadiusCropRect.left - casterRect.left));
+        if (cropRectOffset > casterCornerRadius) {
+            casterCornerRadius = 0;
+        } else {
+            casterCornerRadius -= cropRectOffset;
+        }
+        shadowLayer.geometry.roundedCornersRadius = casterCornerRadius;
+    }
+
+    return shadowLayer;
 }
 
 Hwc2::IComposerClient::Composition Layer::getCompositionType(
@@ -615,7 +673,7 @@ void Layer::pushPendingState() {
     if (mCurrentState.barrierLayer_legacy != nullptr && !isRemovedFromCurrentState()) {
         sp<Layer> barrierLayer = mCurrentState.barrierLayer_legacy.promote();
         if (barrierLayer == nullptr) {
-            ALOGE("[%s] Unable to promote barrier Layer.", mName.string());
+            ALOGE("[%s] Unable to promote barrier Layer.", getDebugName());
             // If we can't promote the layer we are intended to wait on,
             // then it is expired or otherwise invalid. Allow this transaction
             // to be applied as per normal (no synchronization).
@@ -639,7 +697,7 @@ void Layer::pushPendingState() {
         mFlinger->setTransactionFlags(eTraversalNeeded);
     }
     mPendingStates.push_back(mCurrentState);
-    ATRACE_INT(mTransactionName.string(), mPendingStates.size());
+    ATRACE_INT(mTransactionName.c_str(), mPendingStates.size());
 }
 
 void Layer::popPendingState(State* stateToCommit) {
@@ -647,7 +705,7 @@ void Layer::popPendingState(State* stateToCommit) {
     *stateToCommit = mPendingStates[0];
 
     mPendingStates.removeAt(0);
-    ATRACE_INT(mTransactionName.string(), mPendingStates.size());
+    ATRACE_INT(mTransactionName.c_str(), mPendingStates.size());
 }
 
 bool Layer::applyPendingStates(State* stateToCommit) {
@@ -658,7 +716,7 @@ bool Layer::applyPendingStates(State* stateToCommit) {
                 // If we don't have a sync point for this, apply it anyway. It
                 // will be visually wrong, but it should keep us from getting
                 // into too much trouble.
-                ALOGE("[%s] No local sync point found", mName.string());
+                ALOGE("[%s] No local sync point found", getDebugName());
                 popPendingState(stateToCommit);
                 stateUpdateAvailable = true;
                 continue;
@@ -666,7 +724,7 @@ bool Layer::applyPendingStates(State* stateToCommit) {
 
             if (mRemoteSyncPoints.front()->getFrameNumber() !=
                 mPendingStates[0].frameNumber_legacy) {
-                ALOGE("[%s] Unexpected sync point frame number found", mName.string());
+                ALOGE("[%s] Unexpected sync point frame number found", getDebugName());
 
                 // Signal our end of the sync point and then dispose of it
                 mRemoteSyncPoints.front()->setTransactionApplied();
@@ -718,7 +776,7 @@ uint32_t Layer::doTransactionResize(uint32_t flags, State* stateToCommit) {
                  "            requested={ wh={%4u,%4u} }}\n"
                  "  drawing={ active   ={ wh={%4u,%4u} crop={%4d,%4d,%4d,%4d} (%4d,%4d) }\n"
                  "            requested={ wh={%4u,%4u} }}\n",
-                 this, getName().string(), getBufferTransform(), getEffectiveScalingMode(),
+                 this, getName().c_str(), getBufferTransform(), getEffectiveScalingMode(),
                  stateToCommit->active_legacy.w, stateToCommit->active_legacy.h,
                  stateToCommit->crop_legacy.left, stateToCommit->crop_legacy.top,
                  stateToCommit->crop_legacy.right, stateToCommit->crop_legacy.bottom,
@@ -781,6 +839,15 @@ uint32_t Layer::doTransaction(uint32_t flags) {
     ATRACE_CALL();
 
     if (mLayerDetached) {
+        // Ensure BLAST buffer callbacks are processed.
+        // detachChildren and mLayerDetached were implemented to avoid geometry updates
+        // to layers in the cases of animation. For BufferQueue layers buffers are still
+        // consumed as normal. This is useful as otherwise the client could get hung
+        // inevitably waiting on a buffer to return. We recreate this semantic for BufferQueue
+        // even though it is a little consistent. detachChildren is shortly slated for removal
+        // by the hierarchy mirroring work so we don't need to worry about it too much.
+        mDrawingState.callbackHandles = mCurrentState.callbackHandles;
+        mCurrentState.callbackHandles = {};
         return flags;
     }
 
@@ -922,6 +989,8 @@ void Layer::setZOrderRelativeOf(const wp<Layer>& relativeOf) {
     mCurrentState.zOrderRelativeOf = relativeOf;
     mCurrentState.sequence++;
     mCurrentState.modified = true;
+    mCurrentState.isRelativeOf = relativeOf != nullptr;
+
     setTransactionFlags(eTransactionNeeded);
 }
 
@@ -989,9 +1058,10 @@ bool Layer::setBackgroundColor(const half3& color, float alpha, ui::Dataspace da
     if (!mCurrentState.bgColorLayer && alpha != 0) {
         // create background color layer if one does not yet exist
         uint32_t flags = ISurfaceComposerClient::eFXSurfaceColor;
-        const String8& name = mName + "BackgroundColorLayer";
-        mCurrentState.bgColorLayer = new ColorLayer(
-                LayerCreationArgs(mFlinger.get(), nullptr, name, 0, 0, flags, LayerMetadata()));
+        std::string name = mName + "BackgroundColorLayer";
+        mCurrentState.bgColorLayer = mFlinger->getFactory().createColorLayer(
+                LayerCreationArgs(mFlinger.get(), nullptr, std::move(name), 0, 0, flags,
+                                  LayerMetadata()));
 
         // add to child list
         addChild(mCurrentState.bgColorLayer);
@@ -1112,6 +1182,18 @@ uint32_t Layer::getLayerStack() const {
     return p->getLayerStack();
 }
 
+bool Layer::setShadowRadius(float shadowRadius) {
+    if (mCurrentState.shadowRadius == shadowRadius) {
+        return false;
+    }
+
+    mCurrentState.sequence++;
+    mCurrentState.shadowRadius = shadowRadius;
+    mCurrentState.modified = true;
+    setTransactionFlags(eTransactionNeeded);
+    return true;
+}
+
 void Layer::deferTransactionUntil_legacy(const sp<Layer>& barrierLayer, uint64_t frameNumber) {
     ATRACE_CALL();
     mCurrentState.barrierLayer_legacy = barrierLayer;
@@ -1186,11 +1268,13 @@ void Layer::updateTransformHint(const sp<const DisplayDevice>& display) const {
 
 // TODO(marissaw): add new layer state info to layer debugging
 LayerDebugInfo Layer::getLayerDebugInfo() const {
+    using namespace std::string_literals;
+
     LayerDebugInfo info;
     const State& ds = getDrawingState();
     info.mName = getName();
     sp<Layer> parent = getParent();
-    info.mParentName = (parent == nullptr ? std::string("none") : parent->getName().string());
+    info.mParentName = parent ? parent->getName() : "none"s;
     info.mType = getType();
     info.mTransparentRegion = ds.activeTransparentRegion_legacy;
 
@@ -1257,12 +1341,12 @@ void Layer::miniDump(std::string& result, const sp<DisplayDevice>& displayDevice
     std::string name;
     if (mName.length() > 77) {
         std::string shortened;
-        shortened.append(mName.string(), 36);
+        shortened.append(mName, 0, 36);
         shortened.append("[...]");
-        shortened.append(mName.string() + (mName.length() - 36), 36);
-        name = shortened;
+        shortened.append(mName, mName.length() - 36);
+        name = std::move(shortened);
     } else {
-        name = std::string(mName.string(), mName.size());
+        name = mName;
     }
 
     StringAppendF(&result, " %s\n", name.c_str());
@@ -1309,23 +1393,23 @@ void Layer::getFrameStats(FrameStats* outStats) const {
 }
 
 void Layer::dumpFrameEvents(std::string& result) {
-    StringAppendF(&result, "- Layer %s (%s, %p)\n", getName().string(), getType(), this);
+    StringAppendF(&result, "- Layer %s (%s, %p)\n", getName().c_str(), getType(), this);
     Mutex::Autolock lock(mFrameEventHistoryMutex);
     mFrameEventHistory.checkFencesForCompletion();
     mFrameEventHistory.dump(result);
 }
 
 void Layer::dumpCallingUidPid(std::string& result) const {
-    StringAppendF(&result, "Layer %s (%s) pid:%d uid:%d\n", getName().string(), getType(),
+    StringAppendF(&result, "Layer %s (%s) pid:%d uid:%d\n", getName().c_str(), getType(),
                   mCallingPid, mCallingUid);
 }
 
 void Layer::onDisconnect() {
     Mutex::Autolock lock(mFrameEventHistoryMutex);
     mFrameEventHistory.onDisconnect();
-    const int32_t layerID = getSequence();
-    mFlinger->mTimeStats->onDestroy(layerID);
-    mFlinger->mFrameTracer->onDestroy(layerID);
+    const int32_t layerId = getSequence();
+    mFlinger->mTimeStats->onDestroy(layerId);
+    mFlinger->mFrameTracer->onDestroy(layerId);
 }
 
 void Layer::addAndGetFrameTimestamps(const NewFrameEventsEntry* newTimestamps,
@@ -1333,6 +1417,8 @@ void Layer::addAndGetFrameTimestamps(const NewFrameEventsEntry* newTimestamps,
     if (newTimestamps) {
         mFlinger->mTimeStats->setPostTime(getSequence(), newTimestamps->frameNumber,
                                           getName().c_str(), newTimestamps->postedTime);
+        mFlinger->mTimeStats->setAcquireFence(getSequence(), newTimestamps->frameNumber,
+                                              newTimestamps->acquireFence);
     }
 
     Mutex::Autolock lock(mFrameEventHistoryMutex);
@@ -1404,8 +1490,8 @@ void Layer::setChildrenDrawingParent(const sp<Layer>& newParent) {
     for (const sp<Layer>& child : mDrawingChildren) {
         child->mDrawingParent = newParent;
         child->computeBounds(newParent->mBounds,
-                             newParent->getTransformWithScale(
-                                     newParent->getBufferScaleTransform()));
+                             newParent->getTransformWithScale(newParent->getBufferScaleTransform()),
+                             newParent->mEffectiveShadowRadius);
     }
 }
 
@@ -1534,14 +1620,16 @@ void Layer::setParent(const sp<Layer>& layer) {
     mCurrentParent = layer;
 }
 
-int32_t Layer::getZ() const {
-    return mDrawingState.z;
+int32_t Layer::getZ(LayerVector::StateSet stateSet) const {
+    const bool useDrawing = stateSet == LayerVector::StateSet::Drawing;
+    const State& state = useDrawing ? mDrawingState : mCurrentState;
+    return state.z;
 }
 
 bool Layer::usingRelativeZ(LayerVector::StateSet stateSet) const {
     const bool useDrawing = stateSet == LayerVector::StateSet::Drawing;
     const State& state = useDrawing ? mDrawingState : mCurrentState;
-    return state.zOrderRelativeOf != nullptr;
+    return state.isRelativeOf;
 }
 
 __attribute__((no_sanitize("unsigned-integer-overflow"))) LayerVector Layer::makeTraversalList(
@@ -1566,8 +1654,7 @@ __attribute__((no_sanitize("unsigned-integer-overflow"))) LayerVector Layer::mak
     }
 
     for (const sp<Layer>& child : children) {
-        const State& childState = useDrawing ? child->mDrawingState : child->mCurrentState;
-        if (childState.zOrderRelativeOf != nullptr) {
+        if (child->usingRelativeZ(stateSet)) {
             continue;
         }
         traverse.add(child);
@@ -1596,7 +1683,7 @@ void Layer::traverseInZOrder(LayerVector::StateSet stateSet, const LayerVector::
             continue;
         }
 
-        if (relative->getZ() >= 0) {
+        if (relative->getZ(stateSet) >= 0) {
             break;
         }
         relative->traverseInZOrder(stateSet, visitor);
@@ -1630,7 +1717,7 @@ void Layer::traverseInReverseZOrder(LayerVector::StateSet stateSet,
             continue;
         }
 
-        if (relative->getZ() < 0) {
+        if (relative->getZ(stateSet) < 0) {
             break;
         }
         relative->traverseInReverseZOrder(stateSet, visitor);
@@ -1688,7 +1775,7 @@ void Layer::traverseChildrenInZOrderInner(const std::vector<Layer*>& layersInTre
     size_t i = 0;
     for (; i < list.size(); i++) {
         const auto& relative = list[i];
-        if (relative->getZ() >= 0) {
+        if (relative->getZ(stateSet) >= 0) {
             break;
         }
         relative->traverseChildrenInZOrderInner(layersInTree, stateSet, visitor);
@@ -1758,6 +1845,18 @@ Layer::RoundedCornerState Layer::getRoundedCornerState() const {
     return radius > 0 && getCrop(getDrawingState()).isValid()
             ? RoundedCornerState(getCrop(getDrawingState()).toFloatRect(), radius)
             : RoundedCornerState();
+}
+
+renderengine::ShadowSettings Layer::getShadowSettings(const Rect& viewport) const {
+    renderengine::ShadowSettings state = mFlinger->mDrawingState.globalShadowSettings;
+
+    // Shift the spot light x-position to the middle of the display and then
+    // offset it by casting layer's screen pos.
+    state.lightPos.x = (viewport.width() / 2.f) - mScreenBounds.left;
+    state.lightPos.y -= mScreenBounds.top;
+
+    state.length = mEffectiveShadowRadius;
+    return state;
 }
 
 void Layer::commitChildList() {
@@ -2014,6 +2113,127 @@ Region Layer::debugGetVisibleRegionOnDefaultDisplay() const {
     }
 
     return outputLayer->getState().visibleRegion;
+}
+
+void Layer::setInitialValuesForClone(const sp<Layer>& clonedFrom) {
+    // copy drawing state from cloned layer
+    mDrawingState = clonedFrom->mDrawingState;
+    mClonedFrom = clonedFrom;
+
+    // TODO: (b/140756730) Ignore input for now since InputDispatcher doesn't support multiple
+    // InputWindows per client token yet.
+    mDrawingState.inputInfo.token = nullptr;
+}
+
+void Layer::updateMirrorInfo() {
+    if (mClonedChild == nullptr || !mClonedChild->isClonedFromAlive()) {
+        // If mClonedChild is null, there is nothing to mirror. If isClonedFromAlive returns false,
+        // it means that there is a clone, but the layer it was cloned from has been destroyed. In
+        // that case, we want to delete the reference to the clone since we want it to get
+        // destroyed. The root, this layer, will still be around since the client can continue
+        // to hold a reference, but no cloned layers will be displayed.
+        mClonedChild = nullptr;
+        return;
+    }
+
+    std::map<sp<Layer>, sp<Layer>> clonedLayersMap;
+    // If the real layer exists and is in current state, add the clone as a child of the root.
+    // There's no need to remove from drawingState when the layer is offscreen since currentState is
+    // copied to drawingState for the root layer. So the clonedChild is always removed from
+    // drawingState and then needs to be added back each traversal.
+    if (!mClonedChild->getClonedFrom()->isRemovedFromCurrentState()) {
+        addChildToDrawing(mClonedChild);
+    }
+
+    mClonedChild->updateClonedDrawingState(clonedLayersMap);
+    mClonedChild->updateClonedChildren(this, clonedLayersMap);
+    mClonedChild->updateClonedRelatives(clonedLayersMap);
+}
+
+void Layer::updateClonedDrawingState(std::map<sp<Layer>, sp<Layer>>& clonedLayersMap) {
+    // If the layer the clone was cloned from is alive, copy the content of the drawingState
+    // to the clone. If the real layer is no longer alive, continue traversing the children
+    // since we may be able to pull out other children that are still alive.
+    if (isClonedFromAlive()) {
+        sp<Layer> clonedFrom = getClonedFrom();
+        mDrawingState = clonedFrom->mDrawingState;
+        // TODO: (b/140756730) Ignore input for now since InputDispatcher doesn't support multiple
+        // InputWindows per client token yet.
+        mDrawingState.inputInfo.token = nullptr;
+        clonedLayersMap.emplace(clonedFrom, this);
+    }
+
+    // The clone layer may have children in drawingState since they may have been created and
+    // added from a previous request to updateMirorInfo. This is to ensure we don't recreate clones
+    // that already exist, since we can just re-use them.
+    // The drawingChildren will not get overwritten by the currentChildren since the clones are
+    // not updated in the regular traversal. They are skipped since the root will lose the
+    // reference to them when it copies its currentChildren to drawing.
+    for (sp<Layer>& child : mDrawingChildren) {
+        child->updateClonedDrawingState(clonedLayersMap);
+    }
+}
+
+void Layer::updateClonedChildren(const sp<Layer>& mirrorRoot,
+                                 std::map<sp<Layer>, sp<Layer>>& clonedLayersMap) {
+    mDrawingChildren.clear();
+
+    if (!isClonedFromAlive()) {
+        return;
+    }
+
+    sp<Layer> clonedFrom = getClonedFrom();
+    for (sp<Layer>& child : clonedFrom->mDrawingChildren) {
+        if (child == mirrorRoot) {
+            // This is to avoid cyclical mirroring.
+            continue;
+        }
+        sp<Layer> clonedChild = clonedLayersMap[child];
+        if (clonedChild == nullptr) {
+            clonedChild = child->createClone();
+            clonedLayersMap[child] = clonedChild;
+        }
+        addChildToDrawing(clonedChild);
+        clonedChild->updateClonedChildren(mirrorRoot, clonedLayersMap);
+    }
+}
+
+void Layer::updateClonedRelatives(std::map<sp<Layer>, sp<Layer>> clonedLayersMap) {
+    mDrawingState.zOrderRelativeOf = nullptr;
+    mDrawingState.zOrderRelatives.clear();
+
+    if (!isClonedFromAlive()) {
+        return;
+    }
+
+    sp<Layer> clonedFrom = getClonedFrom();
+    for (wp<Layer>& relativeWeak : clonedFrom->mDrawingState.zOrderRelatives) {
+        sp<Layer> relative = relativeWeak.promote();
+        auto clonedRelative = clonedLayersMap[relative];
+        if (clonedRelative != nullptr) {
+            mDrawingState.zOrderRelatives.add(clonedRelative);
+        }
+    }
+
+    // Check if the relativeLayer for the real layer is part of the cloned hierarchy.
+    // It's possible that the layer it's relative to is outside the requested cloned hierarchy.
+    // In that case, we treat the layer as if the relativeOf has been removed. This way, it will
+    // still traverse the children, but the layer with the missing relativeOf will not be shown
+    // on screen.
+    sp<Layer> relativeOf = clonedFrom->mDrawingState.zOrderRelativeOf.promote();
+    sp<Layer> clonedRelativeOf = clonedLayersMap[relativeOf];
+    if (clonedRelativeOf != nullptr) {
+        mDrawingState.zOrderRelativeOf = clonedRelativeOf;
+    }
+
+    for (sp<Layer>& child : mDrawingChildren) {
+        child->updateClonedRelatives(clonedLayersMap);
+    }
+}
+
+void Layer::addChildToDrawing(const sp<Layer>& layer) {
+    mDrawingChildren.add(layer);
+    layer->mDrawingParent = this;
 }
 
 // ---------------------------------------------------------------------------

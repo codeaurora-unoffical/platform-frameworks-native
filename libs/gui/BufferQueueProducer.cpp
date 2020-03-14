@@ -512,6 +512,12 @@ status_t BufferQueueProducer::dequeueBuffer(int* outSlot, sp<android::Fence>* ou
             mCore->mSharedBufferSlot = found;
             mSlots[found].mBufferState.mShared = true;
         }
+
+        if (!(returnFlags & BUFFER_NEEDS_REALLOCATION)) {
+            if (mCore->mConsumerListener != nullptr) {
+                mCore->mConsumerListener->onFrameDequeued(mSlots[*outSlot].mGraphicBuffer->getId());
+            }
+        }
     } // Autolock scope
 
     if (returnFlags & BUFFER_NEEDS_REALLOCATION) {
@@ -528,6 +534,10 @@ status_t BufferQueueProducer::dequeueBuffer(int* outSlot, sp<android::Fence>* ou
             if (error == NO_ERROR && !mCore->mIsAbandoned) {
                 graphicBuffer->setGenerationNumber(mCore->mGenerationNumber);
                 mSlots[*outSlot].mGraphicBuffer = graphicBuffer;
+                if (mCore->mConsumerListener != nullptr) {
+                    mCore->mConsumerListener->onFrameDequeued(
+                            mSlots[*outSlot].mGraphicBuffer->getId());
+                }
             }
 
             mCore->mIsAllocating = false;
@@ -621,13 +631,16 @@ status_t BufferQueueProducer::detachBuffer(int slot) {
             return BAD_VALUE;
         }
 
+        listener = mCore->mConsumerListener;
+        if (listener != nullptr) {
+            listener->onFrameDetached(mSlots[slot].mGraphicBuffer->getId());
+        }
         mSlots[slot].mBufferState.detachProducer();
         mCore->mActiveBuffers.erase(slot);
         mCore->mFreeSlots.insert(slot);
         mCore->clearBufferSlotLocked(slot);
         mCore->mDequeueCondition.notify_all();
         VALIDATE_CONSISTENCY();
-        listener = mCore->mConsumerListener;
     }
 
     if (listener != nullptr) {
@@ -1083,6 +1096,9 @@ status_t BufferQueueProducer::cancelBuffer(int slot, const sp<Fence>& fence) {
         mCore->mFreeBuffers.push_back(slot);
     }
 
+    if (mCore->mConsumerListener != nullptr) {
+        mCore->mConsumerListener->onFrameCancelled(mSlots[slot].mGraphicBuffer->getId());
+    }
     mSlots[slot].mFence = fence;
     mCore->mDequeueCondition.notify_all();
     VALIDATE_CONSISTENCY();

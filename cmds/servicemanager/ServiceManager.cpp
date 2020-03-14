@@ -18,15 +18,65 @@
 
 #include <android-base/logging.h>
 #include <android-base/properties.h>
+#include <binder/Stability.h>
 #include <cutils/android_filesystem_config.h>
 #include <cutils/multiuser.h>
 #include <thread>
 
+#ifndef VENDORSERVICEMANAGER
+#include <vintf/VintfObject.h>
+#include <vintf/constants.h>
+#endif  // !VENDORSERVICEMANAGER
+
 using ::android::binder::Status;
+using ::android::internal::Stability;
 
 namespace android {
 
-ServiceManager::ServiceManager(std::unique_ptr<Access>&& access) : mAccess(std::move(access)) {}
+#ifndef VENDORSERVICEMANAGER
+static bool isVintfDeclared(const std::string& name) {
+    size_t firstSlash = name.find('/');
+    size_t lastDot = name.rfind('.', firstSlash);
+    if (firstSlash == std::string::npos || lastDot == std::string::npos) {
+        LOG(ERROR) << "VINTF HALs require names in the format type/instance (e.g. "
+                   << "some.package.foo.IFoo/default) but got: " << name;
+        return false;
+    }
+    const std::string package = name.substr(0, lastDot);
+    const std::string iface = name.substr(lastDot+1, firstSlash-lastDot-1);
+    const std::string instance = name.substr(firstSlash+1);
+
+    for (const auto& manifest : {
+            vintf::VintfObject::GetDeviceHalManifest(),
+            vintf::VintfObject::GetFrameworkHalManifest()
+        }) {
+        if (manifest != nullptr && manifest->hasAidlInstance(package, iface, instance)) {
+            return true;
+        }
+    }
+    LOG(ERROR) << "Could not find " << package << "." << iface << "/" << instance
+               << " in the VINTF manifest.";
+    return false;
+}
+
+static bool meetsDeclarationRequirements(const sp<IBinder>& binder, const std::string& name) {
+    if (!Stability::requiresVintfDeclaration(binder)) {
+        return true;
+    }
+
+    return isVintfDeclared(name);
+}
+#endif  // !VENDORSERVICEMANAGER
+
+ServiceManager::ServiceManager(std::unique_ptr<Access>&& access) : mAccess(std::move(access)) {
+#ifndef VENDORSERVICEMANAGER
+    // can process these at any times, don't want to delay first VINTF client
+    std::thread([] {
+        vintf::VintfObject::GetDeviceHalManifest();
+        vintf::VintfObject::GetFrameworkHalManifest();
+    }).detach();
+#endif  // !VENDORSERVICEMANAGER
+}
 ServiceManager::~ServiceManager() {
     // this should only happen in tests
 
@@ -119,8 +169,15 @@ Status ServiceManager::addService(const std::string& name, const sp<IBinder>& bi
         return Status::fromExceptionCode(Status::EX_ILLEGAL_ARGUMENT);
     }
 
+#ifndef VENDORSERVICEMANAGER
+    if (!meetsDeclarationRequirements(binder, name)) {
+        // already logged
+        return Status::fromExceptionCode(Status::EX_ILLEGAL_ARGUMENT);
+    }
+#endif  // !VENDORSERVICEMANAGER
+
     // implicitly unlinked when the binder is removed
-    if (OK != binder->linkToDeath(this)) {
+    if (binder->remoteBinder() != nullptr && binder->linkToDeath(this) != OK) {
         LOG(ERROR) << "Could not linkToDeath when adding " << name;
         return Status::fromExceptionCode(Status::EX_ILLEGAL_STATE);
     }
@@ -225,6 +282,21 @@ Status ServiceManager::unregisterForNotifications(
     return Status::ok();
 }
 
+Status ServiceManager::isDeclared(const std::string& name, bool* outReturn) {
+    auto ctx = mAccess->getCallingContext();
+
+    if (!mAccess->canFind(ctx, name)) {
+        return Status::fromExceptionCode(Status::EX_SECURITY);
+    }
+
+    *outReturn = false;
+
+#ifndef VENDORSERVICEMANAGER
+    *outReturn = isVintfDeclared(name);
+#endif
+    return Status::ok();
+}
+
 void ServiceManager::removeCallback(const wp<IBinder>& who,
                                     CallbackMap::iterator* it,
                                     bool* found) {
@@ -242,7 +314,7 @@ void ServiceManager::removeCallback(const wp<IBinder>& who,
     if (listeners.empty()) {
         *it = mNameToCallback.erase(*it);
     } else {
-        it++;
+        (*it)++;
     }
 }
 

@@ -27,17 +27,17 @@ __BEGIN_DECLS
  * Retrieves how long it took for the last time a buffer was dequeued.
  *
  * \return a negative value on error, otherwise returns the duration in
- * microseconds.
+ * nanoseconds
  */
-int ANativeWindow_getLastDequeueDuration(ANativeWindow* window);
+int64_t ANativeWindow_getLastDequeueDuration(ANativeWindow* window);
 
 /**
  * Retrieves how long it took for the last time a buffer was queued.
  *
  * \return a negative value on error, otherwise returns the duration in
- * microseconds
+ * nanoseconds.
  */
-int ANativeWindow_getLastQueueDuration(ANativeWindow* window);
+int64_t ANativeWindow_getLastQueueDuration(ANativeWindow* window);
 
 /**
  * Retrieves the system time in nanoseconds when the last time a buffer
@@ -47,5 +47,14 @@ int ANativeWindow_getLastQueueDuration(ANativeWindow* window);
  * nanoseconds.
  */
 int64_t ANativeWindow_getLastDequeueStartTime(ANativeWindow* window);
+
+/**
+ * Sets a timeout in nanoseconds for dequeue calls. All subsequent dequeue calls
+ * made by the window will return -ETIMEDOUT after the timeout if the dequeue
+ * takes too long.
+ *
+ * \return NO_ERROR on succes, -errno on error.
+ */
+int ANativeWindow_setDequeueTimeout(ANativeWindow* window, int64_t timeout);
 
 __END_DECLS

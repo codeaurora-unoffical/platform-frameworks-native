@@ -22,12 +22,10 @@
 #include "BufferLayer.h"
 
 #include <compositionengine/CompositionEngine.h>
-#include <compositionengine/Display.h>
 #include <compositionengine/Layer.h>
 #include <compositionengine/LayerCreationArgs.h>
 #include <compositionengine/LayerFECompositionState.h>
 #include <compositionengine/OutputLayer.h>
-#include <compositionengine/impl/LayerCompositionState.h>
 #include <compositionengine/impl/OutputLayerCompositionState.h>
 #include <cutils/compiler.h>
 #include <cutils/native_handle.h>
@@ -58,12 +56,15 @@
 
 namespace android {
 
+static constexpr float defaultMaxMasteringLuminance = 1000.0;
+static constexpr float defaultMaxContentLuminance = 1000.0;
+
 BufferLayer::BufferLayer(const LayerCreationArgs& args)
       : Layer(args),
-        mTextureName(args.flinger->getNewTexture()),
+        mTextureName(args.textureName),
         mCompositionLayer{mFlinger->getCompositionEngine().createLayer(
                 compositionengine::LayerCreationArgs{this})} {
-    ALOGV("Creating Layer %s", args.name.string());
+    ALOGV("Creating Layer %s", getDebugName());
 
     mPremultipliedAlpha = !(args.flags & ISurfaceComposerClient::eNonPremultiplied);
 
@@ -72,10 +73,16 @@ BufferLayer::BufferLayer(const LayerCreationArgs& args)
 }
 
 BufferLayer::~BufferLayer() {
-    mFlinger->deleteTextureAsync(mTextureName);
-    const int32_t layerID = getSequence();
-    mFlinger->mTimeStats->onDestroy(layerID);
-    mFlinger->mFrameTracer->onDestroy(layerID);
+    if (!isClone()) {
+        // The original layer and the clone layer share the same texture. Therefore, only one of
+        // the layers, in this case the original layer, needs to handle the deletion. The original
+        // layer and the clone should be removed at the same time so there shouldn't be any issue
+        // with the clone layer trying to use the deleted texture.
+        mFlinger->deleteTextureAsync(mTextureName);
+    }
+    const int32_t layerId = getSequence();
+    mFlinger->mTimeStats->onDestroy(layerId);
+    mFlinger->mFrameTracer->onDestroy(layerId);
 }
 
 void BufferLayer::useSurfaceDamage() {
@@ -103,11 +110,8 @@ bool BufferLayer::isOpaque(const Layer::State& s) const {
 }
 
 bool BufferLayer::isVisible() const {
-    bool visible = !(isHiddenByPolicy()) && getAlpha() > 0.0f &&
+    return !isHiddenByPolicy() && getAlpha() > 0.0f &&
             (mBufferInfo.mBuffer != nullptr || mSidebandStream != nullptr);
-    mFlinger->mScheduler->setLayerVisibility(mSchedulerLayerHandle, visible);
-
-    return visible;
 }
 
 bool BufferLayer::isFixedSize() const {
@@ -183,6 +187,14 @@ std::optional<renderengine::LayerSettings> BufferLayer::prepareClientComposition
         layer.source.buffer.textureName = mTextureName;
         layer.source.buffer.usePremultipliedAlpha = getPremultipledAlpha();
         layer.source.buffer.isY410BT2020 = isHdrY410();
+        bool hasSmpte2086 = mBufferInfo.mHdrMetadata.validTypes & HdrMetadata::SMPTE2086;
+        bool hasCta861_3 = mBufferInfo.mHdrMetadata.validTypes & HdrMetadata::CTA861_3;
+        layer.source.buffer.maxMasteringLuminance = hasSmpte2086
+                ? mBufferInfo.mHdrMetadata.smpte2086.maxLuminance
+                : defaultMaxMasteringLuminance;
+        layer.source.buffer.maxContentLuminance = hasCta861_3
+                ? mBufferInfo.mHdrMetadata.cta8613.maxContentLightLevel
+                : defaultMaxContentLuminance;
         // TODO: we could be more subtle with isFixedSize()
         const bool useFiltering = targetSettings.needsFiltering || mNeedsFiltering || isFixedSize();
 
@@ -285,13 +297,13 @@ bool BufferLayer::onPreComposition(nsecs_t refreshStartTime) {
     return hasReadyFrame();
 }
 
-bool BufferLayer::onPostComposition(const std::optional<DisplayId>& displayId,
+bool BufferLayer::onPostComposition(sp<const DisplayDevice> displayDevice,
                                     const std::shared_ptr<FenceTime>& glDoneFence,
                                     const std::shared_ptr<FenceTime>& presentFence,
                                     const CompositorTiming& compositorTiming) {
     // mFrameLatencyNeeded is true when a new frame was latched for the
     // composition.
-    if (!mFrameLatencyNeeded) return false;
+    if (!mBufferInfo.mFrameLatencyNeeded) return false;
 
     // Update mFrameEventHistory.
     {
@@ -304,8 +316,16 @@ bool BufferLayer::onPostComposition(const std::optional<DisplayId>& displayId,
     nsecs_t desiredPresentTime = mBufferInfo.mDesiredPresentTime;
     mFrameTracker.setDesiredPresentTime(desiredPresentTime);
 
-    const int32_t layerID = getSequence();
-    mFlinger->mTimeStats->setDesiredTime(layerID, mCurrentFrameNumber, desiredPresentTime);
+    const int32_t layerId = getSequence();
+    mFlinger->mTimeStats->setDesiredTime(layerId, mCurrentFrameNumber, desiredPresentTime);
+
+    const auto outputLayer = findOutputLayerForDisplay(displayDevice);
+    if (outputLayer && outputLayer->requiresClientComposition()) {
+        nsecs_t clientCompositionTimestamp = outputLayer->getState().clientCompositionTimestamp;
+        mFlinger->mFrameTracer->traceTimestamp(layerId, getCurrentBufferId(), mCurrentFrameNumber,
+                                               clientCompositionTimestamp,
+                                               FrameTracer::FrameEvent::FALLBACK_COMPOSITION);
+    }
 
     std::shared_ptr<FenceTime> frameReadyFence = mBufferInfo.mFenceTime;
     if (frameReadyFence->isValid()) {
@@ -316,24 +336,25 @@ bool BufferLayer::onPostComposition(const std::optional<DisplayId>& displayId,
         mFrameTracker.setFrameReadyTime(desiredPresentTime);
     }
 
+    const auto displayId = displayDevice->getId();
     if (presentFence->isValid()) {
-        mFlinger->mTimeStats->setPresentFence(layerID, mCurrentFrameNumber, presentFence);
-        mFlinger->mFrameTracer->traceFence(layerID, getCurrentBufferId(), mCurrentFrameNumber,
+        mFlinger->mTimeStats->setPresentFence(layerId, mCurrentFrameNumber, presentFence);
+        mFlinger->mFrameTracer->traceFence(layerId, getCurrentBufferId(), mCurrentFrameNumber,
                                            presentFence, FrameTracer::FrameEvent::PRESENT_FENCE);
         mFrameTracker.setActualPresentFence(std::shared_ptr<FenceTime>(presentFence));
     } else if (displayId && mFlinger->getHwComposer().isConnected(*displayId)) {
         // The HWC doesn't support present fences, so use the refresh
         // timestamp instead.
         const nsecs_t actualPresentTime = mFlinger->getHwComposer().getRefreshTimestamp(*displayId);
-        mFlinger->mTimeStats->setPresentTime(layerID, mCurrentFrameNumber, actualPresentTime);
-        mFlinger->mFrameTracer->traceTimestamp(layerID, getCurrentBufferId(), mCurrentFrameNumber,
+        mFlinger->mTimeStats->setPresentTime(layerId, mCurrentFrameNumber, actualPresentTime);
+        mFlinger->mFrameTracer->traceTimestamp(layerId, getCurrentBufferId(), mCurrentFrameNumber,
                                                actualPresentTime,
                                                FrameTracer::FrameEvent::PRESENT_FENCE);
         mFrameTracker.setActualPresentTime(actualPresentTime);
     }
 
     mFrameTracker.advanceFrame();
-    mFrameLatencyNeeded = false;
+    mBufferInfo.mFrameLatencyNeeded = false;
     return true;
 }
 
@@ -397,7 +418,7 @@ bool BufferLayer::latchBuffer(bool& recomputeVisibleRegions, nsecs_t latchTime,
     gatherBufferInfo();
 
     mRefreshPending = true;
-    mFrameLatencyNeeded = true;
+    mBufferInfo.mFrameLatencyNeeded = true;
     if (oldBufferInfo.mBuffer == nullptr) {
         // the first time we receive a buffer, we need to trigger a
         // geometry invalidation.
@@ -722,6 +743,44 @@ sp<GraphicBuffer> BufferLayer::getBuffer() const {
 void BufferLayer::getDrawingTransformMatrix(bool filteringEnabled, float outMatrix[16]) {
     GLConsumer::computeTransformMatrix(outMatrix, mBufferInfo.mBuffer, mBufferInfo.mCrop,
                                        mBufferInfo.mTransform, filteringEnabled);
+}
+
+void BufferLayer::setInitialValuesForClone(const sp<Layer>& clonedFrom) {
+    Layer::setInitialValuesForClone(clonedFrom);
+
+    sp<BufferLayer> bufferClonedFrom = static_cast<BufferLayer*>(clonedFrom.get());
+    mPremultipliedAlpha = bufferClonedFrom->mPremultipliedAlpha;
+    mPotentialCursor = bufferClonedFrom->mPotentialCursor;
+    mProtectedByApp = bufferClonedFrom->mProtectedByApp;
+
+    updateCloneBufferInfo();
+}
+
+void BufferLayer::updateCloneBufferInfo() {
+    if (!isClone() || !isClonedFromAlive()) {
+        return;
+    }
+
+    sp<BufferLayer> clonedFrom = static_cast<BufferLayer*>(getClonedFrom().get());
+    mBufferInfo = clonedFrom->mBufferInfo;
+    mSidebandStream = clonedFrom->mSidebandStream;
+    surfaceDamageRegion = clonedFrom->surfaceDamageRegion;
+    mCurrentFrameNumber = clonedFrom->mCurrentFrameNumber.load();
+    mPreviousFrameNumber = clonedFrom->mPreviousFrameNumber;
+
+    // After buffer info is updated, the drawingState from the real layer needs to be copied into
+    // the cloned. This is because some properties of drawingState can change when latchBuffer is
+    // called. However, copying the drawingState would also overwrite the cloned layer's relatives.
+    // Therefore, temporarily store the relatives so they can be set in the cloned drawingState
+    // again.
+    wp<Layer> tmpZOrderRelativeOf = mDrawingState.zOrderRelativeOf;
+    SortedVector<wp<Layer>> tmpZOrderRelatives = mDrawingState.zOrderRelatives;
+    mDrawingState = clonedFrom->mDrawingState;
+    // TODO: (b/140756730) Ignore input for now since InputDispatcher doesn't support multiple
+    // InputWindows per client token yet.
+    mDrawingState.inputInfo.token = nullptr;
+    mDrawingState.zOrderRelativeOf = tmpZOrderRelativeOf;
+    mDrawingState.zOrderRelatives = tmpZOrderRelatives;
 }
 
 } // namespace android

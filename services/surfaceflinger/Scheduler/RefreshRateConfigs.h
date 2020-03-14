@@ -23,7 +23,9 @@
 #include <type_traits>
 
 #include "DisplayHardware/HWComposer.h"
+#include "HwcStrongTypes.h"
 #include "Scheduler/SchedulerUtils.h"
+#include "Scheduler/StrongTyping.h"
 
 namespace android::scheduler {
 
@@ -41,172 +43,123 @@ inline RefreshRateConfigEvent operator|(RefreshRateConfigEvent lhs, RefreshRateC
  */
 class RefreshRateConfigs {
 public:
-    // Enum to indicate which vsync rate to run at. Default is the old 60Hz, and performance
-    // is the new 90Hz. Eventually we want to have a way for vendors to map these in the configs.
-    enum class RefreshRateType { DEFAULT, PERFORMANCE };
-
     struct RefreshRate {
+        RefreshRate(HwcConfigIndexType configId, nsecs_t vsyncPeriod,
+                    HwcConfigGroupType configGroup, std::string name, float fps)
+              : configId(configId),
+                vsyncPeriod(vsyncPeriod),
+                configGroup(configGroup),
+                name(std::move(name)),
+                fps(fps) {}
         // This config ID corresponds to the position of the config in the vector that is stored
         // on the device.
-        int configId;
-        // Human readable name of the refresh rate.
-        std::string name;
-        // Refresh rate in frames per second, rounded to the nearest integer.
-        uint32_t fps = 0;
+        const HwcConfigIndexType configId;
         // Vsync period in nanoseconds.
-        nsecs_t vsyncPeriod;
-        // Hwc config Id (returned from HWC2::Display::Config::getId())
-        hwc2_config_t hwcId;
+        const nsecs_t vsyncPeriod;
+        // This configGroup for the config.
+        const HwcConfigGroupType configGroup;
+        // Human readable name of the refresh rate.
+        const std::string name;
+        // Refresh rate in frames per second
+        const float fps = 0;
+
+        bool operator!=(const RefreshRate& other) const {
+            return configId != other.configId || vsyncPeriod != other.vsyncPeriod ||
+                    configGroup != other.configGroup;
+        }
+
+        bool operator==(const RefreshRate& other) const { return !(*this != other); }
     };
 
+    using AllRefreshRatesMapType = std::unordered_map<HwcConfigIndexType, const RefreshRate>;
+
+    // Sets the current policy to choose refresh rates.
+    void setPolicy(HwcConfigIndexType defaultConfigId, float minRefreshRate, float maxRefreshRate)
+            EXCLUDES(mLock);
+
     // Returns true if this device is doing refresh rate switching. This won't change at runtime.
-    bool refreshRateSwitchingSupported() const { return mRefreshRateSwitchingSupported; }
+    bool refreshRateSwitchingSupported() const { return mRefreshRateSwitching; }
 
-    // Returns the refresh rate map. This map won't be modified at runtime, so it's safe to access
-    // from multiple threads. This can only be called if refreshRateSwitching() returns true.
-    // TODO(b/122916473): Get this information from configs prepared by vendors, instead of
-    // baking them in.
-    const std::map<RefreshRateType, RefreshRate>& getRefreshRateMap() const {
-        LOG_ALWAYS_FATAL_IF(!mRefreshRateSwitchingSupported);
-        return mRefreshRateMap;
-    }
+    // Returns all available refresh rates according to the current policy.
+    const RefreshRate& getRefreshRateForContent(float contentFramerate) const EXCLUDES(mLock);
 
-    const RefreshRate& getRefreshRateFromType(RefreshRateType type) const {
-        if (!mRefreshRateSwitchingSupported) {
-            return getCurrentRefreshRate().second;
-        } else {
-            auto refreshRate = mRefreshRateMap.find(type);
-            LOG_ALWAYS_FATAL_IF(refreshRate == mRefreshRateMap.end());
-            return refreshRate->second;
-        }
-    }
+    // Returns all the refresh rates supported by the device. This won't change at runtime.
+    const AllRefreshRatesMapType& getAllRefreshRates() const EXCLUDES(mLock);
 
-    std::pair<RefreshRateType, const RefreshRate&> getCurrentRefreshRate() const {
-        int currentConfig = mCurrentConfig;
-        if (mRefreshRateSwitchingSupported) {
-            for (const auto& [type, refresh] : mRefreshRateMap) {
-                if (refresh.configId == currentConfig) {
-                    return {type, refresh};
-                }
-            }
-            LOG_ALWAYS_FATAL();
-        }
-        return {RefreshRateType::DEFAULT, mRefreshRates[currentConfig]};
-    }
+    // Returns the lowest refresh rate supported by the device. This won't change at runtime.
+    const RefreshRate& getMinRefreshRate() const { return *mMinSupportedRefreshRate; }
 
-    const RefreshRate& getRefreshRateFromConfigId(int configId) const {
-        LOG_ALWAYS_FATAL_IF(configId >= mRefreshRates.size());
-        return mRefreshRates[configId];
-    }
+    // Returns the lowest refresh rate according to the current policy. May change in runtime.
+    const RefreshRate& getMinRefreshRateByPolicy() const EXCLUDES(mLock);
 
-    RefreshRateType getRefreshRateTypeFromHwcConfigId(hwc2_config_t hwcId) const {
-        if (!mRefreshRateSwitchingSupported) return RefreshRateType::DEFAULT;
+    // Returns the highest refresh rate supported by the device. This won't change at runtime.
+    const RefreshRate& getMaxRefreshRate() const { return *mMaxSupportedRefreshRate; }
 
-        for (const auto& [type, refreshRate] : mRefreshRateMap) {
-            if (refreshRate.hwcId == hwcId) {
-                return type;
-            }
-        }
+    // Returns the highest refresh rate according to the current policy. May change in runtime.
+    const RefreshRate& getMaxRefreshRateByPolicy() const EXCLUDES(mLock);
 
-        return RefreshRateType::DEFAULT;
-    }
+    // Returns the current refresh rate
+    const RefreshRate& getCurrentRefreshRate() const EXCLUDES(mLock);
 
-    void setCurrentConfig(int config) {
-        LOG_ALWAYS_FATAL_IF(config >= mRefreshRates.size());
-        mCurrentConfig = config;
-    }
+    // Returns the refresh rate that corresponds to a HwcConfigIndexType. This won't change at
+    // runtime.
+    const RefreshRate& getRefreshRateFromConfigId(HwcConfigIndexType configId) const {
+        return mRefreshRates.at(configId);
+    };
+
+    // Stores the current configId the device operates at
+    void setCurrentConfigId(HwcConfigIndexType configId) EXCLUDES(mLock);
 
     struct InputConfig {
-        hwc2_config_t hwcId = 0;
+        HwcConfigIndexType configId = HwcConfigIndexType(0);
+        HwcConfigGroupType configGroup = HwcConfigGroupType(0);
         nsecs_t vsyncPeriod = 0;
     };
 
     RefreshRateConfigs(bool refreshRateSwitching, const std::vector<InputConfig>& configs,
-                       int currentConfig) {
-        init(refreshRateSwitching, configs, currentConfig);
-    }
-
+                       HwcConfigIndexType currentHwcConfig);
     RefreshRateConfigs(bool refreshRateSwitching,
                        const std::vector<std::shared_ptr<const HWC2::Display::Config>>& configs,
-                       int currentConfig) {
-        std::vector<InputConfig> inputConfigs;
-        for (const auto& config : configs) {
-            inputConfigs.push_back({config->getId(), config->getVsyncPeriod()});
-        }
-        init(refreshRateSwitching, inputConfigs, currentConfig);
-    }
+                       HwcConfigIndexType currentConfigId);
 
 private:
-    void init(bool refreshRateSwitching, const std::vector<InputConfig>& configs,
-              int currentConfig) {
-        mRefreshRateSwitchingSupported = refreshRateSwitching;
-        LOG_ALWAYS_FATAL_IF(configs.empty());
-        LOG_ALWAYS_FATAL_IF(currentConfig >= configs.size());
-        mCurrentConfig = currentConfig;
+    void init(const std::vector<InputConfig>& configs, HwcConfigIndexType currentHwcConfig);
 
-        auto buildRefreshRate = [&](int configId) -> RefreshRate {
-            const nsecs_t vsyncPeriod = configs[configId].vsyncPeriod;
-            const float fps = 1e9 / vsyncPeriod;
-            return {configId, base::StringPrintf("%2.ffps", fps), static_cast<uint32_t>(fps),
-                    vsyncPeriod, configs[configId].hwcId};
-        };
+    void constructAvailableRefreshRates() REQUIRES(mLock);
 
-        for (int i = 0; i < configs.size(); ++i) {
-            mRefreshRates.push_back(buildRefreshRate(i));
-        }
+    void getSortedRefreshRateList(
+            const std::function<bool(const RefreshRate&)>& shouldAddRefreshRate,
+            std::vector<const RefreshRate*>* outRefreshRates);
 
-        if (!mRefreshRateSwitchingSupported) return;
-
-        auto findDefaultAndPerfConfigs = [&]() -> std::optional<std::pair<int, int>> {
-            if (configs.size() < 2) {
-                return {};
-            }
-
-            std::vector<const RefreshRate*> sortedRefreshRates;
-            for (const auto& refreshRate : mRefreshRates) {
-                sortedRefreshRates.push_back(&refreshRate);
-            }
-            std::sort(sortedRefreshRates.begin(), sortedRefreshRates.end(),
-                      [](const RefreshRate* refreshRate1, const RefreshRate* refreshRate2) {
-                          return refreshRate1->vsyncPeriod > refreshRate2->vsyncPeriod;
-                      });
-
-            // When the configs are ordered by the resync rate, we assume that
-            // the first one is DEFAULT and the second one is PERFORMANCE,
-            // i.e. the higher rate.
-            if (sortedRefreshRates[0]->vsyncPeriod == 0 ||
-                sortedRefreshRates[1]->vsyncPeriod == 0) {
-                return {};
-            }
-
-            return std::pair<int, int>(sortedRefreshRates[0]->configId,
-                                       sortedRefreshRates[1]->configId);
-        };
-
-        auto defaultAndPerfConfigs = findDefaultAndPerfConfigs();
-        if (!defaultAndPerfConfigs) {
-            mRefreshRateSwitchingSupported = false;
-            return;
-        }
-
-        mRefreshRateMap[RefreshRateType::DEFAULT] = mRefreshRates[defaultAndPerfConfigs->first];
-        mRefreshRateMap[RefreshRateType::PERFORMANCE] =
-                mRefreshRates[defaultAndPerfConfigs->second];
-    }
-
-    // Whether this device is doing refresh rate switching or not. This must not change after this
-    // object is initialized.
-    bool mRefreshRateSwitchingSupported;
     // The list of refresh rates, indexed by display config ID. This must not change after this
     // object is initialized.
-    std::vector<RefreshRate> mRefreshRates;
-    // The mapping of refresh rate type to RefreshRate. This must not change after this object is
-    // initialized.
-    std::map<RefreshRateType, RefreshRate> mRefreshRateMap;
-    // The ID of the current config. This will change at runtime. This is set by SurfaceFlinger on
-    // the main thread, and read by the Scheduler (and other objects) on other threads, so it's
-    // atomic.
-    std::atomic<int> mCurrentConfig;
+    AllRefreshRatesMapType mRefreshRates;
+
+    // The list of refresh rates which are available in the current policy, ordered by vsyncPeriod
+    // (the first element is the lowest refresh rate)
+    std::vector<const RefreshRate*> mAvailableRefreshRates GUARDED_BY(mLock);
+
+    // The current config. This will change at runtime. This is set by SurfaceFlinger on
+    // the main thread, and read by the Scheduler (and other objects) on other threads.
+    const RefreshRate* mCurrentRefreshRate GUARDED_BY(mLock);
+
+    // The current config group. This will change at runtime. This is set by SurfaceFlinger on
+    // the main thread, and read by the Scheduler (and other objects) on other threads.
+    HwcConfigGroupType mCurrentGroupId GUARDED_BY(mLock);
+
+    // The min and max FPS allowed by the policy. This will change at runtime and set by
+    // SurfaceFlinger on the main thread.
+    float mMinRefreshRateFps GUARDED_BY(mLock) = 0;
+    float mMaxRefreshRateFps GUARDED_BY(mLock) = std::numeric_limits<float>::max();
+
+    // The min and max refresh rates supported by the device.
+    // This will not change at runtime.
+    const RefreshRate* mMinSupportedRefreshRate;
+    const RefreshRate* mMaxSupportedRefreshRate;
+
+    const bool mRefreshRateSwitching;
+
+    mutable std::mutex mLock;
 };
 
 } // namespace android::scheduler

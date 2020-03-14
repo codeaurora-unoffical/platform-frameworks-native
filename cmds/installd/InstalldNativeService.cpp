@@ -92,15 +92,12 @@ static constexpr const char* PKG_LIB_POSTFIX = "/lib";
 static constexpr const char* CACHE_DIR_POSTFIX = "/cache";
 static constexpr const char* CODE_CACHE_DIR_POSTFIX = "/code_cache";
 
-static constexpr const char *kIdMapPath = "/system/bin/idmap";
-static constexpr const char* IDMAP_PREFIX = "/data/resource-cache/";
-static constexpr const char* IDMAP_SUFFIX = "@idmap";
-
 // fsverity assumes the page size is always 4096. If not, the feature can not be
 // enabled.
 static constexpr int kVerityPageSize = 4096;
 static constexpr size_t kSha256Size = 32;
 static constexpr const char* kPropApkVerityMode = "ro.apk_verity.mode";
+static constexpr const char* kFuseProp = "persist.sys.fuse";
 
 namespace {
 
@@ -592,12 +589,21 @@ binder::Status InstalldNativeService::clearAppData(const std::unique_ptr<std::st
         std::lock_guard<std::recursive_mutex> lock(mMountsLock);
         for (const auto& n : mStorageMounts) {
             auto extPath = n.second;
-            if (n.first.compare(0, 14, "/mnt/media_rw/") != 0) {
-                extPath += StringPrintf("/%d", userId);
-            } else if (userId != 0) {
-                // TODO: support devices mounted under secondary users
-                continue;
+
+            if (android::base::GetBoolProperty(kFuseProp, false)) {
+                std::regex re("^\\/mnt\\/pass_through\\/[0-9]+\\/emulated");
+                if (std::regex_match(extPath, re)) {
+                    extPath += "/" + std::to_string(userId);
+                }
+            } else {
+                if (n.first.compare(0, 14, "/mnt/media_rw/") != 0) {
+                    extPath += StringPrintf("/%d", userId);
+                } else if (userId != 0) {
+                    // TODO: support devices mounted under secondary users
+                    continue;
+                }
             }
+
             if (flags & FLAG_CLEAR_CACHE_ONLY) {
                 // Clear only cached data from shared storage
                 auto path = StringPrintf("%s/Android/data/%s/cache", extPath.c_str(), pkgname);
@@ -688,16 +694,26 @@ binder::Status InstalldNativeService::destroyAppData(const std::unique_ptr<std::
         std::lock_guard<std::recursive_mutex> lock(mMountsLock);
         for (const auto& n : mStorageMounts) {
             auto extPath = n.second;
-            if (n.first.compare(0, 14, "/mnt/media_rw/") != 0) {
-                extPath += StringPrintf("/%d", userId);
-            } else if (userId != 0) {
-                // TODO: support devices mounted under secondary users
-                continue;
+
+            if (android::base::GetBoolProperty(kFuseProp, false)) {
+                std::regex re("^\\/mnt\\/pass_through\\/[0-9]+\\/emulated");
+                if (std::regex_match(extPath, re)) {
+                    extPath += "/" + std::to_string(userId);
+                }
+            } else {
+                if (n.first.compare(0, 14, "/mnt/media_rw/") != 0) {
+                    extPath += StringPrintf("/%d", userId);
+                } else if (userId != 0) {
+                    // TODO: support devices mounted under secondary users
+                    continue;
+                }
             }
+
             auto path = StringPrintf("%s/Android/data/%s", extPath.c_str(), pkgname);
             if (delete_dir_contents_and_dir(path, true) != 0) {
                 res = error("Failed to delete contents of " + path);
             }
+
             path = StringPrintf("%s/Android/media/%s", extPath.c_str(), pkgname);
             if (delete_dir_contents_and_dir(path, true) != 0) {
                 res = error("Failed to delete contents of " + path);
@@ -832,7 +848,7 @@ static int32_t copy_directory_recursive(const char* from, const char* to) {
     };
 
     LOG(DEBUG) << "Copying " << from << " to " << to;
-    return android_fork_execvp(ARRAY_SIZE(argv), argv, nullptr, false, true);
+    return logwrap_fork_execvp(ARRAY_SIZE(argv), argv, nullptr, false, LOG_ALOG, false, nullptr);
 }
 
 binder::Status InstalldNativeService::snapshotAppData(
@@ -2253,206 +2269,6 @@ out:
     return res;
 }
 
-static void run_idmap(const char *target_apk, const char *overlay_apk, int idmap_fd)
-{
-    execl(kIdMapPath, kIdMapPath, "--fd", target_apk, overlay_apk,
-            StringPrintf("%d", idmap_fd).c_str(), (char*)nullptr);
-    PLOG(ERROR) << "execl (" << kIdMapPath << ") failed";
-}
-
-static void run_verify_idmap(const char *target_apk, const char *overlay_apk, int idmap_fd)
-{
-    execl(kIdMapPath, kIdMapPath, "--verify", target_apk, overlay_apk,
-            StringPrintf("%d", idmap_fd).c_str(), (char*)nullptr);
-    PLOG(ERROR) << "execl (" << kIdMapPath << ") failed";
-}
-
-static bool delete_stale_idmap(const char* target_apk, const char* overlay_apk,
-        const char* idmap_path, int32_t uid) {
-    int idmap_fd = open(idmap_path, O_RDWR);
-    if (idmap_fd < 0) {
-        PLOG(ERROR) << "idmap open failed: " << idmap_path;
-        unlink(idmap_path);
-        return true;
-    }
-
-    pid_t pid;
-    pid = fork();
-    if (pid == 0) {
-        /* child -- drop privileges before continuing */
-        if (setgid(uid) != 0) {
-            LOG(ERROR) << "setgid(" << uid << ") failed during idmap";
-            exit(1);
-        }
-        if (setuid(uid) != 0) {
-            LOG(ERROR) << "setuid(" << uid << ") failed during idmap";
-            exit(1);
-        }
-        if (flock(idmap_fd, LOCK_EX | LOCK_NB) != 0) {
-            PLOG(ERROR) << "flock(" << idmap_path << ") failed during idmap";
-            exit(1);
-        }
-
-        run_verify_idmap(target_apk, overlay_apk, idmap_fd);
-        exit(1); /* only if exec call to deleting stale idmap failed */
-    } else {
-        int status = wait_child(pid);
-        close(idmap_fd);
-
-        if (status != 0) {
-            // Failed on verifying if idmap is made from target_apk and overlay_apk.
-            LOG(DEBUG) << "delete stale idmap: " << idmap_path;
-            unlink(idmap_path);
-            return true;
-        }
-    }
-    return false;
-}
-
-// Transform string /a/b/c.apk to (prefix)/a@b@c.apk@(suffix)
-// eg /a/b/c.apk to /data/resource-cache/a@b@c.apk@idmap
-static int flatten_path(const char *prefix, const char *suffix,
-        const char *overlay_path, char *idmap_path, size_t N)
-{
-    if (overlay_path == nullptr || idmap_path == nullptr) {
-        return -1;
-    }
-    const size_t len_overlay_path = strlen(overlay_path);
-    // will access overlay_path + 1 further below; requires absolute path
-    if (len_overlay_path < 2 || *overlay_path != '/') {
-        return -1;
-    }
-    const size_t len_idmap_root = strlen(prefix);
-    const size_t len_suffix = strlen(suffix);
-    if (SIZE_MAX - len_idmap_root < len_overlay_path ||
-            SIZE_MAX - (len_idmap_root + len_overlay_path) < len_suffix) {
-        // additions below would cause overflow
-        return -1;
-    }
-    if (N < len_idmap_root + len_overlay_path + len_suffix) {
-        return -1;
-    }
-    memset(idmap_path, 0, N);
-    snprintf(idmap_path, N, "%s%s%s", prefix, overlay_path + 1, suffix);
-    char *ch = idmap_path + len_idmap_root;
-    while (*ch != '\0') {
-        if (*ch == '/') {
-            *ch = '@';
-        }
-        ++ch;
-    }
-    return 0;
-}
-
-binder::Status InstalldNativeService::idmap(const std::string& targetApkPath,
-        const std::string& overlayApkPath, int32_t uid) {
-    ENFORCE_UID(AID_SYSTEM);
-    CHECK_ARGUMENT_PATH(targetApkPath);
-    CHECK_ARGUMENT_PATH(overlayApkPath);
-    std::lock_guard<std::recursive_mutex> lock(mLock);
-
-    const char* target_apk = targetApkPath.c_str();
-    const char* overlay_apk = overlayApkPath.c_str();
-    ALOGV("idmap target_apk=%s overlay_apk=%s uid=%d\n", target_apk, overlay_apk, uid);
-
-    int idmap_fd = -1;
-    char idmap_path[PATH_MAX];
-    struct stat idmap_stat;
-    bool outdated = false;
-
-    if (flatten_path(IDMAP_PREFIX, IDMAP_SUFFIX, overlay_apk,
-                idmap_path, sizeof(idmap_path)) == -1) {
-        ALOGE("idmap cannot generate idmap path for overlay %s\n", overlay_apk);
-        goto fail;
-    }
-
-    if (stat(idmap_path, &idmap_stat) < 0) {
-        outdated = true;
-    } else {
-        outdated = delete_stale_idmap(target_apk, overlay_apk, idmap_path, uid);
-    }
-
-    if (outdated) {
-        idmap_fd = open(idmap_path, O_RDWR | O_CREAT | O_EXCL, 0644);
-    } else {
-        idmap_fd = open(idmap_path, O_RDWR);
-    }
-
-    if (idmap_fd < 0) {
-        ALOGE("idmap cannot open '%s' for output: %s\n", idmap_path, strerror(errno));
-        goto fail;
-    }
-    if (fchown(idmap_fd, AID_SYSTEM, uid) < 0) {
-        ALOGE("idmap cannot chown '%s'\n", idmap_path);
-        goto fail;
-    }
-    if (fchmod(idmap_fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) < 0) {
-        ALOGE("idmap cannot chmod '%s'\n", idmap_path);
-        goto fail;
-    }
-
-    if (!outdated) {
-        close(idmap_fd);
-        return ok();
-    }
-
-    pid_t pid;
-    pid = fork();
-    if (pid == 0) {
-        /* child -- drop privileges before continuing */
-        if (setgid(uid) != 0) {
-            ALOGE("setgid(%d) failed during idmap\n", uid);
-            exit(1);
-        }
-        if (setuid(uid) != 0) {
-            ALOGE("setuid(%d) failed during idmap\n", uid);
-            exit(1);
-        }
-        if (flock(idmap_fd, LOCK_EX | LOCK_NB) != 0) {
-            ALOGE("flock(%s) failed during idmap: %s\n", idmap_path, strerror(errno));
-            exit(1);
-        }
-
-        run_idmap(target_apk, overlay_apk, idmap_fd);
-        exit(1); /* only if exec call to idmap failed */
-    } else {
-        int status = wait_child(pid);
-        if (status != 0) {
-            ALOGE("idmap failed, status=0x%04x\n", status);
-            goto fail;
-        }
-    }
-
-    close(idmap_fd);
-    return ok();
-fail:
-    if (idmap_fd >= 0) {
-        close(idmap_fd);
-        unlink(idmap_path);
-    }
-    return error();
-}
-
-binder::Status InstalldNativeService::removeIdmap(const std::string& overlayApkPath) {
-    ENFORCE_UID(AID_SYSTEM);
-    CHECK_ARGUMENT_PATH(overlayApkPath);
-    std::lock_guard<std::recursive_mutex> lock(mLock);
-
-    const char* overlay_apk = overlayApkPath.c_str();
-    char idmap_path[PATH_MAX];
-
-    if (flatten_path(IDMAP_PREFIX, IDMAP_SUFFIX, overlay_apk,
-                idmap_path, sizeof(idmap_path)) == -1) {
-        ALOGE("idmap cannot generate idmap path for overlay %s\n", overlay_apk);
-        return error();
-    }
-    if (unlink(idmap_path) < 0) {
-        ALOGE("couldn't unlink idmap file %s\n", idmap_path);
-        return error();
-    }
-    return ok();
-}
-
 binder::Status InstalldNativeService::restoreconAppData(const std::unique_ptr<std::string>& uuid,
         const std::string& packageName, int32_t userId, int32_t flags, int32_t appId,
         const std::string& seInfo) {
@@ -2778,12 +2594,21 @@ binder::Status InstalldNativeService::invalidateMounts() {
         std::getline(in, target, ' ');
         std::getline(in, ignored);
 
+        if (android::base::GetBoolProperty(kFuseProp, false)) {
+            // TODO(b/146139106): Use sdcardfs mounts on devices running sdcardfs so we don't bypass
+            // it's VFS cache
+            if (target.compare(0, 17, "/mnt/pass_through") == 0) {
+                LOG(DEBUG) << "Found storage mount " << source << " at " << target;
+                mStorageMounts[source] = target;
+            }
+        } else {
 #if !BYPASS_SDCARDFS
-        if (target.compare(0, 21, "/mnt/runtime/default/") == 0) {
-            LOG(DEBUG) << "Found storage mount " << source << " at " << target;
-            mStorageMounts[source] = target;
-        }
+            if (target.compare(0, 21, "/mnt/runtime/default/") == 0) {
+                LOG(DEBUG) << "Found storage mount " << source << " at " << target;
+                mStorageMounts[source] = target;
+            }
 #endif
+        }
     }
     return ok();
 }
@@ -2793,6 +2618,17 @@ std::string InstalldNativeService::findDataMediaPath(
     std::lock_guard<std::recursive_mutex> lock(mMountsLock);
     const char* uuid_ = uuid ? uuid->c_str() : nullptr;
     auto path = StringPrintf("%s/media", create_data_path(uuid_).c_str());
+    if (android::base::GetBoolProperty(kFuseProp, false)) {
+        // TODO(b/146139106): This is only safe on devices not running sdcardfs where there is no
+        // risk of bypassing the sdcardfs VFS cache
+
+        // Always use the lower filesystem path on FUSE enabled devices not running sdcardfs
+        // The upper filesystem path, /mnt/pass_through/<userid>/<vol>/ which was a bind mount
+        // to the lower filesytem may have been unmounted already when a user is
+        // removed and the path will now be pointing to a tmpfs without content
+        return StringPrintf("%s/%u", path.c_str(), userid);
+    }
+
     auto resolved = mStorageMounts[path];
     if (resolved.empty()) {
         LOG(WARNING) << "Failed to find storage mount for " << path;

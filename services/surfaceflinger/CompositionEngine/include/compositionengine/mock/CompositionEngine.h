@@ -32,14 +32,17 @@ public:
     CompositionEngine();
     ~CompositionEngine() override;
 
-    MOCK_METHOD1(createDisplay, std::shared_ptr<Display>(DisplayCreationArgs&&));
-    MOCK_METHOD1(createLayer, std::shared_ptr<Layer>(LayerCreationArgs&&));
+    MOCK_METHOD1(createDisplay, std::shared_ptr<Display>(const DisplayCreationArgs&));
+    MOCK_METHOD1(createLayer, std::shared_ptr<Layer>(const LayerCreationArgs&));
 
     MOCK_CONST_METHOD0(getHwComposer, HWComposer&());
     MOCK_METHOD1(setHwComposer, void(std::unique_ptr<HWComposer>));
 
     MOCK_CONST_METHOD0(getRenderEngine, renderengine::RenderEngine&());
     MOCK_METHOD1(setRenderEngine, void(std::unique_ptr<renderengine::RenderEngine>));
+
+    MOCK_CONST_METHOD0(getTimeStats, TimeStats&());
+    MOCK_METHOD1(setTimeStats, void(const std::shared_ptr<TimeStats>&));
 
     MOCK_CONST_METHOD0(needsAnotherUpdate, bool());
     MOCK_CONST_METHOD0(getLastFrameRefreshTimestamp, nsecs_t());
@@ -48,6 +51,8 @@ public:
     MOCK_METHOD1(updateCursorAsync, void(CompositionRefreshArgs&));
 
     MOCK_METHOD1(preComposition, void(CompositionRefreshArgs&));
+
+    MOCK_CONST_METHOD1(dump, void(std::string&));
 };
 
 } // namespace android::compositionengine::mock

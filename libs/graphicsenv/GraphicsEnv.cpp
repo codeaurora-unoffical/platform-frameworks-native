@@ -124,12 +124,8 @@ static const std::string getSystemNativeLibraries(NativeLibrary type) {
     return env;
 }
 
-int GraphicsEnv::getCanLoadSystemLibraries() {
-    if (property_get_bool("ro.debuggable", false) && prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)) {
-        // Return an integer value since this crosses library boundaries
-        return 1;
-    }
-    return 0;
+bool GraphicsEnv::isDebuggable() {
+    return prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) > 0;
 }
 
 void GraphicsEnv::setDriverPathAndSphalLibraries(const std::string path,
@@ -305,6 +301,13 @@ void GraphicsEnv::sendGpuStatsLocked(GpuStatsInfo::Api api, bool isDriverLoaded,
                                 mGpuStats.appPackageName, mGpuStats.vulkanVersion, driver,
                                 isIntendedDriverLoaded, driverLoadingTime);
     }
+}
+
+bool GraphicsEnv::setInjectLayersPrSetDumpable() {
+    if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == -1) {
+        return false;
+    }
+    return true;
 }
 
 void* GraphicsEnv::loadLibrary(std::string name) {

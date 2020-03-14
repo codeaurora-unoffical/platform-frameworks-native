@@ -21,23 +21,32 @@
 
 #include "Scheduler/DispSync.h"
 #include "Scheduler/EventThread.h"
+#include "Scheduler/LayerHistory.h"
 #include "Scheduler/Scheduler.h"
 
 namespace android {
 
-class TestableScheduler : public Scheduler {
+class TestableScheduler : public Scheduler, private ISchedulerCallback {
 public:
     explicit TestableScheduler(const scheduler::RefreshRateConfigs& configs)
-          : Scheduler([](bool) {}, configs) {}
+          : Scheduler([](bool) {}, configs, *this) {
+        mLayerHistory.emplace();
+    }
 
     TestableScheduler(std::unique_ptr<DispSync> primaryDispSync,
                       std::unique_ptr<EventControlThread> eventControlThread,
                       const scheduler::RefreshRateConfigs& configs)
-          : Scheduler(std::move(primaryDispSync), std::move(eventControlThread), configs) {}
+          : Scheduler(std::move(primaryDispSync), std::move(eventControlThread), configs, *this) {
+        mLayerHistory.emplace();
+    }
 
     // Used to inject mock event thread.
     ConnectionHandle createConnection(std::unique_ptr<EventThread> eventThread) {
         return Scheduler::createConnection(std::move(eventThread));
+    }
+
+    size_t layerHistorySize() const NO_THREAD_SAFETY_ANALYSIS {
+        return mLayerHistory->mLayerInfos.size();
     }
 
     /* ------------------------------------------------------------------------
@@ -48,6 +57,7 @@ public:
     auto& mutableEventControlThread() { return mEventControlThread; }
     auto& mutablePrimaryDispSync() { return mPrimaryDispSync; }
     auto& mutableHWVsyncAvailable() { return mHWVsyncAvailable; }
+    auto& mutableLayerHistory() { return mLayerHistory; }
 
     ~TestableScheduler() {
         // All these pointer and container clears help ensure that GMock does
@@ -58,6 +68,10 @@ public:
         mutablePrimaryDispSync().reset();
         mConnections.clear();
     }
+
+private:
+    void changeRefreshRate(const RefreshRate&, ConfigEvent) override {}
+    void repaintEverythingForHWC() override {}
 };
 
 } // namespace android

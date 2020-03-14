@@ -688,6 +688,7 @@ public:
                              const sp<IBinder>& /*applyToken*/,
                              const InputWindowCommands& /*inputWindowCommands*/,
                              int64_t /*desiredPresentTime*/, const client_cache_t& /*cachedBuffer*/,
+                             bool /*hasListenerCallbacks*/,
                              const std::vector<ListenerCallbacks>& /*listenerCallbacks*/) override {
     }
 
@@ -830,7 +831,24 @@ public:
                                       std::vector<int32_t>* /*outAllowedConfigs*/) override {
         return NO_ERROR;
     }
+    status_t setDesiredDisplayConfigSpecs(const sp<IBinder>& /*displayToken*/,
+                                          int32_t /*defaultModeId*/, float /*minRefreshRate*/,
+                                          float /*maxRefreshRate*/) override {
+        return NO_ERROR;
+    }
+    status_t getDesiredDisplayConfigSpecs(const sp<IBinder>& /*displayToken*/,
+                                          int32_t* /*outDefaultModeId*/,
+                                          float* /*outMinRefreshRate*/,
+                                          float* /*outMaxRefreshRate*/) override {
+        return NO_ERROR;
+    };
     status_t notifyPowerHint(int32_t /*hintId*/) override { return NO_ERROR; }
+
+    status_t setGlobalShadowSettings(const half4& /*ambientColor*/, const half4& /*spotColor*/,
+                                     float /*lightPosY*/, float /*lightPosZ*/,
+                                     float /*lightRadius*/) override {
+        return NO_ERROR;
+    }
 
 protected:
     IBinder* onAsBinder() override { return nullptr; }

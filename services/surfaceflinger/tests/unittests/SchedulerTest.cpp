@@ -50,10 +50,11 @@ SchedulerTest::SchedulerTest() {
             ::testing::UnitTest::GetInstance()->current_test_info();
     ALOGD("**** Setting up for %s.%s\n", test_info->test_case_name(), test_info->name());
 
-    std::vector<scheduler::RefreshRateConfigs::InputConfig> configs{{/*hwcId=*/0, 16666667}};
-    mRefreshRateConfigs =
-            std::make_unique<scheduler::RefreshRateConfigs>(/*refreshRateSwitching=*/false, configs,
-                                                            /*currentConfig=*/0);
+    std::vector<scheduler::RefreshRateConfigs::InputConfig> configs{
+            {{HwcConfigIndexType(0), HwcConfigGroupType(0), 16666667}}};
+    mRefreshRateConfigs = std::make_unique<
+            scheduler::RefreshRateConfigs>(/*refreshRateSwitching=*/false, configs,
+                                           /*currentConfig=*/HwcConfigIndexType(0));
 
     mScheduler = std::make_unique<TestableScheduler>(*mRefreshRateConfigs);
 
@@ -92,7 +93,6 @@ TEST_F(SchedulerTest, invalidConnectionHandle) {
                                                                   ISurfaceComposer::
                                                                           eConfigChangedSuppress));
     EXPECT_FALSE(connection);
-    EXPECT_FALSE(mScheduler->getEventThread(handle));
     EXPECT_FALSE(mScheduler->getEventConnection(handle));
 
     // The EXPECT_CALLS make sure we don't call the functions on the subsequent event threads.
@@ -121,8 +121,6 @@ TEST_F(SchedulerTest, validConnectionHandle) {
                                                                   ISurfaceComposer::
                                                                           eConfigChangedSuppress));
     ASSERT_EQ(mEventThreadConnection, connection);
-
-    EXPECT_TRUE(mScheduler->getEventThread(mConnectionHandle));
     EXPECT_TRUE(mScheduler->getEventConnection(mConnectionHandle));
 
     EXPECT_CALL(*mEventThread, onHotplugReceived(PHYSICAL_DISPLAY_ID, false)).Times(1);

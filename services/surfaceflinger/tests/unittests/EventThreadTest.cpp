@@ -26,6 +26,7 @@
 
 #include "AsyncCallRecorder.h"
 #include "Scheduler/EventThread.h"
+#include "Scheduler/HwcStrongTypes.h"
 
 using namespace std::chrono_literals;
 using namespace std::placeholders;
@@ -34,6 +35,7 @@ using testing::_;
 using testing::Invoke;
 
 namespace android {
+
 namespace {
 
 constexpr PhysicalDisplayId INTERNAL_DISPLAY_ID = 111;
@@ -42,6 +44,8 @@ constexpr PhysicalDisplayId DISPLAY_ID_64BIT = 0xabcd12349876fedcULL;
 
 class MockVSyncSource : public VSyncSource {
 public:
+    const char* getName() const override { return "test"; }
+
     MOCK_METHOD1(setVSyncEnabled, void(bool));
     MOCK_METHOD1(setCallback, void(VSyncSource::Callback*));
     MOCK_METHOD1(setPhaseOffset, void(nsecs_t));
@@ -54,8 +58,7 @@ class EventThreadTest : public testing::Test {
 protected:
     class MockEventThreadConnection : public EventThreadConnection {
     public:
-        MockEventThreadConnection(android::impl::EventThread* eventThread,
-                                  ResyncCallback&& resyncCallback,
+        MockEventThreadConnection(impl::EventThread* eventThread, ResyncCallback&& resyncCallback,
                                   ISurfaceComposer::ConfigChanged configChanged)
               : EventThreadConnection(eventThread, std::move(resyncCallback), configChanged) {}
         MOCK_METHOD1(postEvent, status_t(const DisplayEventReceiver::Event& event));
@@ -67,7 +70,7 @@ protected:
     EventThreadTest();
     ~EventThreadTest() override;
 
-    void createThread();
+    void createThread(std::unique_ptr<VSyncSource>);
     sp<MockEventThreadConnection> createConnection(ConnectionEventRecorder& recorder,
                                                    ISurfaceComposer::ConfigChanged configChanged);
 
@@ -91,9 +94,9 @@ protected:
     AsyncCallRecorder<void (*)(nsecs_t)> mInterceptVSyncCallRecorder;
     ConnectionEventRecorder mConnectionEventCallRecorder{0};
 
-    MockVSyncSource mVSyncSource;
+    MockVSyncSource* mVSyncSource;
     VSyncSource::Callback* mCallback = nullptr;
-    std::unique_ptr<android::impl::EventThread> mThread;
+    std::unique_ptr<impl::EventThread> mThread;
     sp<MockEventThreadConnection> mConnection;
 };
 
@@ -102,16 +105,19 @@ EventThreadTest::EventThreadTest() {
             ::testing::UnitTest::GetInstance()->current_test_info();
     ALOGD("**** Setting up for %s.%s\n", test_info->test_case_name(), test_info->name());
 
-    EXPECT_CALL(mVSyncSource, setVSyncEnabled(_))
+    auto vsyncSource = std::make_unique<MockVSyncSource>();
+    mVSyncSource = vsyncSource.get();
+
+    EXPECT_CALL(*mVSyncSource, setVSyncEnabled(_))
             .WillRepeatedly(Invoke(mVSyncSetEnabledCallRecorder.getInvocable()));
 
-    EXPECT_CALL(mVSyncSource, setCallback(_))
+    EXPECT_CALL(*mVSyncSource, setCallback(_))
             .WillRepeatedly(Invoke(mVSyncSetCallbackCallRecorder.getInvocable()));
 
-    EXPECT_CALL(mVSyncSource, setPhaseOffset(_))
+    EXPECT_CALL(*mVSyncSource, setPhaseOffset(_))
             .WillRepeatedly(Invoke(mVSyncSetPhaseOffsetCallRecorder.getInvocable()));
 
-    createThread();
+    createThread(std::move(vsyncSource));
     mConnection = createConnection(mConnectionEventCallRecorder,
                                    ISurfaceComposer::eConfigChangedDispatch);
 
@@ -129,11 +135,9 @@ EventThreadTest::~EventThreadTest() {
     EXPECT_TRUE(!mVSyncSetCallbackCallRecorder.waitForUnexpectedCall().has_value());
 }
 
-void EventThreadTest::createThread() {
-    mThread =
-            std::make_unique<android::impl::EventThread>(&mVSyncSource,
-                                                         mInterceptVSyncCallRecorder.getInvocable(),
-                                                         "unit-test-event-thread");
+void EventThreadTest::createThread(std::unique_ptr<VSyncSource> source) {
+    mThread = std::make_unique<impl::EventThread>(std::move(source),
+                                                  mInterceptVSyncCallRecorder.getInvocable());
 
     // EventThread should register itself as VSyncSource callback.
     mCallback = expectVSyncSetCallbackCallReceived();
@@ -446,17 +450,17 @@ TEST_F(EventThreadTest, postHotplugExternalConnect) {
 }
 
 TEST_F(EventThreadTest, postConfigChangedPrimary) {
-    mThread->onConfigChanged(INTERNAL_DISPLAY_ID, 7);
+    mThread->onConfigChanged(INTERNAL_DISPLAY_ID, HwcConfigIndexType(7));
     expectConfigChangedEventReceivedByConnection(INTERNAL_DISPLAY_ID, 7);
 }
 
 TEST_F(EventThreadTest, postConfigChangedExternal) {
-    mThread->onConfigChanged(EXTERNAL_DISPLAY_ID, 5);
+    mThread->onConfigChanged(EXTERNAL_DISPLAY_ID, HwcConfigIndexType(5));
     expectConfigChangedEventReceivedByConnection(EXTERNAL_DISPLAY_ID, 5);
 }
 
 TEST_F(EventThreadTest, postConfigChangedPrimary64bit) {
-    mThread->onConfigChanged(DISPLAY_ID_64BIT, 7);
+    mThread->onConfigChanged(DISPLAY_ID_64BIT, HwcConfigIndexType(7));
     expectConfigChangedEventReceivedByConnection(DISPLAY_ID_64BIT, 7);
 }
 
@@ -466,7 +470,7 @@ TEST_F(EventThreadTest, suppressConfigChanged) {
             createConnection(suppressConnectionEventRecorder,
                              ISurfaceComposer::eConfigChangedSuppress);
 
-    mThread->onConfigChanged(INTERNAL_DISPLAY_ID, 9);
+    mThread->onConfigChanged(INTERNAL_DISPLAY_ID, HwcConfigIndexType(9));
     expectConfigChangedEventReceivedByConnection(INTERNAL_DISPLAY_ID, 9);
 
     auto args = suppressConnectionEventRecorder.waitForCall();

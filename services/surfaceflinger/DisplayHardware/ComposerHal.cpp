@@ -17,8 +17,10 @@
 #undef LOG_TAG
 #define LOG_TAG "HwcComposer"
 
-#include <inttypes.h>
 #include <log/log.h>
+
+#include <algorithm>
+#include <cinttypes>
 
 #include "ComposerHal.h"
 
@@ -93,6 +95,7 @@ private:
 
 // assume NO_RESOURCES when Status::isOk returns false
 constexpr Error kDefaultError = Error::NO_RESOURCES;
+constexpr V2_4::Error kDefaultError_2_4 = static_cast<V2_4::Error>(kDefaultError);
 
 template<typename T, typename U>
 T unwrapRet(Return<T>& ret, const U& default_val)
@@ -173,7 +176,16 @@ Composer::Composer(const std::string& serviceName)
         LOG_ALWAYS_FATAL("failed to get hwcomposer service");
     }
 
-    if (sp<IComposer> composer_2_3 = IComposer::castFrom(mComposer)) {
+    if (sp<IComposer> composer_2_4 = IComposer::castFrom(mComposer)) {
+        composer_2_4->createClient_2_4([&](const auto& tmpError, const auto& tmpClient) {
+            if (tmpError == V2_4::Error::NONE) {
+                mClient = tmpClient;
+                mClient_2_2 = tmpClient;
+                mClient_2_3 = tmpClient;
+                mClient_2_4 = tmpClient;
+            }
+        });
+    } else if (sp<V2_3::IComposer> composer_2_3 = V2_3::IComposer::castFrom(mComposer)) {
         composer_2_3->createClient_2_3([&](const auto& tmpError, const auto& tmpClient) {
             if (tmpError == Error::NONE) {
                 mClient = tmpClient;
@@ -235,7 +247,12 @@ std::string Composer::dumpDebugInfo()
 void Composer::registerCallback(const sp<IComposerCallback>& callback)
 {
     android::hardware::setMinSchedulerPolicy(callback, SCHED_FIFO, 2);
-    auto ret = mClient->registerCallback(callback);
+    auto ret = [&]() {
+        if (mClient_2_4) {
+            return mClient_2_4->registerCallback_2_4(callback);
+        }
+        return mClient->registerCallback(callback);
+    }();
     if (!ret.isOk()) {
         ALOGE("failed to register IComposerCallback");
     }
@@ -401,15 +418,28 @@ Error Composer::getDisplayAttribute(Display display, Config config,
         IComposerClient::Attribute attribute, int32_t* outValue)
 {
     Error error = kDefaultError;
-    mClient->getDisplayAttribute(display, config, attribute,
-            [&](const auto& tmpError, const auto& tmpValue) {
-                error = tmpError;
-                if (error != Error::NONE) {
-                    return;
-                }
+    if (mClient_2_4) {
+        mClient_2_4->getDisplayAttribute_2_4(display, config, attribute,
+                                             [&](const auto& tmpError, const auto& tmpValue) {
+                                                 error = static_cast<Error>(tmpError);
+                                                 if (error != Error::NONE) {
+                                                     return;
+                                                 }
 
-                *outValue = tmpValue;
-            });
+                                                 *outValue = tmpValue;
+                                             });
+    } else {
+        mClient->getDisplayAttribute(display, config,
+                                     static_cast<V2_1::IComposerClient::Attribute>(attribute),
+                                     [&](const auto& tmpError, const auto& tmpValue) {
+                                         error = tmpError;
+                                         if (error != Error::NONE) {
+                                             return;
+                                         }
+
+                                         *outValue = tmpValue;
+                                     });
+    }
 
     return error;
 }
@@ -454,23 +484,6 @@ Error Composer::getDisplayRequests(Display display,
     mReader.takeDisplayRequests(display, outDisplayRequestMask,
             outLayers, outLayerRequestMasks);
     return Error::NONE;
-}
-
-Error Composer::getDisplayType(Display display,
-        IComposerClient::DisplayType* outType)
-{
-    Error error = kDefaultError;
-    mClient->getDisplayType(display,
-            [&](const auto& tmpError, const auto& tmpType) {
-                error = tmpError;
-                if (error != Error::NONE) {
-                    return;
-                }
-
-                *outType = tmpType;
-            });
-
-    return error;
 }
 
 Error Composer::getDozeSupport(Display display, bool* outSupport)
@@ -1113,23 +1126,6 @@ Error Composer::getDisplayedContentSamplingAttributes(Display display, PixelForm
     return error;
 }
 
-Error Composer::getDisplayCapabilities(Display display,
-                                       std::vector<DisplayCapability>* outCapabilities) {
-    if (!mClient_2_3) {
-        return Error::UNSUPPORTED;
-    }
-    Error error = kDefaultError;
-    mClient_2_3->getDisplayCapabilities(display,
-                                        [&](const auto& tmpError, const auto& tmpCapabilities) {
-                                            error = tmpError;
-                                            if (error != Error::NONE) {
-                                                return;
-                                            }
-                                            *outCapabilities = tmpCapabilities;
-                                        });
-    return error;
-}
-
 Error Composer::setDisplayContentSamplingEnabled(Display display, bool enabled,
                                                  uint8_t componentMask, uint64_t maxFrames) {
     if (!mClient_2_3) {
@@ -1185,6 +1181,104 @@ Error Composer::setDisplayBrightness(Display display, float brightness) {
         return Error::UNSUPPORTED;
     }
     return mClient_2_3->setDisplayBrightness(display, brightness);
+}
+
+// Composer HAL 2.4
+
+Error Composer::getDisplayCapabilities(Display display,
+                                       std::vector<DisplayCapability>* outCapabilities) {
+    if (!mClient_2_3) {
+        return Error::UNSUPPORTED;
+    }
+
+    V2_4::Error error = kDefaultError_2_4;
+    if (mClient_2_4) {
+        mClient_2_4->getDisplayCapabilities_2_4(display,
+                                                [&](const auto& tmpError, const auto& tmpCaps) {
+                                                    error = tmpError;
+                                                    if (error != V2_4::Error::NONE) {
+                                                        return;
+                                                    }
+                                                    *outCapabilities = tmpCaps;
+                                                });
+    } else {
+        mClient_2_3
+                ->getDisplayCapabilities(display, [&](const auto& tmpError, const auto& tmpCaps) {
+                    error = static_cast<V2_4::Error>(tmpError);
+                    if (error != V2_4::Error::NONE) {
+                        return;
+                    }
+
+                    outCapabilities->resize(tmpCaps.size());
+                    std::transform(tmpCaps.begin(), tmpCaps.end(), outCapabilities->begin(),
+                                   [](auto cap) { return static_cast<DisplayCapability>(cap); });
+                });
+    }
+
+    return static_cast<Error>(error);
+}
+
+V2_4::Error Composer::getDisplayConnectionType(Display display,
+                                               IComposerClient::DisplayConnectionType* outType) {
+    using Error = V2_4::Error;
+    if (!mClient_2_4) {
+        return Error::UNSUPPORTED;
+    }
+
+    Error error = kDefaultError_2_4;
+    mClient_2_4->getDisplayConnectionType(display, [&](const auto& tmpError, const auto& tmpType) {
+        error = tmpError;
+        if (error != V2_4::Error::NONE) {
+            return;
+        }
+
+        *outType = tmpType;
+    });
+
+    return error;
+}
+
+V2_4::Error Composer::getDisplayVsyncPeriod(Display display, VsyncPeriodNanos* outVsyncPeriod) {
+    using Error = V2_4::Error;
+    if (!mClient_2_4) {
+        return Error::UNSUPPORTED;
+    }
+
+    Error error = kDefaultError_2_4;
+    mClient_2_4->getDisplayVsyncPeriod(display,
+                                       [&](const auto& tmpError, const auto& tmpVsyncPeriod) {
+                                           error = tmpError;
+                                           if (error != Error::NONE) {
+                                               return;
+                                           }
+
+                                           *outVsyncPeriod = tmpVsyncPeriod;
+                                       });
+
+    return error;
+}
+
+V2_4::Error Composer::setActiveConfigWithConstraints(
+        Display display, Config config,
+        const IComposerClient::VsyncPeriodChangeConstraints& vsyncPeriodChangeConstraints,
+        VsyncPeriodChangeTimeline* outTimeline) {
+    using Error = V2_4::Error;
+    if (!mClient_2_4) {
+        return Error::UNSUPPORTED;
+    }
+
+    Error error = kDefaultError_2_4;
+    mClient_2_4->setActiveConfigWithConstraints(display, config, vsyncPeriodChangeConstraints,
+                                                [&](const auto& tmpError, const auto& tmpTimeline) {
+                                                    error = tmpError;
+                                                    if (error != Error::NONE) {
+                                                        return;
+                                                    }
+
+                                                    *outTimeline = tmpTimeline;
+                                                });
+
+    return error;
 }
 
 CommandReader::~CommandReader()

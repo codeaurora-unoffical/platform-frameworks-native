@@ -25,13 +25,9 @@
 #include <sys/types.h>
 
 #include <compositionengine/CompositionEngine.h>
-#include <compositionengine/Display.h>
 #include <compositionengine/Layer.h>
 #include <compositionengine/LayerCreationArgs.h>
 #include <compositionengine/LayerFECompositionState.h>
-#include <compositionengine/OutputLayer.h>
-#include <compositionengine/impl/LayerCompositionState.h>
-#include <compositionengine/impl/OutputLayerCompositionState.h>
 #include <renderengine/RenderEngine.h>
 #include <ui/GraphicBuffer.h>
 #include <utils/Errors.h>
@@ -111,6 +107,12 @@ ui::Dataspace ColorLayer::getDataSpace() const {
     return mDrawingState.dataspace;
 }
 
-// ---------------------------------------------------------------------------
+sp<Layer> ColorLayer::createClone() {
+    sp<ColorLayer> layer = mFlinger->getFactory().createColorLayer(
+            LayerCreationArgs(mFlinger.get(), nullptr, mName + " (Mirror)", 0, 0, 0,
+                              LayerMetadata()));
+    layer->setInitialValuesForClone(this);
+    return layer;
+}
 
-}; // namespace android
+} // namespace android

@@ -34,17 +34,12 @@ namespace android::compositionengine::impl {
 
 std::shared_ptr<Display> createDisplay(
         const compositionengine::CompositionEngine& compositionEngine,
-        compositionengine::DisplayCreationArgs&& args) {
-    return std::make_shared<Display>(compositionEngine, std::move(args));
+        const compositionengine::DisplayCreationArgs& args) {
+    return createDisplayTemplated<Display>(compositionEngine, args);
 }
 
-Display::Display(const CompositionEngine& compositionEngine, DisplayCreationArgs&& args)
-      : compositionengine::impl::Output(compositionEngine),
-        mIsVirtual(args.isVirtual),
-        mId(args.displayId),
-        mPowerAdvisor(args.powerAdvisor) {
-    editState().isSecure = args.isSecure;
-}
+Display::Display(const DisplayCreationArgs& args)
+      : mIsVirtual(args.isVirtual), mId(args.displayId), mPowerAdvisor(args.powerAdvisor) {}
 
 Display::~Display() = default;
 
@@ -58,6 +53,10 @@ bool Display::isSecure() const {
 
 bool Display::isVirtual() const {
     return mIsVirtual;
+}
+
+std::optional<DisplayId> Display::getDisplayId() const {
+    return mId;
 }
 
 void Display::disconnect() {
@@ -125,19 +124,19 @@ void Display::dump(std::string& out) const {
     Output::dumpBase(out);
 }
 
-void Display::createDisplayColorProfile(DisplayColorProfileCreationArgs&& args) {
-    setDisplayColorProfile(compositionengine::impl::createDisplayColorProfile(std::move(args)));
+void Display::createDisplayColorProfile(const DisplayColorProfileCreationArgs& args) {
+    setDisplayColorProfile(compositionengine::impl::createDisplayColorProfile(args));
 }
 
-void Display::createRenderSurface(RenderSurfaceCreationArgs&& args) {
-    setRenderSurface(compositionengine::impl::createRenderSurface(getCompositionEngine(), *this,
-                                                                  std::move(args)));
+void Display::createRenderSurface(const RenderSurfaceCreationArgs& args) {
+    setRenderSurface(
+            compositionengine::impl::createRenderSurface(getCompositionEngine(), *this, args));
 }
 
 std::unique_ptr<compositionengine::OutputLayer> Display::createOutputLayer(
         const std::shared_ptr<compositionengine::Layer>& layer,
         const sp<compositionengine::LayerFE>& layerFE) const {
-    auto result = Output::createOutputLayer(layer, layerFE);
+    auto result = impl::createOutputLayer(*this, layer, layerFE);
 
     if (result && mId) {
         auto& hwc = getCompositionEngine().getHwComposer();
@@ -156,6 +155,39 @@ std::unique_ptr<compositionengine::OutputLayer> Display::createOutputLayer(
         result->setHwcLayer(std::move(hwcLayer));
     }
     return result;
+}
+
+void Display::setReleasedLayers(const compositionengine::CompositionRefreshArgs& refreshArgs) {
+    Output::setReleasedLayers(refreshArgs);
+
+    if (!mId || refreshArgs.layersWithQueuedFrames.empty()) {
+        return;
+    }
+
+    // For layers that are being removed from a HWC display, and that have
+    // queued frames, add them to a a list of released layers so we can properly
+    // set a fence.
+    compositionengine::Output::ReleasedLayers releasedLayers;
+
+    // Any non-null entries in the current list of layers are layers that are no
+    // longer going to be visible
+    for (auto* layer : getOutputLayersOrderedByZ()) {
+        if (!layer) {
+            continue;
+        }
+
+        sp<compositionengine::LayerFE> layerFE(&layer->getLayerFE());
+        const bool hasQueuedFrames =
+                std::find(refreshArgs.layersWithQueuedFrames.cbegin(),
+                          refreshArgs.layersWithQueuedFrames.cend(),
+                          &layer->getLayer()) != refreshArgs.layersWithQueuedFrames.cend();
+
+        if (hasQueuedFrames) {
+            releasedLayers.emplace_back(layerFE);
+        }
+    }
+
+    setReleasedLayers(std::move(releasedLayers));
 }
 
 void Display::chooseCompositionStrategy() {
@@ -202,14 +234,14 @@ bool Display::getSkipColorTransform() const {
 }
 
 bool Display::anyLayersRequireClientComposition() const {
-    const auto& layers = getOutputLayersOrderedByZ();
-    return std::any_of(layers.cbegin(), layers.cend(),
+    const auto layers = getOutputLayersOrderedByZ();
+    return std::any_of(layers.begin(), layers.end(),
                        [](const auto& layer) { return layer->requiresClientComposition(); });
 }
 
 bool Display::allLayersRequireClientComposition() const {
-    const auto& layers = getOutputLayersOrderedByZ();
-    return std::all_of(layers.cbegin(), layers.cend(),
+    const auto layers = getOutputLayersOrderedByZ();
+    return std::all_of(layers.begin(), layers.end(),
                        [](const auto& layer) { return layer->requiresClientComposition(); });
 }
 
@@ -218,7 +250,7 @@ void Display::applyChangedTypesToLayers(const ChangedTypes& changedTypes) {
         return;
     }
 
-    for (auto& layer : getOutputLayersOrderedByZ()) {
+    for (auto* layer : getOutputLayersOrderedByZ()) {
         auto hwcLayer = layer->getHwcLayer();
         if (!hwcLayer) {
             continue;
@@ -239,7 +271,7 @@ void Display::applyDisplayRequests(const DisplayRequests& displayRequests) {
 }
 
 void Display::applyLayerRequestsToLayers(const LayerRequests& layerRequests) {
-    for (auto& layer : getOutputLayersOrderedByZ()) {
+    for (auto* layer : getOutputLayersOrderedByZ()) {
         layer->prepareForDeviceLayerRequests();
 
         auto hwcLayer = layer->getHwcLayer();
@@ -267,7 +299,7 @@ compositionengine::Output::FrameFences Display::presentAndGetFrameFences() {
     result.presentFence = hwc.getPresentFence(*mId);
 
     // TODO(b/121291683): Change HWComposer call to return entire map
-    for (const auto& layer : getOutputLayersOrderedByZ()) {
+    for (const auto* layer : getOutputLayersOrderedByZ()) {
         auto hwcLayer = layer->getHwcLayer();
         if (!hwcLayer) {
             continue;

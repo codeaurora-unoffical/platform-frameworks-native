@@ -16,9 +16,10 @@
 
 #pragma once
 
-#include <memory>
-
+#include <TimeStats/TimeStats.h>
 #include <utils/Timers.h>
+
+#include <memory>
 
 namespace android {
 
@@ -46,14 +47,17 @@ public:
     virtual ~CompositionEngine();
 
     // Create a composition Display
-    virtual std::shared_ptr<Display> createDisplay(DisplayCreationArgs&&) = 0;
-    virtual std::shared_ptr<Layer> createLayer(LayerCreationArgs&&) = 0;
+    virtual std::shared_ptr<Display> createDisplay(const DisplayCreationArgs&) = 0;
+    virtual std::shared_ptr<Layer> createLayer(const LayerCreationArgs&) = 0;
 
     virtual HWComposer& getHwComposer() const = 0;
     virtual void setHwComposer(std::unique_ptr<HWComposer>) = 0;
 
     virtual renderengine::RenderEngine& getRenderEngine() const = 0;
     virtual void setRenderEngine(std::unique_ptr<renderengine::RenderEngine>) = 0;
+
+    virtual TimeStats& getTimeStats() const = 0;
+    virtual void setTimeStats(const std::shared_ptr<TimeStats>&) = 0;
 
     virtual bool needsAnotherUpdate() const = 0;
     virtual nsecs_t getLastFrameRefreshTimestamp() const = 0;
@@ -66,6 +70,9 @@ public:
 
     // TODO(b/121291683): These will become private/internal
     virtual void preComposition(CompositionRefreshArgs&) = 0;
+
+    // Debugging
+    virtual void dump(std::string&) const = 0;
 };
 
 } // namespace compositionengine

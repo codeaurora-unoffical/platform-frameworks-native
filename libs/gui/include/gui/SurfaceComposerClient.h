@@ -58,12 +58,16 @@ class Region;
 
 struct SurfaceControlStats {
     SurfaceControlStats(const sp<SurfaceControl>& sc, nsecs_t time,
-                        const sp<Fence>& prevReleaseFence)
-          : surfaceControl(sc), acquireTime(time), previousReleaseFence(prevReleaseFence) {}
+                        const sp<Fence>& prevReleaseFence, uint32_t hint)
+          : surfaceControl(sc),
+            acquireTime(time),
+            previousReleaseFence(prevReleaseFence),
+            transformHint(hint) {}
 
     sp<SurfaceControl> surfaceControl;
     nsecs_t acquireTime = -1;
     sp<Fence> previousReleaseFence;
+    uint32_t transformHint = 0;
 };
 
 using TransactionCompletedCallbackTakesContext =
@@ -124,6 +128,22 @@ public:
     // returned from getDisplayConfigs().
     static status_t getAllowedDisplayConfigs(const sp<IBinder>& displayToken,
                                              std::vector<int32_t>* outAllowedConfigs);
+
+    // Sets the refresh rate boundaries for display configuration.
+    // For all other parameters, default configuration is used. The index for the default is
+    // corresponting to the configs returned from getDisplayConfigs().
+    static status_t setDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken,
+                                                 int32_t defaultModeId, float minRefreshRate,
+                                                 float maxRefreshRate);
+    // Gets the refresh rate boundaries for display configuration.
+    // For all other parameters, default configuration is used. The index for the default is
+    // corresponting to the configs returned from getDisplayConfigs().
+    // The reason is passed in for telemetry tracking, and it corresponds to the list of all
+    // the policy rules that were used.
+    static status_t getDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken,
+                                                 int32_t* outDefaultModeId,
+                                                 float* outMinRefreshRate,
+                                                 float* outMaxRefreshRate);
 
     // Gets the list of supported color modes for the given display
     static status_t getDisplayColorModes(const sp<IBinder>& display,
@@ -210,6 +230,27 @@ public:
      */
     static status_t notifyPowerHint(int32_t hintId);
 
+    /*
+     * Sets the global configuration for all the shadows drawn by SurfaceFlinger. Shadow follows
+     * material design guidelines.
+     *
+     * ambientColor
+     *      Color to the ambient shadow. The alpha is premultiplied.
+     *
+     * spotColor
+     *      Color to the spot shadow. The alpha is premultiplied. The position of the spot shadow
+     *      depends on the light position.
+     *
+     * lightPosY/lightPosZ
+     *      Position of the light used to cast the spot shadow. The X value is always the display
+     *      width / 2.
+     *
+     * lightRadius
+     *      Radius of the light casting the shadow.
+     */
+    static status_t setGlobalShadowSettings(const half4& ambientColor, const half4& spotColor,
+                                            float lightPosY, float lightPosZ, float lightRadius);
+
     // ------------------------------------------------------------------------
     // surface creation / destruction
 
@@ -222,18 +263,18 @@ public:
                                      PixelFormat format,               // pixel-format desired
                                      uint32_t flags = 0,               // usage flags
                                      SurfaceControl* parent = nullptr, // parent
-                                     LayerMetadata metadata = LayerMetadata() // metadata
-    );
+                                     LayerMetadata metadata = LayerMetadata(), // metadata
+                                     uint32_t* outTransformHint = nullptr);
 
     status_t createSurfaceChecked(const String8& name, // name of the surface
                                   uint32_t w,          // width in pixel
                                   uint32_t h,          // height in pixel
                                   PixelFormat format,  // pixel-format desired
                                   sp<SurfaceControl>* outSurface,
-                                  uint32_t flags = 0,                      // usage flags
-                                  SurfaceControl* parent = nullptr,        // parent
-                                  LayerMetadata metadata = LayerMetadata() // metadata
-    );
+                                  uint32_t flags = 0,                       // usage flags
+                                  SurfaceControl* parent = nullptr,         // parent
+                                  LayerMetadata metadata = LayerMetadata(), // metadata
+                                  uint32_t* outTransformHint = nullptr);
 
     //! Create a surface
     sp<SurfaceControl> createWithSurfaceParent(const String8& name,       // name of the surface
@@ -242,8 +283,19 @@ public:
                                                PixelFormat format,        // pixel-format desired
                                                uint32_t flags = 0,        // usage flags
                                                Surface* parent = nullptr, // parent
-                                               LayerMetadata metadata = LayerMetadata() // metadata
-    );
+                                               LayerMetadata metadata = LayerMetadata(), // metadata
+                                               uint32_t* outTransformHint = nullptr);
+
+    // Creates a mirrored hierarchy for the mirrorFromSurface. This returns a SurfaceControl
+    // which is a parent of the root of the mirrored hierarchy.
+    //
+    //  Real Hierarchy    Mirror
+    //                      SC (value that's returned)
+    //                      |
+    //      A               A'
+    //      |               |
+    //      B               B'
+    sp<SurfaceControl> mirrorSurface(SurfaceControl* mirrorFromSurface);
 
     //! Create a virtual display
     static sp<IBinder> createDisplay(const String8& displayName, bool secure);
@@ -291,6 +343,7 @@ public:
     };
 
     class Transaction : public Parcelable {
+    protected:
         std::unordered_map<sp<IBinder>, ComposerState, IBinderHash> mComposerStates;
         SortedVector<DisplayState > mDisplayStates;
         std::unordered_map<sp<ITransactionCompletedListener>, CallbackInfo, TCLHash>
@@ -458,6 +511,7 @@ public:
 
         Transaction& setGeometry(const sp<SurfaceControl>& sc,
                 const Rect& source, const Rect& dst, int transform);
+        Transaction& setShadowRadius(const sp<SurfaceControl>& sc, float cornerRadius);
 
         status_t setDisplaySurface(const sp<IBinder>& token,
                 const sp<IGraphicBufferProducer>& bufferProducer);

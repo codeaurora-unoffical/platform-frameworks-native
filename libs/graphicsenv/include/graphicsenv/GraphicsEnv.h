@@ -33,8 +33,16 @@ class GraphicsEnv {
 public:
     static GraphicsEnv& getInstance();
 
-    // Check if device is debuggable.
-    int getCanLoadSystemLibraries();
+    // Check if the process is debuggable. It returns false except in any of the
+    // following circumstances:
+    // 1. ro.debuggable=1 (global debuggable enabled).
+    // 2. android:debuggable="true" in the manifest for an individual app.
+    // 3. An app which explicitly calls prctl(PR_SET_DUMPABLE, 1).
+    // 4. GraphicsEnv calls prctl(PR_SET_DUMPABLE, 1) in the presence of
+    //    <meta-data android:name="com.android.graphics.injectLayers.enable"
+    //               android:value="true"/>
+    //    in the application manifest.
+    bool isDebuggable();
 
     /*
      * Apis for updatable driver
@@ -66,6 +74,14 @@ public:
     void setDriverToLoad(GpuStatsInfo::Driver driver);
     // Set which driver is actually loaded.
     void setDriverLoaded(GpuStatsInfo::Api api, bool isDriverLoaded, int64_t driverLoadingTime);
+
+    /*
+     * Api for Vk/GL layer injection.  Presently, drivers enable certain
+     * profiling features when prctl(PR_GET_DUMPABLE) returns true.
+     * Calling this when layer injection metadata is present allows the driver
+     * to enable profiling even when in a non-debuggable app
+     */
+    bool setInjectLayersPrSetDumpable();
 
     /*
      * Apis for ANGLE

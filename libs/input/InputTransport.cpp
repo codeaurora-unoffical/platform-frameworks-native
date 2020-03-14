@@ -11,10 +11,10 @@
 #define DEBUG_CHANNEL_MESSAGES 0
 
 // Log debug messages whenever InputChannel objects are created/destroyed
-#define DEBUG_CHANNEL_LIFECYCLE 0
+static constexpr bool DEBUG_CHANNEL_LIFECYCLE = false;
 
 // Log debug messages about transport actions
-#define DEBUG_TRANSPORT_ACTIONS 0
+static constexpr bool DEBUG_TRANSPORT_ACTIONS = false;
 
 // Log debug messages about touch event resampling
 #define DEBUG_RESAMPLING 0
@@ -34,7 +34,6 @@
 #include <utils/Trace.h>
 
 #include <input/InputTransport.h>
-#include <statslog.h>
 
 using android::base::StringPrintf;
 
@@ -89,18 +88,23 @@ inline static bool isPointerEvent(int32_t source) {
     return (source & AINPUT_SOURCE_CLASS_POINTER) == AINPUT_SOURCE_CLASS_POINTER;
 }
 
+inline static const char* toString(bool value) {
+    return value ? "true" : "false";
+}
+
 // --- InputMessage ---
 
 bool InputMessage::isValid(size_t actualSize) const {
     if (size() == actualSize) {
         switch (header.type) {
-        case TYPE_KEY:
-            return true;
-        case TYPE_MOTION:
-            return body.motion.pointerCount > 0
-                    && body.motion.pointerCount <= MAX_POINTERS;
-        case TYPE_FINISHED:
-            return true;
+            case Type::KEY:
+                return true;
+            case Type::MOTION:
+                return body.motion.pointerCount > 0 && body.motion.pointerCount <= MAX_POINTERS;
+            case Type::FINISHED:
+                return true;
+            case Type::FOCUS:
+                return true;
         }
     }
     return false;
@@ -108,12 +112,14 @@ bool InputMessage::isValid(size_t actualSize) const {
 
 size_t InputMessage::size() const {
     switch (header.type) {
-    case TYPE_KEY:
-        return sizeof(Header) + body.key.size();
-    case TYPE_MOTION:
-        return sizeof(Header) + body.motion.size();
-    case TYPE_FINISHED:
-        return sizeof(Header) + body.finished.size();
+        case Type::KEY:
+            return sizeof(Header) + body.key.size();
+        case Type::MOTION:
+            return sizeof(Header) + body.motion.size();
+        case Type::FINISHED:
+            return sizeof(Header) + body.finished.size();
+        case Type::FOCUS:
+            return sizeof(Header) + body.focus.size();
     }
     return sizeof(Header);
 }
@@ -130,7 +136,7 @@ void InputMessage::getSanitizedCopy(InputMessage* msg) const {
 
     // Write the body
     switch(header.type) {
-        case InputMessage::TYPE_KEY: {
+        case InputMessage::Type::KEY: {
             // uint32_t seq
             msg->body.key.seq = body.key.seq;
             // nsecs_t eventTime
@@ -157,7 +163,7 @@ void InputMessage::getSanitizedCopy(InputMessage* msg) const {
             msg->body.key.downTime = body.key.downTime;
             break;
         }
-        case InputMessage::TYPE_MOTION: {
+        case InputMessage::Type::MOTION: {
             // uint32_t seq
             msg->body.motion.seq = body.motion.seq;
             // nsecs_t eventTime
@@ -213,13 +219,15 @@ void InputMessage::getSanitizedCopy(InputMessage* msg) const {
             }
             break;
         }
-        case InputMessage::TYPE_FINISHED: {
+        case InputMessage::Type::FINISHED: {
             msg->body.finished.seq = body.finished.seq;
             msg->body.finished.handled = body.finished.handled;
             break;
         }
-        default: {
-            LOG_FATAL("Unexpected message type %i", header.type);
+        case InputMessage::Type::FOCUS: {
+            msg->body.focus.seq = body.focus.seq;
+            msg->body.focus.hasFocus = body.focus.hasFocus;
+            msg->body.focus.inTouchMode = body.focus.inTouchMode;
             break;
         }
     }
@@ -227,28 +235,28 @@ void InputMessage::getSanitizedCopy(InputMessage* msg) const {
 
 // --- InputChannel ---
 
-sp<InputChannel> InputChannel::create(const std::string& name, android::base::unique_fd fd) {
+sp<InputChannel> InputChannel::create(const std::string& name, android::base::unique_fd fd,
+                                      sp<IBinder> token) {
     const int result = fcntl(fd, F_SETFL, O_NONBLOCK);
     if (result != 0) {
         LOG_ALWAYS_FATAL("channel '%s' ~ Could not make socket non-blocking: %s", name.c_str(),
                          strerror(errno));
         return nullptr;
     }
-    return new InputChannel(name, std::move(fd));
+    return new InputChannel(name, std::move(fd), token);
 }
 
-InputChannel::InputChannel(const std::string& name, android::base::unique_fd fd)
-      : mName(name), mFd(std::move(fd)) {
-#if DEBUG_CHANNEL_LIFECYCLE
-    ALOGD("Input channel constructed: name='%s', fd=%d",
-            mName.c_str(), fd);
-#endif
+InputChannel::InputChannel(const std::string& name, android::base::unique_fd fd, sp<IBinder> token)
+      : mName(name), mFd(std::move(fd)), mToken(token) {
+    if (DEBUG_CHANNEL_LIFECYCLE) {
+        ALOGD("Input channel constructed: name='%s', fd=%d", mName.c_str(), mFd.get());
+    }
 }
 
 InputChannel::~InputChannel() {
-#if DEBUG_CHANNEL_LIFECYCLE
-    ALOGD("Input channel destroyed: name='%s', fd=%d", mName.c_str(), mFd.get());
-#endif
+    if (DEBUG_CHANNEL_LIFECYCLE) {
+        ALOGD("Input channel destroyed: name='%s', fd=%d", mName.c_str(), mFd.get());
+    }
 }
 
 status_t InputChannel::openInputChannelPair(const std::string& name,
@@ -269,13 +277,15 @@ status_t InputChannel::openInputChannelPair(const std::string& name,
     setsockopt(sockets[1], SOL_SOCKET, SO_SNDBUF, &bufferSize, sizeof(bufferSize));
     setsockopt(sockets[1], SOL_SOCKET, SO_RCVBUF, &bufferSize, sizeof(bufferSize));
 
+    sp<IBinder> token = new BBinder();
+
     std::string serverChannelName = name + " (server)";
     android::base::unique_fd serverFd(sockets[0]);
-    outServerChannel = InputChannel::create(serverChannelName, std::move(serverFd));
+    outServerChannel = InputChannel::create(serverChannelName, std::move(serverFd), token);
 
     std::string clientChannelName = name + " (client)";
     android::base::unique_fd clientFd(sockets[1]);
-    outClientChannel = InputChannel::create(clientChannelName, std::move(clientFd));
+    outClientChannel = InputChannel::create(clientChannelName, std::move(clientFd), token);
     return OK;
 }
 
@@ -362,9 +372,16 @@ sp<InputChannel> InputChannel::dup() const {
     if (!newFd.ok()) {
         ALOGE("Could not duplicate fd %i for channel %s: %s", getFd(), mName.c_str(),
               strerror(errno));
+        const bool hitFdLimit = errno == EMFILE || errno == ENFILE;
+        // If this process is out of file descriptors, then throwing that might end up exploding
+        // on the other side of a binder call, which isn't really helpful.
+        // Better to just crash here and hope that the FD leak is slow.
+        // Other failures could be client errors, so we still propagate those back to the caller.
+        LOG_ALWAYS_FATAL_IF(hitFdLimit, "Too many open files, could not duplicate input channel %s",
+                            getName().c_str());
         return nullptr;
     }
-    return InputChannel::create(mName, std::move(newFd));
+    return InputChannel::create(mName, std::move(newFd), mToken);
 }
 
 status_t InputChannel::write(Parcel& out) const {
@@ -391,22 +408,11 @@ sp<InputChannel> InputChannel::read(const Parcel& from) {
         return nullptr;
     }
 
-    sp<InputChannel> channel = InputChannel::create(name, std::move(rawFd));
-    if (channel != nullptr) {
-        channel->setToken(token);
-    }
-    return channel;
+    return InputChannel::create(name, std::move(rawFd), token);
 }
 
-sp<IBinder> InputChannel::getToken() const {
+sp<IBinder> InputChannel::getConnectionToken() const {
     return mToken;
-}
-
-void InputChannel::setToken(const sp<IBinder>& token) {
-    if (mToken != nullptr) {
-        ALOGE("Assigning InputChannel (%s) a second handle?", mName.c_str());
-    }
-    mToken = token;
 }
 
 // --- InputPublisher ---
@@ -436,14 +442,13 @@ status_t InputPublisher::publishKeyEvent(
                 mChannel->getName().c_str(), keyCode);
         ATRACE_NAME(message.c_str());
     }
-#if DEBUG_TRANSPORT_ACTIONS
-    ALOGD("channel '%s' publisher ~ publishKeyEvent: seq=%u, deviceId=%d, source=0x%x, "
-            "action=0x%x, flags=0x%x, keyCode=%d, scanCode=%d, metaState=0x%x, repeatCount=%d,"
-            "downTime=%" PRId64 ", eventTime=%" PRId64,
-            mChannel->getName().c_str(), seq,
-            deviceId, source, action, flags, keyCode, scanCode, metaState, repeatCount,
-            downTime, eventTime);
-#endif
+    if (DEBUG_TRANSPORT_ACTIONS) {
+        ALOGD("channel '%s' publisher ~ publishKeyEvent: seq=%u, deviceId=%d, source=0x%x, "
+              "action=0x%x, flags=0x%x, keyCode=%d, scanCode=%d, metaState=0x%x, repeatCount=%d,"
+              "downTime=%" PRId64 ", eventTime=%" PRId64,
+              mChannel->getName().c_str(), seq, deviceId, source, action, flags, keyCode, scanCode,
+              metaState, repeatCount, downTime, eventTime);
+    }
 
     if (!seq) {
         ALOGE("Attempted to publish a key event with sequence number 0.");
@@ -451,7 +456,7 @@ status_t InputPublisher::publishKeyEvent(
     }
 
     InputMessage msg;
-    msg.header.type = InputMessage::TYPE_KEY;
+    msg.header.type = InputMessage::Type::KEY;
     msg.body.key.seq = seq;
     msg.body.key.deviceId = deviceId;
     msg.body.key.source = source;
@@ -480,18 +485,18 @@ status_t InputPublisher::publishMotionEvent(
                 mChannel->getName().c_str(), action);
         ATRACE_NAME(message.c_str());
     }
-#if DEBUG_TRANSPORT_ACTIONS
-    ALOGD("channel '%s' publisher ~ publishMotionEvent: seq=%u, deviceId=%d, source=0x%x, "
-            "displayId=%" PRId32 ", "
-            "action=0x%x, actionButton=0x%08x, flags=0x%x, edgeFlags=0x%x, "
-            "metaState=0x%x, buttonState=0x%x, classification=%s, xOffset=%f, yOffset=%f, "
-            "xPrecision=%f, yPrecision=%f, downTime=%" PRId64 ", eventTime=%" PRId64 ", "
-            "pointerCount=%" PRIu32,
-            mChannel->getName().c_str(), seq,
-            deviceId, source, displayId, action, actionButton, flags, edgeFlags, metaState,
-            buttonState, motionClassificationToString(classification),
-            xOffset, yOffset, xPrecision, yPrecision, downTime, eventTime, pointerCount);
-#endif
+    if (DEBUG_TRANSPORT_ACTIONS) {
+        ALOGD("channel '%s' publisher ~ publishMotionEvent: seq=%u, deviceId=%d, source=0x%x, "
+              "displayId=%" PRId32 ", "
+              "action=0x%x, actionButton=0x%08x, flags=0x%x, edgeFlags=0x%x, "
+              "metaState=0x%x, buttonState=0x%x, classification=%s, xOffset=%f, yOffset=%f, "
+              "xPrecision=%f, yPrecision=%f, downTime=%" PRId64 ", eventTime=%" PRId64 ", "
+              "pointerCount=%" PRIu32,
+              mChannel->getName().c_str(), seq, deviceId, source, displayId, action, actionButton,
+              flags, edgeFlags, metaState, buttonState,
+              motionClassificationToString(classification), xOffset, yOffset, xPrecision,
+              yPrecision, downTime, eventTime, pointerCount);
+    }
 
     if (!seq) {
         ALOGE("Attempted to publish a motion event with sequence number 0.");
@@ -505,7 +510,7 @@ status_t InputPublisher::publishMotionEvent(
     }
 
     InputMessage msg;
-    msg.header.type = InputMessage::TYPE_MOTION;
+    msg.header.type = InputMessage::Type::MOTION;
     msg.body.motion.seq = seq;
     msg.body.motion.deviceId = deviceId;
     msg.body.motion.source = source;
@@ -531,17 +536,30 @@ status_t InputPublisher::publishMotionEvent(
         msg.body.motion.pointers[i].coords.copyFrom(pointerCoords[i]);
     }
 
-    if (source == AINPUT_SOURCE_TOUCHSCREEN) {
-        reportTouchEventForStatistics(eventTime);
+    return mChannel->sendMessage(&msg);
+}
+
+status_t InputPublisher::publishFocusEvent(uint32_t seq, bool hasFocus, bool inTouchMode) {
+    if (ATRACE_ENABLED()) {
+        std::string message =
+                StringPrintf("publishFocusEvent(inputChannel=%s, hasFocus=%s, inTouchMode=%s)",
+                             mChannel->getName().c_str(), toString(hasFocus),
+                             toString(inTouchMode));
+        ATRACE_NAME(message.c_str());
     }
+
+    InputMessage msg;
+    msg.header.type = InputMessage::Type::FOCUS;
+    msg.body.focus.seq = seq;
+    msg.body.focus.hasFocus = hasFocus ? 1 : 0;
+    msg.body.focus.inTouchMode = inTouchMode ? 1 : 0;
     return mChannel->sendMessage(&msg);
 }
 
 status_t InputPublisher::receiveFinishedSignal(uint32_t* outSeq, bool* outHandled) {
-#if DEBUG_TRANSPORT_ACTIONS
-    ALOGD("channel '%s' publisher ~ receiveFinishedSignal",
-            mChannel->getName().c_str());
-#endif
+    if (DEBUG_TRANSPORT_ACTIONS) {
+        ALOGD("channel '%s' publisher ~ receiveFinishedSignal", mChannel->getName().c_str());
+    }
 
     InputMessage msg;
     status_t result = mChannel->receiveMessage(&msg);
@@ -550,25 +568,14 @@ status_t InputPublisher::receiveFinishedSignal(uint32_t* outSeq, bool* outHandle
         *outHandled = false;
         return result;
     }
-    if (msg.header.type != InputMessage::TYPE_FINISHED) {
+    if (msg.header.type != InputMessage::Type::FINISHED) {
         ALOGE("channel '%s' publisher ~ Received unexpected message of type %d from consumer",
                 mChannel->getName().c_str(), msg.header.type);
         return UNKNOWN_ERROR;
     }
     *outSeq = msg.body.finished.seq;
-    *outHandled = msg.body.finished.handled;
+    *outHandled = msg.body.finished.handled == 1;
     return OK;
-}
-
-void InputPublisher::reportTouchEventForStatistics(nsecs_t evdevTime) {
-    if (mTouchStatistics.shouldReport()) {
-        android::util::stats_write(android::util::TOUCH_EVENT_REPORTED, mTouchStatistics.getMin(),
-                                   mTouchStatistics.getMax(), mTouchStatistics.getMean(),
-                                   mTouchStatistics.getStDev(), mTouchStatistics.getCount());
-        mTouchStatistics.reset();
-    }
-    nsecs_t latency = nanoseconds_to_microseconds(systemTime(CLOCK_MONOTONIC) - evdevTime);
-    mTouchStatistics.addValue(latency);
 }
 
 // --- InputConsumer ---
@@ -585,12 +592,12 @@ bool InputConsumer::isTouchResamplingEnabled() {
     return property_get_bool(PROPERTY_RESAMPLING_ENABLED, true);
 }
 
-status_t InputConsumer::consume(InputEventFactoryInterface* factory,
-        bool consumeBatches, nsecs_t frameTime, uint32_t* outSeq, InputEvent** outEvent) {
-#if DEBUG_TRANSPORT_ACTIONS
-    ALOGD("channel '%s' consumer ~ consume: consumeBatches=%s, frameTime=%" PRId64,
-            mChannel->getName().c_str(), consumeBatches ? "true" : "false", frameTime);
-#endif
+status_t InputConsumer::consume(InputEventFactoryInterface* factory, bool consumeBatches,
+                                nsecs_t frameTime, uint32_t* outSeq, InputEvent** outEvent) {
+    if (DEBUG_TRANSPORT_ACTIONS) {
+        ALOGD("channel '%s' consumer ~ consume: consumeBatches=%s, frameTime=%" PRId64,
+              mChannel->getName().c_str(), toString(consumeBatches), frameTime);
+    }
 
     *outSeq = 0;
     *outEvent = nullptr;
@@ -610,10 +617,10 @@ status_t InputConsumer::consume(InputEventFactoryInterface* factory,
                 if (consumeBatches || result != WOULD_BLOCK) {
                     result = consumeBatch(factory, frameTime, outSeq, outEvent);
                     if (*outEvent) {
-#if DEBUG_TRANSPORT_ACTIONS
-                        ALOGD("channel '%s' consumer ~ consumed batch event, seq=%u",
-                                mChannel->getName().c_str(), *outSeq);
-#endif
+                        if (DEBUG_TRANSPORT_ACTIONS) {
+                            ALOGD("channel '%s' consumer ~ consumed batch event, seq=%u",
+                                  mChannel->getName().c_str(), *outSeq);
+                        }
                         break;
                     }
                 }
@@ -622,92 +629,103 @@ status_t InputConsumer::consume(InputEventFactoryInterface* factory,
         }
 
         switch (mMsg.header.type) {
-        case InputMessage::TYPE_KEY: {
-            KeyEvent* keyEvent = factory->createKeyEvent();
-            if (!keyEvent) return NO_MEMORY;
+            case InputMessage::Type::KEY: {
+                KeyEvent* keyEvent = factory->createKeyEvent();
+                if (!keyEvent) return NO_MEMORY;
 
-            initializeKeyEvent(keyEvent, &mMsg);
-            *outSeq = mMsg.body.key.seq;
-            *outEvent = keyEvent;
-#if DEBUG_TRANSPORT_ACTIONS
-            ALOGD("channel '%s' consumer ~ consumed key event, seq=%u",
-                    mChannel->getName().c_str(), *outSeq);
-#endif
-            break;
-        }
-
-        case InputMessage::TYPE_MOTION: {
-            ssize_t batchIndex = findBatch(mMsg.body.motion.deviceId, mMsg.body.motion.source);
-            if (batchIndex >= 0) {
-                Batch& batch = mBatches.editItemAt(batchIndex);
-                if (canAddSample(batch, &mMsg)) {
-                    batch.samples.push(mMsg);
-#if DEBUG_TRANSPORT_ACTIONS
-                    ALOGD("channel '%s' consumer ~ appended to batch event",
-                            mChannel->getName().c_str());
-#endif
-                    break;
-                } else if (isPointerEvent(mMsg.body.motion.source) &&
-                        mMsg.body.motion.action == AMOTION_EVENT_ACTION_CANCEL) {
-                    // No need to process events that we are going to cancel anyways
-                    const size_t count = batch.samples.size();
-                    for (size_t i = 0; i < count; i++) {
-                        const InputMessage& msg = batch.samples.itemAt(i);
-                        sendFinishedSignal(msg.body.motion.seq, false);
-                    }
-                    batch.samples.removeItemsAt(0, count);
-                    mBatches.removeAt(batchIndex);
-                } else {
-                    // We cannot append to the batch in progress, so we need to consume
-                    // the previous batch right now and defer the new message until later.
-                    mMsgDeferred = true;
-                    status_t result = consumeSamples(factory,
-                            batch, batch.samples.size(), outSeq, outEvent);
-                    mBatches.removeAt(batchIndex);
-                    if (result) {
-                        return result;
-                    }
-#if DEBUG_TRANSPORT_ACTIONS
-                    ALOGD("channel '%s' consumer ~ consumed batch event and "
-                            "deferred current event, seq=%u",
-                            mChannel->getName().c_str(), *outSeq);
-#endif
-                    break;
+                initializeKeyEvent(keyEvent, &mMsg);
+                *outSeq = mMsg.body.key.seq;
+                *outEvent = keyEvent;
+                if (DEBUG_TRANSPORT_ACTIONS) {
+                    ALOGD("channel '%s' consumer ~ consumed key event, seq=%u",
+                          mChannel->getName().c_str(), *outSeq);
                 }
+            break;
             }
 
-            // Start a new batch if needed.
-            if (mMsg.body.motion.action == AMOTION_EVENT_ACTION_MOVE
-                    || mMsg.body.motion.action == AMOTION_EVENT_ACTION_HOVER_MOVE) {
-                mBatches.push();
-                Batch& batch = mBatches.editTop();
-                batch.samples.push(mMsg);
-#if DEBUG_TRANSPORT_ACTIONS
-                ALOGD("channel '%s' consumer ~ started batch event",
-                        mChannel->getName().c_str());
-#endif
+            case InputMessage::Type::MOTION: {
+                ssize_t batchIndex = findBatch(mMsg.body.motion.deviceId, mMsg.body.motion.source);
+                if (batchIndex >= 0) {
+                    Batch& batch = mBatches.editItemAt(batchIndex);
+                    if (canAddSample(batch, &mMsg)) {
+                        batch.samples.push(mMsg);
+                        if (DEBUG_TRANSPORT_ACTIONS) {
+                            ALOGD("channel '%s' consumer ~ appended to batch event",
+                                  mChannel->getName().c_str());
+                        }
+                    break;
+                    } else if (isPointerEvent(mMsg.body.motion.source) &&
+                               mMsg.body.motion.action == AMOTION_EVENT_ACTION_CANCEL) {
+                        // No need to process events that we are going to cancel anyways
+                        const size_t count = batch.samples.size();
+                        for (size_t i = 0; i < count; i++) {
+                            const InputMessage& msg = batch.samples.itemAt(i);
+                            sendFinishedSignal(msg.body.motion.seq, false);
+                        }
+                        batch.samples.removeItemsAt(0, count);
+                        mBatches.removeAt(batchIndex);
+                    } else {
+                        // We cannot append to the batch in progress, so we need to consume
+                        // the previous batch right now and defer the new message until later.
+                        mMsgDeferred = true;
+                        status_t result = consumeSamples(factory, batch, batch.samples.size(),
+                                                         outSeq, outEvent);
+                        mBatches.removeAt(batchIndex);
+                        if (result) {
+                            return result;
+                        }
+                        if (DEBUG_TRANSPORT_ACTIONS) {
+                            ALOGD("channel '%s' consumer ~ consumed batch event and "
+                                  "deferred current event, seq=%u",
+                                  mChannel->getName().c_str(), *outSeq);
+                        }
+                    break;
+                    }
+                }
+
+                // Start a new batch if needed.
+                if (mMsg.body.motion.action == AMOTION_EVENT_ACTION_MOVE ||
+                    mMsg.body.motion.action == AMOTION_EVENT_ACTION_HOVER_MOVE) {
+                    mBatches.push();
+                    Batch& batch = mBatches.editTop();
+                    batch.samples.push(mMsg);
+                    if (DEBUG_TRANSPORT_ACTIONS) {
+                        ALOGD("channel '%s' consumer ~ started batch event",
+                              mChannel->getName().c_str());
+                    }
+                    break;
+                }
+
+                MotionEvent* motionEvent = factory->createMotionEvent();
+                if (!motionEvent) return NO_MEMORY;
+
+                updateTouchState(mMsg);
+                initializeMotionEvent(motionEvent, &mMsg);
+                *outSeq = mMsg.body.motion.seq;
+                *outEvent = motionEvent;
+
+                if (DEBUG_TRANSPORT_ACTIONS) {
+                    ALOGD("channel '%s' consumer ~ consumed motion event, seq=%u",
+                          mChannel->getName().c_str(), *outSeq);
+                }
                 break;
             }
 
-            MotionEvent* motionEvent = factory->createMotionEvent();
-            if (! motionEvent) return NO_MEMORY;
+            case InputMessage::Type::FINISHED: {
+                LOG_ALWAYS_FATAL("Consumed a FINISHED message, which should never be seen by "
+                                 "InputConsumer!");
+                break;
+            }
 
-            updateTouchState(mMsg);
-            initializeMotionEvent(motionEvent, &mMsg);
-            *outSeq = mMsg.body.motion.seq;
-            *outEvent = motionEvent;
+            case InputMessage::Type::FOCUS: {
+                FocusEvent* focusEvent = factory->createFocusEvent();
+                if (!focusEvent) return NO_MEMORY;
 
-#if DEBUG_TRANSPORT_ACTIONS
-            ALOGD("channel '%s' consumer ~ consumed motion event, seq=%u",
-                    mChannel->getName().c_str(), *outSeq);
-#endif
-            break;
-        }
-
-        default:
-            ALOGE("channel '%s' consumer ~ Received unexpected message of type %d",
-                    mChannel->getName().c_str(), mMsg.header.type);
-            return UNKNOWN_ERROR;
+                initializeFocusEvent(focusEvent, &mMsg);
+                *outSeq = mMsg.body.focus.seq;
+                *outEvent = focusEvent;
+                break;
+            }
         }
     }
     return OK;
@@ -1032,10 +1050,10 @@ bool InputConsumer::shouldResampleTool(int32_t toolType) {
 }
 
 status_t InputConsumer::sendFinishedSignal(uint32_t seq, bool handled) {
-#if DEBUG_TRANSPORT_ACTIONS
-    ALOGD("channel '%s' consumer ~ sendFinishedSignal: seq=%u, handled=%s",
-            mChannel->getName().c_str(), seq, handled ? "true" : "false");
-#endif
+    if (DEBUG_TRANSPORT_ACTIONS) {
+        ALOGD("channel '%s' consumer ~ sendFinishedSignal: seq=%u, handled=%s",
+              mChannel->getName().c_str(), seq, toString(handled));
+    }
 
     if (!seq) {
         ALOGE("Attempted to send a finished signal with sequence number 0.");
@@ -1082,9 +1100,9 @@ status_t InputConsumer::sendFinishedSignal(uint32_t seq, bool handled) {
 
 status_t InputConsumer::sendUnchainedFinishedSignal(uint32_t seq, bool handled) {
     InputMessage msg;
-    msg.header.type = InputMessage::TYPE_FINISHED;
+    msg.header.type = InputMessage::Type::FINISHED;
     msg.body.finished.seq = seq;
-    msg.body.finished.handled = handled;
+    msg.body.finished.handled = handled ? 1 : 0;
     return mChannel->sendMessage(&msg);
 }
 
@@ -1130,6 +1148,10 @@ void InputConsumer::initializeKeyEvent(KeyEvent* event, const InputMessage* msg)
             msg->body.key.repeatCount,
             msg->body.key.downTime,
             msg->body.key.eventTime);
+}
+
+void InputConsumer::initializeFocusEvent(FocusEvent* event, const InputMessage* msg) {
+    event->initialize(msg->body.focus.hasFocus == 1, msg->body.focus.inTouchMode == 1);
 }
 
 void InputConsumer::initializeMotionEvent(MotionEvent* event, const InputMessage* msg) {

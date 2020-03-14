@@ -46,6 +46,7 @@
 #include "GLExtensions.h"
 #include "GLFramebuffer.h"
 #include "GLImage.h"
+#include "GLShadowVertexGenerator.h"
 #include "Program.h"
 #include "ProgramCache.h"
 
@@ -227,8 +228,7 @@ static status_t selectEGLConfig(EGLDisplay display, EGLint format, EGLint render
     return err;
 }
 
-std::unique_ptr<GLESRenderEngine> GLESRenderEngine::create(int hwcFormat, uint32_t featureFlags,
-                                                           uint32_t imageCacheSize) {
+std::unique_ptr<GLESRenderEngine> GLESRenderEngine::create(const RenderEngineCreationArgs& args) {
     // initialize EGL for the default display
     EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (!eglInitialize(display, nullptr, nullptr)) {
@@ -243,14 +243,13 @@ std::unique_ptr<GLESRenderEngine> GLESRenderEngine::create(int hwcFormat, uint32
     // supported.
     EGLConfig config = EGL_NO_CONFIG;
     if (!extensions.hasNoConfigContext()) {
-        config = chooseEglConfig(display, hwcFormat, /*logConfig*/ true);
+        config = chooseEglConfig(display, args.pixelFormat, /*logConfig*/ true);
     }
 
-    bool useContextPriority = extensions.hasContextPriority() &&
-            (featureFlags & RenderEngine::USE_HIGH_PRIORITY_CONTEXT);
+    bool useContextPriority =
+            extensions.hasContextPriority() && args.contextPriority == ContextPriority::HIGH;
     EGLContext protectedContext = EGL_NO_CONTEXT;
-    if ((featureFlags & RenderEngine::ENABLE_PROTECTED_CONTEXT) &&
-        extensions.hasProtectedContent()) {
+    if (args.enableProtectedContext && extensions.hasProtectedContent()) {
         protectedContext = createEglContext(display, config, nullptr, useContextPriority,
                                             Protection::PROTECTED);
         ALOGE_IF(protectedContext == EGL_NO_CONTEXT, "Can't create protected context");
@@ -264,7 +263,8 @@ std::unique_ptr<GLESRenderEngine> GLESRenderEngine::create(int hwcFormat, uint32
 
     EGLSurface dummy = EGL_NO_SURFACE;
     if (!extensions.hasSurfacelessContext()) {
-        dummy = createDummyEglPbufferSurface(display, config, hwcFormat, Protection::UNPROTECTED);
+        dummy = createDummyEglPbufferSurface(display, config, args.pixelFormat,
+                                             Protection::UNPROTECTED);
         LOG_ALWAYS_FATAL_IF(dummy == EGL_NO_SURFACE, "can't create dummy pbuffer");
     }
     EGLBoolean success = eglMakeCurrent(display, dummy, dummy, ctxt);
@@ -274,8 +274,8 @@ std::unique_ptr<GLESRenderEngine> GLESRenderEngine::create(int hwcFormat, uint32
 
     EGLSurface protectedDummy = EGL_NO_SURFACE;
     if (protectedContext != EGL_NO_CONTEXT && !extensions.hasSurfacelessContext()) {
-        protectedDummy =
-                createDummyEglPbufferSurface(display, config, hwcFormat, Protection::PROTECTED);
+        protectedDummy = createDummyEglPbufferSurface(display, config, args.pixelFormat,
+                                                      Protection::PROTECTED);
         ALOGE_IF(protectedDummy == EGL_NO_SURFACE, "can't create protected dummy pbuffer");
     }
 
@@ -291,9 +291,8 @@ std::unique_ptr<GLESRenderEngine> GLESRenderEngine::create(int hwcFormat, uint32
             break;
         case GLES_VERSION_2_0:
         case GLES_VERSION_3_0:
-            engine = std::make_unique<GLESRenderEngine>(featureFlags, display, config, ctxt, dummy,
-                                                        protectedContext, protectedDummy,
-                                                        imageCacheSize);
+            engine = std::make_unique<GLESRenderEngine>(args, display, config, ctxt, dummy,
+                                                        protectedContext, protectedDummy);
             break;
     }
 
@@ -347,10 +346,10 @@ EGLConfig GLESRenderEngine::chooseEglConfig(EGLDisplay display, int format, bool
     return config;
 }
 
-GLESRenderEngine::GLESRenderEngine(uint32_t featureFlags, EGLDisplay display, EGLConfig config,
-                                   EGLContext ctxt, EGLSurface dummy, EGLContext protectedContext,
-                                   EGLSurface protectedDummy, uint32_t imageCacheSize)
-      : renderengine::impl::RenderEngine(featureFlags),
+GLESRenderEngine::GLESRenderEngine(const RenderEngineCreationArgs& args, EGLDisplay display,
+                                   EGLConfig config, EGLContext ctxt, EGLSurface dummy,
+                                   EGLContext protectedContext, EGLSurface protectedDummy)
+      : renderengine::impl::RenderEngine(args),
         mEGLDisplay(display),
         mEGLConfig(config),
         mEGLContext(ctxt),
@@ -359,8 +358,8 @@ GLESRenderEngine::GLESRenderEngine(uint32_t featureFlags, EGLDisplay display, EG
         mProtectedDummySurface(protectedDummy),
         mVpWidth(0),
         mVpHeight(0),
-        mFramebufferImageCacheSize(imageCacheSize),
-        mUseColorManagement(featureFlags & USE_COLOR_MANAGEMENT) {
+        mFramebufferImageCacheSize(args.imageCacheSize),
+        mUseColorManagement(args.useColorManagement) {
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &mMaxTextureSize);
     glGetIntegerv(GL_MAX_VIEWPORT_DIMS, mMaxViewportDims);
 
@@ -458,7 +457,8 @@ Framebuffer* GLESRenderEngine::getFramebufferForDrawing() {
 
 void GLESRenderEngine::primeCache() const {
     ProgramCache::getInstance().primeCache(mInProtectedContext ? mProtectedEGLContext : mEGLContext,
-                                           mFeatureFlags & USE_COLOR_MANAGEMENT);
+                                           mArgs.useColorManagement,
+                                           mArgs.precacheToneMapperShaderOnly);
 }
 
 base::unique_fd GLESRenderEngine::flush() {
@@ -567,7 +567,10 @@ void GLESRenderEngine::fillRegionWithColor(const Region& region, float red, floa
                                            float alpha) {
     size_t c;
     Rect const* r = region.getArray(&c);
-    Mesh mesh(Mesh::TRIANGLES, c * 6, 2);
+    Mesh mesh = Mesh::Builder()
+                        .setPrimitive(Mesh::TRIANGLES)
+                        .setVertices(c * 6 /* count */, 2 /* size */)
+                        .build();
     Mesh::VertexArray<vec2> position(mesh.getPositionArray<vec2>());
     for (size_t i = 0; i < c; i++, r++) {
         position[i * 6 + 0].x = r->left;
@@ -827,11 +830,14 @@ void GLESRenderEngine::handleRoundedCorners(const DisplaySettings& display,
     drawMesh(mesh);
 
     // The middle part of the layer can turn off blending.
-    const Rect middleRect(bounds.left, bounds.top + radius, bounds.right, bounds.bottom - radius);
-    setScissor(middleRect);
-    mState.cornerRadius = 0.0;
-    disableBlending();
-    drawMesh(mesh);
+    if (topRect.bottom < bottomRect.top) {
+        const Rect middleRect(bounds.left, bounds.top + radius, bounds.right,
+                              bounds.bottom - radius);
+        setScissor(middleRect);
+        mState.cornerRadius = 0.0;
+        disableBlending();
+        drawMesh(mesh);
+    }
     disableScissor();
 }
 
@@ -979,8 +985,15 @@ status_t GLESRenderEngine::drawLayers(const DisplaySettings& display,
         fillRegionWithColor(display.clearRegion, 0.0, 0.0, 0.0, 1.0);
     }
 
-    Mesh mesh(Mesh::TRIANGLE_FAN, 4, 2, 2);
+    Mesh mesh = Mesh::Builder()
+                        .setPrimitive(Mesh::TRIANGLE_FAN)
+                        .setVertices(4 /* count */, 2 /* size */)
+                        .setTexCoords(2 /* size */)
+                        .setCropCoords(2 /* size */)
+                        .build();
     for (auto layer : layers) {
+        mState.maxMasteringLuminance = layer.source.buffer.maxMasteringLuminance;
+        mState.maxContentLuminance = layer.source.buffer.maxContentLuminance;
         mState.projectionMatrix = projectionMatrix * layer.geometry.positionTransform;
 
         const FloatRect bounds = layer.geometry.boundaries;
@@ -996,7 +1009,6 @@ status_t GLESRenderEngine::drawLayers(const DisplaySettings& display,
         bool usePremultipliedAlpha = true;
         bool disableTexture = true;
         bool isOpaque = false;
-
         if (layer.source.buffer.buffer != nullptr) {
             disableTexture = false;
             isOpaque = layer.source.buffer.isOpaque;
@@ -1034,10 +1046,14 @@ status_t GLESRenderEngine::drawLayers(const DisplaySettings& display,
         }
         setSourceDataSpace(layer.sourceDataspace);
 
+        if (layer.shadow.length > 0.0f) {
+            handleShadow(layer.geometry.boundaries, layer.geometry.roundedCornersRadius,
+                         layer.shadow);
+        }
         // We only want to do a special handling for rounded corners when having rounded corners
         // is the only reason it needs to turn on blending, otherwise, we handle it like the
         // usual way since it needs to turn on blending anyway.
-        if (layer.geometry.roundedCornersRadius > 0.0 && color.a >= 1.0f && isOpaque) {
+        else if (layer.geometry.roundedCornersRadius > 0.0 && color.a >= 1.0f && isOpaque) {
             handleRoundedCorners(display, layer, mesh);
         } else {
             drawMesh(mesh);
@@ -1175,13 +1191,23 @@ void GLESRenderEngine::drawMesh(const Mesh& mesh) {
                               mesh.getByteStride(), mesh.getCropCoords());
     }
 
+    if (mState.drawShadows) {
+        glEnableVertexAttribArray(Program::shadowColor);
+        glVertexAttribPointer(Program::shadowColor, mesh.getShadowColorSize(), GL_FLOAT, GL_FALSE,
+                              mesh.getByteStride(), mesh.getShadowColor());
+
+        glEnableVertexAttribArray(Program::shadowParams);
+        glVertexAttribPointer(Program::shadowParams, mesh.getShadowParamsSize(), GL_FLOAT, GL_FALSE,
+                              mesh.getByteStride(), mesh.getShadowParams());
+    }
+
+    Description managedState = mState;
     // By default, DISPLAY_P3 is the only supported wide color output. However,
     // when HDR content is present, hardware composer may be able to handle
     // BT2020 data space, in that case, the output data space is set to be
     // BT2020_HLG or BT2020_PQ respectively. In GPU fall back we need
     // to respect this and convert non-HDR content to HDR format.
     if (mUseColorManagement) {
-        Description managedState = mState;
         Dataspace inputStandard = static_cast<Dataspace>(mDataSpace & Dataspace::STANDARD_MASK);
         Dataspace inputTransfer = static_cast<Dataspace>(mDataSpace & Dataspace::TRANSFER_MASK);
         Dataspace outputStandard =
@@ -1272,25 +1298,23 @@ void GLESRenderEngine::drawMesh(const Mesh& mesh) {
             managedState.outputTransferFunction =
                     Description::dataSpaceToTransferFunction(outputTransfer);
         }
+    }
 
-        ProgramCache::getInstance().useProgram(mInProtectedContext ? mProtectedEGLContext
-                                                                   : mEGLContext,
-                                               managedState);
+    ProgramCache::getInstance().useProgram(mInProtectedContext ? mProtectedEGLContext : mEGLContext,
+                                           managedState);
 
-        glDrawArrays(mesh.getPrimitive(), 0, mesh.getVertexCount());
-
-        if (outputDebugPPMs) {
-            static uint64_t managedColorFrameCount = 0;
-            std::ostringstream out;
-            out << "/data/texture_out" << managedColorFrameCount++;
-            writePPM(out.str().c_str(), mVpWidth, mVpHeight);
-        }
+    if (mState.drawShadows) {
+        glDrawElements(mesh.getPrimitive(), mesh.getIndexCount(), GL_UNSIGNED_SHORT,
+                       mesh.getIndices());
     } else {
-        ProgramCache::getInstance().useProgram(mInProtectedContext ? mProtectedEGLContext
-                                                                   : mEGLContext,
-                                               mState);
-
         glDrawArrays(mesh.getPrimitive(), 0, mesh.getVertexCount());
+    }
+
+    if (mUseColorManagement && outputDebugPPMs) {
+        static uint64_t managedColorFrameCount = 0;
+        std::ostringstream out;
+        out << "/data/texture_out" << managedColorFrameCount++;
+        writePPM(out.str().c_str(), mVpWidth, mVpHeight);
     }
 
     if (mesh.getTexCoordsSize()) {
@@ -1299,6 +1323,11 @@ void GLESRenderEngine::drawMesh(const Mesh& mesh) {
 
     if (mState.cornerRadius > 0.0f) {
         glDisableVertexAttribArray(Program::cropCoords);
+    }
+
+    if (mState.drawShadows) {
+        glDisableVertexAttribArray(Program::shadowColor);
+        glDisableVertexAttribArray(Program::shadowParams);
     }
 }
 
@@ -1532,6 +1561,35 @@ void GLESRenderEngine::FlushTracer::loop() {
             mEngine->waitSync(entry.mSync, 0);
         }
     }
+}
+
+void GLESRenderEngine::handleShadow(const FloatRect& casterRect, float casterCornerRadius,
+                                    const ShadowSettings& settings) {
+    ATRACE_CALL();
+    const float casterZ = settings.length / 2.0f;
+    const GLShadowVertexGenerator shadows(casterRect, casterCornerRadius, casterZ,
+                                          settings.casterIsTranslucent, settings.ambientColor,
+                                          settings.spotColor, settings.lightPos,
+                                          settings.lightRadius);
+
+    // setup mesh for both shadows
+    Mesh mesh = Mesh::Builder()
+                        .setPrimitive(Mesh::TRIANGLES)
+                        .setVertices(shadows.getVertexCount(), 2 /* size */)
+                        .setShadowAttrs()
+                        .setIndices(shadows.getIndexCount())
+                        .build();
+
+    Mesh::VertexArray<vec2> position = mesh.getPositionArray<vec2>();
+    Mesh::VertexArray<vec4> shadowColor = mesh.getShadowColorArray<vec4>();
+    Mesh::VertexArray<vec3> shadowParams = mesh.getShadowParamsArray<vec3>();
+    shadows.fillVertices(position, shadowColor, shadowParams);
+    shadows.fillIndices(mesh.getIndicesArray());
+
+    mState.cornerRadius = 0.0f;
+    mState.drawShadows = true;
+    drawMesh(mesh);
+    mState.drawShadows = false;
 }
 
 } // namespace gl

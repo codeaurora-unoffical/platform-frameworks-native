@@ -43,12 +43,13 @@ namespace impl {
 
 std::unique_ptr<compositionengine::RenderSurface> createRenderSurface(
         const compositionengine::CompositionEngine& compositionEngine,
-        compositionengine::Display& display, compositionengine::RenderSurfaceCreationArgs&& args) {
-    return std::make_unique<RenderSurface>(compositionEngine, display, std::move(args));
+        compositionengine::Display& display,
+        const compositionengine::RenderSurfaceCreationArgs& args) {
+    return std::make_unique<RenderSurface>(compositionEngine, display, args);
 }
 
 RenderSurface::RenderSurface(const CompositionEngine& compositionEngine, Display& display,
-                             RenderSurfaceCreationArgs&& args)
+                             const RenderSurfaceCreationArgs& args)
       : mCompositionEngine(compositionEngine),
         mDisplay(display),
         mNativeWindow(args.nativeWindow),
@@ -116,12 +117,12 @@ void RenderSurface::prepareFrame(bool usesClientComposition, bool usesDeviceComp
     if (usesClientComposition && usesDeviceComposition) {
         compositionType = DisplaySurface::COMPOSITION_MIXED;
     } else if (usesClientComposition) {
-        compositionType = DisplaySurface::COMPOSITION_GLES;
+        compositionType = DisplaySurface::COMPOSITION_GPU;
     } else if (usesDeviceComposition) {
         compositionType = DisplaySurface::COMPOSITION_HWC;
     } else {
         // Nothing to do -- when turning the screen off we get a frame like
-        // this. Call it a HWC frame since we won't be doing any GLES work but
+        // this. Call it a HWC frame since we won't be doing any GPU work but
         // will do a prepare/set cycle.
         compositionType = DisplaySurface::COMPOSITION_HWC;
     }
@@ -156,7 +157,7 @@ sp<GraphicBuffer> RenderSurface::dequeueBuffer(base::unique_fd* bufferFence) {
     return mGraphicBuffer;
 }
 
-void RenderSurface::queueBuffer(base::unique_fd&& readyFence) {
+void RenderSurface::queueBuffer(base::unique_fd readyFence) {
     auto& state = mDisplay.getState();
 
     if (state.usesClientComposition || state.flipClientTarget) {

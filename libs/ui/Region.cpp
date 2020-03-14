@@ -23,11 +23,10 @@
 
 #include <utils/Log.h>
 
+#include <ui/Point.h>
 #include <ui/Rect.h>
 #include <ui/Region.h>
-#include <ui/Point.h>
-
-#include <private/ui/RegionHelper.h>
+#include <ui/RegionHelper.h>
 
 // ----------------------------------------------------------------------------
 
@@ -281,6 +280,20 @@ bool Region::isTriviallyEqual(const Region& region) const {
     return begin() == region.begin();
 }
 
+bool Region::hasSameRects(const Region& other) const {
+    size_t thisRectCount = 0;
+    android::Rect const* thisRects = getArray(&thisRectCount);
+    size_t otherRectCount = 0;
+    android::Rect const* otherRects = other.getArray(&otherRectCount);
+
+    if (thisRectCount != otherRectCount) return false;
+
+    for (size_t i = 0; i < thisRectCount; i++) {
+        if (thisRects[i] != otherRects[i]) return false;
+    }
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 
 void Region::addRectUnchecked(int l, int t, int r, int b)
@@ -339,10 +352,10 @@ Region& Region::scaleSelf(float sx, float sy) {
     size_t count = mStorage.size();
     Rect* rects = mStorage.editArray();
     while (count) {
-        rects->left = static_cast<int32_t>(rects->left * sx + 0.5f);
-        rects->right = static_cast<int32_t>(rects->right * sx + 0.5f);
-        rects->top = static_cast<int32_t>(rects->top * sy + 0.5f);
-        rects->bottom = static_cast<int32_t>(rects->bottom * sy + 0.5f);
+        rects->left = static_cast<int32_t>(static_cast<float>(rects->left) * sx + 0.5f);
+        rects->right = static_cast<int32_t>(static_cast<float>(rects->right) * sx + 0.5f);
+        rects->top = static_cast<int32_t>(static_cast<float>(rects->top) * sy + 0.5f);
+        rects->bottom = static_cast<int32_t>(static_cast<float>(rects->bottom) * sy + 0.5f);
         rects++;
         count--;
     }

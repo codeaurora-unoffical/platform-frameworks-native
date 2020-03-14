@@ -27,6 +27,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <variant>
 
 using namespace android::surfaceflinger;
 
@@ -44,20 +45,36 @@ public:
     virtual void incrementMissedFrames() = 0;
     virtual void incrementClientCompositionFrames() = 0;
 
-    virtual void setPostTime(int32_t layerID, uint64_t frameNumber, const std::string& layerName,
+    // Records the start and end times for a frame.
+    // The start time is the same as the beginning of a SurfaceFlinger
+    // invalidate message.
+    // The end time corresponds to when SurfaceFlinger finishes submitting the
+    // request to HWC to present a frame.
+    virtual void recordFrameDuration(nsecs_t startTime, nsecs_t endTime) = 0;
+    // Records the start time and end times for when RenderEngine begins work.
+    // The start time corresponds to the beginning of RenderEngine::drawLayers.
+    // The end time corresponds to when RenderEngine finishes rendering.
+    virtual void recordRenderEngineDuration(nsecs_t startTime, nsecs_t endTime) = 0;
+    // Same as above, but passes in a fence representing the end time.
+    virtual void recordRenderEngineDuration(nsecs_t startTime,
+                                            const std::shared_ptr<FenceTime>& readyFence) = 0;
+
+    virtual void setPostTime(int32_t layerId, uint64_t frameNumber, const std::string& layerName,
                              nsecs_t postTime) = 0;
-    virtual void setLatchTime(int32_t layerID, uint64_t frameNumber, nsecs_t latchTime) = 0;
-    virtual void setDesiredTime(int32_t layerID, uint64_t frameNumber, nsecs_t desiredTime) = 0;
-    virtual void setAcquireTime(int32_t layerID, uint64_t frameNumber, nsecs_t acquireTime) = 0;
-    virtual void setAcquireFence(int32_t layerID, uint64_t frameNumber,
+    virtual void setLatchTime(int32_t layerId, uint64_t frameNumber, nsecs_t latchTime) = 0;
+    virtual void setDesiredTime(int32_t layerId, uint64_t frameNumber, nsecs_t desiredTime) = 0;
+    virtual void setAcquireTime(int32_t layerId, uint64_t frameNumber, nsecs_t acquireTime) = 0;
+    virtual void setAcquireFence(int32_t layerId, uint64_t frameNumber,
                                  const std::shared_ptr<FenceTime>& acquireFence) = 0;
-    virtual void setPresentTime(int32_t layerID, uint64_t frameNumber, nsecs_t presentTime) = 0;
-    virtual void setPresentFence(int32_t layerID, uint64_t frameNumber,
+    // SetPresent{Time, Fence} are not expected to be called in the critical
+    // rendering path, as they flush prior fences if those fences have fired.
+    virtual void setPresentTime(int32_t layerId, uint64_t frameNumber, nsecs_t presentTime) = 0;
+    virtual void setPresentFence(int32_t layerId, uint64_t frameNumber,
                                  const std::shared_ptr<FenceTime>& presentFence) = 0;
     // Clean up the layer record
-    virtual void onDestroy(int32_t layerID) = 0;
+    virtual void onDestroy(int32_t layerId) = 0;
     // If SF skips or rejects a buffer, remove the corresponding TimeRecord.
-    virtual void removeTimeRecord(int32_t layerID, uint64_t frameNumber) = 0;
+    virtual void removeTimeRecord(int32_t layerId, uint64_t frameNumber) = 0;
 
     virtual void setPowerMode(int32_t powerMode) = 0;
     // Source of truth is RefrehRateStats.
@@ -100,9 +117,15 @@ class TimeStats : public android::TimeStats {
         nsecs_t prevTime = 0;
     };
 
+    struct RenderEngineDuration {
+        nsecs_t startTime;
+        std::variant<nsecs_t, std::shared_ptr<FenceTime>> endTime;
+    };
+
     struct GlobalRecord {
         nsecs_t prevPresentTime = 0;
         std::deque<std::shared_ptr<FenceTime>> presentFences;
+        std::deque<RenderEngineDuration> renderEngineDurations;
     };
 
 public:
@@ -116,20 +139,25 @@ public:
     void incrementMissedFrames() override;
     void incrementClientCompositionFrames() override;
 
-    void setPostTime(int32_t layerID, uint64_t frameNumber, const std::string& layerName,
+    void recordFrameDuration(nsecs_t startTime, nsecs_t endTime) override;
+    void recordRenderEngineDuration(nsecs_t startTime, nsecs_t endTime) override;
+    void recordRenderEngineDuration(nsecs_t startTime,
+                                    const std::shared_ptr<FenceTime>& readyFence) override;
+
+    void setPostTime(int32_t layerId, uint64_t frameNumber, const std::string& layerName,
                      nsecs_t postTime) override;
-    void setLatchTime(int32_t layerID, uint64_t frameNumber, nsecs_t latchTime) override;
-    void setDesiredTime(int32_t layerID, uint64_t frameNumber, nsecs_t desiredTime) override;
-    void setAcquireTime(int32_t layerID, uint64_t frameNumber, nsecs_t acquireTime) override;
-    void setAcquireFence(int32_t layerID, uint64_t frameNumber,
+    void setLatchTime(int32_t layerId, uint64_t frameNumber, nsecs_t latchTime) override;
+    void setDesiredTime(int32_t layerId, uint64_t frameNumber, nsecs_t desiredTime) override;
+    void setAcquireTime(int32_t layerId, uint64_t frameNumber, nsecs_t acquireTime) override;
+    void setAcquireFence(int32_t layerId, uint64_t frameNumber,
                          const std::shared_ptr<FenceTime>& acquireFence) override;
-    void setPresentTime(int32_t layerID, uint64_t frameNumber, nsecs_t presentTime) override;
-    void setPresentFence(int32_t layerID, uint64_t frameNumber,
+    void setPresentTime(int32_t layerId, uint64_t frameNumber, nsecs_t presentTime) override;
+    void setPresentFence(int32_t layerId, uint64_t frameNumber,
                          const std::shared_ptr<FenceTime>& presentFence) override;
     // Clean up the layer record
-    void onDestroy(int32_t layerID) override;
+    void onDestroy(int32_t layerId) override;
     // If SF skips or rejects a buffer, remove the corresponding TimeRecord.
-    void removeTimeRecord(int32_t layerID, uint64_t frameNumber) override;
+    void removeTimeRecord(int32_t layerId, uint64_t frameNumber) override;
 
     void setPowerMode(int32_t powerMode) override;
     // Source of truth is RefrehRateStats.
@@ -139,8 +167,8 @@ public:
     static const size_t MAX_NUM_TIME_RECORDS = 64;
 
 private:
-    bool recordReadyLocked(int32_t layerID, TimeRecord* timeRecord);
-    void flushAvailableRecordsToStatsLocked(int32_t layerID);
+    bool recordReadyLocked(int32_t layerId, TimeRecord* timeRecord);
+    void flushAvailableRecordsToStatsLocked(int32_t layerId);
     void flushPowerTimeLocked();
     void flushAvailableGlobalRecordsToStatsLocked();
 
@@ -152,7 +180,7 @@ private:
     std::atomic<bool> mEnabled = false;
     std::mutex mMutex;
     TimeStatsHelper::TimeStatsGlobal mTimeStats;
-    // Hashmap for LayerRecord with layerID as the hash key
+    // Hashmap for LayerRecord with layerId as the hash key
     std::unordered_map<int32_t, LayerRecord> mTimeStatsTracker;
     PowerTime mPowerTime;
     GlobalRecord mGlobalRecord;
