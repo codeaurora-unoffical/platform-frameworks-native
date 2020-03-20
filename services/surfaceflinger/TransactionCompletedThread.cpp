@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 //#define LOG_NDEBUG 0
 #undef LOG_TAG
 #define LOG_TAG "TransactionCompletedThread"
@@ -233,9 +237,13 @@ status_t TransactionCompletedThread::addCallbackHandle(const sp<CallbackHandle>&
     // destroyed the client side is dead and there won't be anyone to send the callback to.
     sp<IBinder> surfaceControl = handle->surfaceControl.promote();
     if (surfaceControl) {
+        FrameEventHistoryStats eventStats(handle->frameNumber,
+                                          handle->gpuCompositionDoneFence->getSnapshot().fence,
+                                          handle->compositorTiming, handle->refreshStartTime,
+                                          handle->dequeueReadyTime);
         transactionStats->surfaceStats.emplace_back(surfaceControl, handle->acquireTime,
                                                     handle->previousReleaseFence,
-                                                    handle->transformHint);
+                                                    handle->transformHint, eventStats);
     }
     return NO_ERROR;
 }
@@ -310,9 +318,17 @@ void TransactionCompletedThread::threadMain() {
                     // we get pointers that compare unequal in the SF process.
                     interface_cast<ITransactionCompletedListener>(listenerStats.listener)
                             ->onTransactionCompleted(listenerStats);
-                    listener->unlinkToDeath(mDeathRecipient);
+                    if (transactionStatsDeque.empty()) {
+                        listener->unlinkToDeath(mDeathRecipient);
+                        completedTransactionsItr =
+                                mCompletedTransactions.erase(completedTransactionsItr);
+                    } else {
+                        completedTransactionsItr++;
+                    }
+                } else {
+                    completedTransactionsItr =
+                            mCompletedTransactions.erase(completedTransactionsItr);
                 }
-                completedTransactionsItr = mCompletedTransactions.erase(completedTransactionsItr);
             } else {
                 completedTransactionsItr++;
             }
@@ -347,3 +363,6 @@ CallbackHandle::CallbackHandle(const sp<IBinder>& transactionListener,
       : listener(transactionListener), callbackIds(ids), surfaceControl(sc) {}
 
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

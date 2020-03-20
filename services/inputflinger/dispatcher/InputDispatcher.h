@@ -25,6 +25,7 @@
 #include "InputDispatcherPolicyInterface.h"
 #include "InputState.h"
 #include "InputTarget.h"
+#include "InputThread.h"
 #include "Monitor.h"
 #include "TouchState.h"
 #include "TouchedWindow.h"
@@ -54,6 +55,16 @@
 namespace android::inputdispatcher {
 
 class Connection;
+
+class HmacKeyManager {
+public:
+    HmacKeyManager();
+    std::array<uint8_t, 32> sign(const VerifiedInputEvent& event) const;
+
+private:
+    std::array<uint8_t, 32> sign(const std::vector<uint8_t>& data) const;
+    const std::array<uint8_t, 128> mHmacKey;
+};
 
 /* Dispatches events to input targets.  Some functions of the input dispatcher, such as
  * identifying input targets, are controlled by a separate policy object.
@@ -95,6 +106,8 @@ public:
                                      int32_t injectorUid, int32_t syncMode, int32_t timeoutMillis,
                                      uint32_t policyFlags) override;
 
+    virtual std::unique_ptr<VerifiedInputEvent> verifyInputEvent(const InputEvent& event) override;
+
     virtual void setInputWindows(
             const std::vector<sp<InputWindowHandle>>& inputWindowHandles, int32_t displayId,
             const sp<ISetInputWindowsListener>& setInputWindowsListener = nullptr) override;
@@ -124,8 +137,7 @@ private:
         STALE,
     };
 
-    class InputDispatcherThread;
-    sp<InputDispatcherThread> mThread;
+    std::unique_ptr<InputThread> mThread;
 
     sp<InputDispatcherPolicyInterface> mPolicy;
     android::InputDispatcherConfiguration mConfig;
@@ -144,6 +156,8 @@ private:
 
     DropReason mLastDropReason GUARDED_BY(mLock);
 
+    const IdGenerator mIdGenerator;
+
     // With each iteration, InputDispatcher nominally processes one queued event,
     // a timeout, or a response from an input consumer.
     // This method should only be called on the input dispatcher's own thread.
@@ -157,6 +171,9 @@ private:
     // Cleans up input state when dropping an inbound event.
     void dropInboundEventLocked(const EventEntry& entry, DropReason dropReason) REQUIRES(mLock);
 
+    // Enqueues a focus event.
+    void enqueueFocusEventLocked(const InputWindowHandle& window, bool hasFocus) REQUIRES(mLock);
+
     // Adds an event to a queue of recent events for debugging purposes.
     void addRecentEventLocked(EventEntry* entry) REQUIRES(mLock);
 
@@ -167,9 +184,6 @@ private:
     bool isAppSwitchKeyEvent(const KeyEntry& keyEntry);
     bool isAppSwitchPendingLocked() REQUIRES(mLock);
     void resetPendingAppSwitchLocked(bool handled) REQUIRES(mLock);
-
-    // Stale event latency optimization.
-    static bool isStaleEvent(nsecs_t currentTime, const EventEntry& entry);
 
     // Blocked event latency optimization.  Drops old events when the user intends
     // to transfer focus to a new application.
@@ -204,6 +218,8 @@ private:
     // to continue even when there isn't a touched window,and have the ability to steal the rest of
     // the pointer stream in order to claim it for a system gesture.
     std::unordered_map<int32_t, std::vector<Monitor>> mGestureMonitorsByDisplay GUARDED_BY(mLock);
+
+    HmacKeyManager mHmacKeyManager;
 
     // Event injection and synchronization.
     std::condition_variable mInjectionResultAvailable;
@@ -302,6 +318,7 @@ private:
                            nsecs_t* nextWakeupTime) REQUIRES(mLock);
     bool dispatchMotionLocked(nsecs_t currentTime, MotionEntry* entry, DropReason* dropReason,
                               nsecs_t* nextWakeupTime) REQUIRES(mLock);
+    void dispatchFocusLocked(nsecs_t currentTime, FocusEntry* entry) REQUIRES(mLock);
     void dispatchEventLocked(nsecs_t currentTime, EventEntry* entry,
                              const std::vector<InputTarget>& inputTargets) REQUIRES(mLock);
 
@@ -381,13 +398,13 @@ private:
     // with the mutex held makes it easier to ensure that connection invariants are maintained.
     // If needed, the methods post commands to run later once the critical bits are done.
     void prepareDispatchCycleLocked(nsecs_t currentTime, const sp<Connection>& connection,
-                                    EventEntry* eventEntry, const InputTarget* inputTarget)
+                                    EventEntry* eventEntry, const InputTarget& inputTarget)
             REQUIRES(mLock);
     void enqueueDispatchEntriesLocked(nsecs_t currentTime, const sp<Connection>& connection,
-                                      EventEntry* eventEntry, const InputTarget* inputTarget)
+                                      EventEntry* eventEntry, const InputTarget& inputTarget)
             REQUIRES(mLock);
     void enqueueDispatchEntryLocked(const sp<Connection>& connection, EventEntry* eventEntry,
-                                    const InputTarget* inputTarget, int32_t dispatchMode)
+                                    const InputTarget& inputTarget, int32_t dispatchMode)
             REQUIRES(mLock);
     void startDispatchCycleLocked(nsecs_t currentTime, const sp<Connection>& connection)
             REQUIRES(mLock);
@@ -414,6 +431,9 @@ private:
             REQUIRES(mLock);
     void synthesizeCancelationEventsForConnectionLocked(const sp<Connection>& connection,
                                                         const CancelationOptions& options)
+            REQUIRES(mLock);
+
+    void synthesizePointerDownEventsForConnectionLocked(const sp<Connection>& connection)
             REQUIRES(mLock);
 
     // Splitting motion events across windows.

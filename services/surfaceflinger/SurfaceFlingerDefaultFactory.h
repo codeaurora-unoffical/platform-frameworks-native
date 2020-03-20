@@ -30,13 +30,14 @@ public:
     std::unique_ptr<EventControlThread> createEventControlThread(SetVSyncEnabled) override;
     std::unique_ptr<HWComposer> createHWComposer(const std::string& serviceName) override;
     std::unique_ptr<MessageQueue> createMessageQueue() override;
-    std::unique_ptr<scheduler::PhaseOffsets> createPhaseOffsets() override;
+    std::unique_ptr<scheduler::PhaseConfiguration> createPhaseConfiguration(
+            const scheduler::RefreshRateConfigs&) override;
     std::unique_ptr<Scheduler> createScheduler(SetVSyncEnabled,
                                                const scheduler::RefreshRateConfigs&,
                                                ISchedulerCallback&) override;
     std::unique_ptr<SurfaceInterceptor> createSurfaceInterceptor(SurfaceFlinger*) override;
     sp<StartPropertySetThread> createStartPropertySetThread(bool timestampPropertyValue) override;
-    sp<DisplayDevice> createDisplayDevice(DisplayDeviceCreationArgs&&) override;
+    sp<DisplayDevice> createDisplayDevice(DisplayDeviceCreationArgs&) override;
     sp<GraphicBuffer> createGraphicBuffer(uint32_t width, uint32_t height, PixelFormat format,
                                           uint32_t layerCount, uint64_t usage,
                                           std::string requestorName) override;
@@ -54,7 +55,7 @@ public:
     std::unique_ptr<compositionengine::CompositionEngine> createCompositionEngine() override;
     sp<BufferQueueLayer> createBufferQueueLayer(const LayerCreationArgs& args) override;
     sp<BufferStateLayer> createBufferStateLayer(const LayerCreationArgs& args) override;
-    sp<ColorLayer> createColorLayer(const LayerCreationArgs& args) override;
+    sp<EffectLayer> createEffectLayer(const LayerCreationArgs& args) override;
     sp<ContainerLayer> createContainerLayer(const LayerCreationArgs& args) override;
 };
 

@@ -20,6 +20,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include "SchedulerUtils.h"
 #include "VSyncTracker.h"
 
 namespace android::scheduler {
@@ -37,9 +38,10 @@ public:
                    uint32_t outlierTolerancePercent);
     ~VSyncPredictor();
 
-    void addVsyncTimestamp(nsecs_t timestamp) final;
+    bool addVsyncTimestamp(nsecs_t timestamp) final;
     nsecs_t nextAnticipatedVSyncTimeFrom(nsecs_t timePoint) const final;
     nsecs_t currentPeriod() const final;
+    void resetModel() final;
 
     /*
      * Inform the model that the period is anticipated to change to a new value.
@@ -48,7 +50,7 @@ public:
      *
      * \param [in] period   The new period that should be used.
      */
-    void setPeriod(nsecs_t period);
+    void setPeriod(nsecs_t period) final;
 
     /* Query if the model is in need of more samples to make a prediction at timePoint.
      * \param [in] timePoint    The timePoint to inquire of.
@@ -61,6 +63,10 @@ public:
 private:
     VSyncPredictor(VSyncPredictor const&) = delete;
     VSyncPredictor& operator=(VSyncPredictor const&) = delete;
+    void clearTimestamps() REQUIRES(mMutex);
+
+    inline void traceInt64If(const char* name, int64_t value) const;
+    bool const mTraceOn;
 
     size_t const kHistorySize;
     size_t const kMinimumSamplesForPrediction;
@@ -77,8 +83,8 @@ private:
 
     std::unordered_map<nsecs_t, std::tuple<nsecs_t, nsecs_t>> mutable mRateMap GUARDED_BY(mMutex);
 
-    int lastTimestampIndex GUARDED_BY(mMutex) = 0;
-    std::vector<nsecs_t> timestamps GUARDED_BY(mMutex);
+    int mLastTimestampIndex GUARDED_BY(mMutex) = 0;
+    std::vector<nsecs_t> mTimestamps GUARDED_BY(mMutex);
 };
 
 } // namespace android::scheduler

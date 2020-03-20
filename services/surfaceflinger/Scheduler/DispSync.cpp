@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 //#define LOG_NDEBUG 0
 
@@ -538,7 +542,8 @@ void DispSync::beginResync() {
     resetLocked();
 }
 
-bool DispSync::addResyncSample(nsecs_t timestamp, bool* periodFlushed) {
+bool DispSync::addResyncSample(nsecs_t timestamp, std::optional<nsecs_t> /*hwcVsyncPeriod*/,
+                               bool* periodFlushed) {
     Mutex::Autolock lock(mMutex);
 
     ALOGV("[%s] addResyncSample(%" PRId64 ")", mName, ns2us(timestamp));
@@ -847,3 +852,6 @@ nsecs_t DispSync::expectedPresentTime() {
 } // namespace impl
 
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

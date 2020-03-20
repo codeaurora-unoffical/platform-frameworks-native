@@ -1,3 +1,23 @@
+/*
+ * Copyright 2019 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #undef LOG_TAG
 #define LOG_TAG "SchedulerUnittests"
 
@@ -53,10 +73,9 @@ SchedulerTest::SchedulerTest() {
     std::vector<scheduler::RefreshRateConfigs::InputConfig> configs{
             {{HwcConfigIndexType(0), HwcConfigGroupType(0), 16666667}}};
     mRefreshRateConfigs = std::make_unique<
-            scheduler::RefreshRateConfigs>(/*refreshRateSwitching=*/false, configs,
-                                           /*currentConfig=*/HwcConfigIndexType(0));
+            scheduler::RefreshRateConfigs>(configs, /*currentConfig=*/HwcConfigIndexType(0));
 
-    mScheduler = std::make_unique<TestableScheduler>(*mRefreshRateConfigs);
+    mScheduler = std::make_unique<TestableScheduler>(*mRefreshRateConfigs, false);
 
     auto eventThread = std::make_unique<mock::EventThread>();
     mEventThread = eventThread.get();
@@ -140,7 +159,15 @@ TEST_F(SchedulerTest, validConnectionHandle) {
 
     EXPECT_CALL(*mEventThread, setPhaseOffset(10)).Times(1);
     ASSERT_NO_FATAL_FAILURE(mScheduler->setPhaseOffset(mConnectionHandle, 10));
+
+    static constexpr size_t kEventConnections = 5;
+    ON_CALL(*mEventThread, getEventThreadConnectionCount())
+            .WillByDefault(Return(kEventConnections));
+    EXPECT_EQ(kEventConnections, mScheduler->getEventThreadConnectionCount(mConnectionHandle));
 }
 
 } // namespace
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

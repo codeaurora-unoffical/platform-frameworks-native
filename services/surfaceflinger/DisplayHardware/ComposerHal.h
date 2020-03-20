@@ -23,18 +23,25 @@
 #include <utility>
 #include <vector>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #if defined(USE_VR_COMPOSER) && USE_VR_COMPOSER
 #include <android/frameworks/vr/composer/2.0/IVrComposerClient.h>
 #endif // defined(USE_VR_COMPOSER) && USE_VR_COMPOSER
 #include <android/hardware/graphics/common/1.1/types.h>
 #include <android/hardware/graphics/composer/2.4/IComposer.h>
 #include <android/hardware/graphics/composer/2.4/IComposerClient.h>
-#include <composer-command-buffer/2.3/ComposerCommandBuffer.h>
+#include <composer-command-buffer/2.4/ComposerCommandBuffer.h>
 #include <gui/HdrMetadata.h>
 #include <math/mat4.h>
 #include <ui/DisplayedFrameStats.h>
 #include <ui/GraphicBuffer.h>
 #include <utils/StrongPointer.h>
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
 
 namespace android {
 
@@ -63,8 +70,8 @@ using V2_1::Config;
 using V2_1::Display;
 using V2_1::Error;
 using V2_1::Layer;
-using V2_3::CommandReaderBase;
-using V2_3::CommandWriterBase;
+using V2_4::CommandReaderBase;
+using V2_4::CommandWriterBase;
 using V2_4::IComposer;
 using V2_4::IComposerCallback;
 using V2_4::IComposerClient;
@@ -221,6 +228,18 @@ public:
             Display display, Config config,
             const IComposerClient::VsyncPeriodChangeConstraints& vsyncPeriodChangeConstraints,
             VsyncPeriodChangeTimeline* outTimeline) = 0;
+
+    virtual V2_4::Error setAutoLowLatencyMode(Display displayId, bool on) = 0;
+    virtual V2_4::Error getSupportedContentTypes(
+            Display displayId,
+            std::vector<IComposerClient::ContentType>* outSupportedContentTypes) = 0;
+    virtual V2_4::Error setContentType(Display displayId,
+                                       IComposerClient::ContentType contentType) = 0;
+    virtual V2_4::Error setLayerGenericMetadata(Display display, Layer layer,
+                                                const std::string& key, bool mandatory,
+                                                const std::vector<uint8_t>& value) = 0;
+    virtual V2_4::Error getLayerGenericMetadataKeys(
+            std::vector<IComposerClient::LayerGenericMetadataKey>* outKeys) = 0;
 };
 
 namespace impl {
@@ -273,6 +292,7 @@ private:
     bool parseSetPresentFence(uint16_t length);
     bool parseSetReleaseFences(uint16_t length);
     bool parseSetPresentOrValidateDisplayResult(uint16_t length);
+    bool parseSetClientTargetProperty(uint16_t length);
 
     struct ReturnData {
         uint32_t displayRequests = 0;
@@ -289,6 +309,13 @@ private:
         std::vector<int> releaseFences;
 
         uint32_t presentOrValidateState;
+
+        // Composer 2.4 implementation can return a client target property
+        // structure to indicate the client target properties that hardware
+        // composer requests. The composer client must change the client target
+        // properties to match this request.
+        IComposerClient::ClientTargetProperty clientTargetProperty{PixelFormat::RGBA_8888,
+                                                                   Dataspace::UNKNOWN};
     };
 
     std::vector<CommandError> mErrors;
@@ -442,6 +469,16 @@ public:
             Display display, Config config,
             const IComposerClient::VsyncPeriodChangeConstraints& vsyncPeriodChangeConstraints,
             VsyncPeriodChangeTimeline* outTimeline) override;
+    V2_4::Error setAutoLowLatencyMode(Display displayId, bool on) override;
+    V2_4::Error getSupportedContentTypes(
+            Display displayId,
+            std::vector<IComposerClient::ContentType>* outSupportedContentTypes) override;
+    V2_4::Error setContentType(Display displayId,
+                               IComposerClient::ContentType contentType) override;
+    V2_4::Error setLayerGenericMetadata(Display display, Layer layer, const std::string& key,
+                                        bool mandatory, const std::vector<uint8_t>& value) override;
+    V2_4::Error getLayerGenericMetadataKeys(
+            std::vector<IComposerClient::LayerGenericMetadataKey>* outKeys) override;
 
 private:
 #if defined(USE_VR_COMPOSER) && USE_VR_COMPOSER

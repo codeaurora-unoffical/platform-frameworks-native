@@ -13,6 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
 #undef LOG_TAG
 #define LOG_TAG "SurfaceTracing"
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
@@ -166,6 +170,12 @@ LayersTraceProto SurfaceTracing::traceLayersLocked(const char* where) {
     mFlinger.dumpOffscreenLayersProto(layers);
     entry.mutable_layers()->Swap(&layers);
 
+    if (mTraceFlags & SurfaceTracing::TRACE_HWC) {
+        std::string hwcDump;
+        mFlinger.dumpHwc(hwcDump);
+        entry.set_hwc_blob(hwcDump);
+    }
+
     return entry;
 }
 
@@ -184,8 +194,11 @@ void SurfaceTracing::writeProtoFileLocked() {
         ALOGE("Could not save the proto file! Permission denied");
         mLastErr = PERMISSION_DENIED;
     }
-    if (!android::base::WriteStringToFile(output, kDefaultFileName, S_IRWXU | S_IRGRP, getuid(),
-                                          getgid(), true)) {
+
+    // -rw-r--r--
+    const mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+    if (!android::base::WriteStringToFile(output, kDefaultFileName, mode, getuid(), getgid(),
+                                          true)) {
         ALOGE("Could not save the proto file! There are missing fields");
         mLastErr = PERMISSION_DENIED;
     }
@@ -202,3 +215,6 @@ void SurfaceTracing::dump(std::string& result) const {
 }
 
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

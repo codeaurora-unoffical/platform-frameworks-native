@@ -25,9 +25,18 @@
 #include <compositionengine/impl/DumpHelpers.h>
 #include <compositionengine/impl/OutputLayer.h>
 #include <compositionengine/impl/RenderSurface.h>
+
 #include <utils/Trace.h>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include "DisplayHardware/HWComposer.h"
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
+
 #include "DisplayHardware/PowerAdvisor.h"
 
 namespace android::compositionengine::impl {
@@ -38,10 +47,35 @@ std::shared_ptr<Display> createDisplay(
     return createDisplayTemplated<Display>(compositionEngine, args);
 }
 
-Display::Display(const DisplayCreationArgs& args)
-      : mIsVirtual(args.isVirtual), mId(args.displayId), mPowerAdvisor(args.powerAdvisor) {}
-
 Display::~Display() = default;
+
+void Display::setConfiguration(const compositionengine::DisplayCreationArgs& args) {
+    mIsVirtual = !args.physical;
+    mId = args.physical ? std::make_optional(args.physical->id) : std::nullopt;
+    mPowerAdvisor = args.powerAdvisor;
+
+    editState().isSecure = args.isSecure;
+
+    setLayerStackFilter(args.layerStackId,
+                        args.physical ? args.physical->type == DisplayConnectionType::Internal
+                                      : false);
+    setName(args.name);
+
+    if (!args.physical && args.useHwcVirtualDisplays) {
+        mId = maybeAllocateDisplayIdForVirtualDisplay(args.pixels, args.pixelFormat);
+    }
+}
+
+std::optional<DisplayId> Display::maybeAllocateDisplayIdForVirtualDisplay(
+        ui::Size pixels, ui::PixelFormat pixelFormat) const {
+    auto& hwc = getCompositionEngine().getHwComposer();
+    return hwc.allocateVirtualDisplay(static_cast<uint32_t>(pixels.width),
+                                      static_cast<uint32_t>(pixels.height), &pixelFormat);
+}
+
+bool Display::isValid() const {
+    return Output::isValid() && mPowerAdvisor;
+}
 
 const std::optional<DisplayId>& Display::getId() const {
     return mId;
@@ -57,6 +91,10 @@ bool Display::isVirtual() const {
 
 std::optional<DisplayId> Display::getDisplayId() const {
     return mId;
+}
+
+void Display::setDisplayIdForTesting(std::optional<DisplayId> displayId) {
+    mId = displayId;
 }
 
 void Display::disconnect() {
@@ -133,10 +171,13 @@ void Display::createRenderSurface(const RenderSurfaceCreationArgs& args) {
             compositionengine::impl::createRenderSurface(getCompositionEngine(), *this, args));
 }
 
+void Display::createClientCompositionCache(uint32_t cacheSize) {
+    cacheClientCompositionRequests(cacheSize);
+}
+
 std::unique_ptr<compositionengine::OutputLayer> Display::createOutputLayer(
-        const std::shared_ptr<compositionengine::Layer>& layer,
         const sp<compositionengine::LayerFE>& layerFE) const {
-    auto result = impl::createOutputLayer(*this, layer, layerFE);
+    auto result = impl::createOutputLayer(*this, layerFE);
 
     if (result && mId) {
         auto& hwc = getCompositionEngine().getHwComposer();
@@ -171,16 +212,18 @@ void Display::setReleasedLayers(const compositionengine::CompositionRefreshArgs&
 
     // Any non-null entries in the current list of layers are layers that are no
     // longer going to be visible
-    for (auto* layer : getOutputLayersOrderedByZ()) {
-        if (!layer) {
+    for (auto* outputLayer : getOutputLayersOrderedByZ()) {
+        if (!outputLayer) {
             continue;
         }
 
-        sp<compositionengine::LayerFE> layerFE(&layer->getLayerFE());
+        compositionengine::LayerFE* layerFE = &outputLayer->getLayerFE();
         const bool hasQueuedFrames =
-                std::find(refreshArgs.layersWithQueuedFrames.cbegin(),
-                          refreshArgs.layersWithQueuedFrames.cend(),
-                          &layer->getLayer()) != refreshArgs.layersWithQueuedFrames.cend();
+                std::any_of(refreshArgs.layersWithQueuedFrames.cbegin(),
+                            refreshArgs.layersWithQueuedFrames.cend(),
+                            [layerFE](sp<compositionengine::LayerFE> layerWithQueuedFrames) {
+                                return layerFE == layerWithQueuedFrames.get();
+                            });
 
         if (hasQueuedFrames) {
             releasedLayers.emplace_back(layerFE);

@@ -17,7 +17,9 @@
 #define LOG_TAG "Input"
 //#define LOG_NDEBUG 0
 
+#include <cutils/compiler.h>
 #include <limits.h>
+#include <string.h>
 
 #include <input/Input.h>
 #include <input/InputDevice.h>
@@ -25,6 +27,7 @@
 
 #ifdef __ANDROID__
 #include <binder/Parcel.h>
+#include <sys/random.h>
 #endif
 
 namespace android {
@@ -38,6 +41,32 @@ const char* motionClassificationToString(MotionClassification classification) {
         case MotionClassification::DEEP_PRESS:
             return "DEEP_PRESS";
     }
+}
+
+// --- IdGenerator ---
+IdGenerator::IdGenerator(Source source) : mSource(source) {}
+
+int32_t IdGenerator::nextId() const {
+    constexpr uint32_t SEQUENCE_NUMBER_MASK = ~SOURCE_MASK;
+    int32_t id = 0;
+
+// Avoid building against syscall getrandom(2) on host, which will fail build on Mac. Host doesn't
+// use sequence number so just always return mSource.
+#ifdef __ANDROID__
+    constexpr size_t BUF_LEN = sizeof(id);
+    size_t totalBytes = 0;
+    while (totalBytes < BUF_LEN) {
+        ssize_t bytes = TEMP_FAILURE_RETRY(getrandom(&id, BUF_LEN, GRND_NONBLOCK));
+        if (CC_UNLIKELY(bytes < 0)) {
+            ALOGW("Failed to fill in random number for sequence number: %s.", strerror(errno));
+            id = 0;
+            break;
+        }
+        totalBytes += bytes;
+    }
+#endif // __ANDROID__
+
+    return (id & SEQUENCE_NUMBER_MASK) | static_cast<int32_t>(mSource);
 }
 
 // --- InputEvent ---
@@ -57,16 +86,50 @@ const char* inputEventTypeToString(int32_t type) {
     return "UNKNOWN";
 }
 
-void InputEvent::initialize(int32_t deviceId, int32_t source, int32_t displayId) {
+VerifiedKeyEvent verifiedKeyEventFromKeyEvent(const KeyEvent& event) {
+    return {{VerifiedInputEvent::Type::KEY, event.getDeviceId(), event.getEventTime(),
+             event.getSource(), event.getDisplayId()},
+            event.getAction(),
+            event.getDownTime(),
+            event.getFlags() & VERIFIED_KEY_EVENT_FLAGS,
+            event.getKeyCode(),
+            event.getScanCode(),
+            event.getMetaState(),
+            event.getRepeatCount()};
+}
+
+VerifiedMotionEvent verifiedMotionEventFromMotionEvent(const MotionEvent& event) {
+    return {{VerifiedInputEvent::Type::MOTION, event.getDeviceId(), event.getEventTime(),
+             event.getSource(), event.getDisplayId()},
+            event.getRawX(0),
+            event.getRawY(0),
+            event.getActionMasked(),
+            event.getDownTime(),
+            event.getFlags() & VERIFIED_MOTION_EVENT_FLAGS,
+            event.getMetaState(),
+            event.getButtonState()};
+}
+
+void InputEvent::initialize(int32_t id, int32_t deviceId, uint32_t source, int32_t displayId,
+                            std::array<uint8_t, 32> hmac) {
+    mId = id;
     mDeviceId = deviceId;
     mSource = source;
     mDisplayId = displayId;
+    mHmac = hmac;
 }
 
 void InputEvent::initialize(const InputEvent& from) {
+    mId = from.mId;
     mDeviceId = from.mDeviceId;
     mSource = from.mSource;
     mDisplayId = from.mDisplayId;
+    mHmac = from.mHmac;
+}
+
+int32_t InputEvent::nextId() {
+    static IdGenerator idGen(IdGenerator::Source::OTHER);
+    return idGen.nextId();
 }
 
 // --- KeyEvent ---
@@ -79,19 +142,11 @@ int32_t KeyEvent::getKeyCodeFromLabel(const char* label) {
     return getKeyCodeByLabel(label);
 }
 
-void KeyEvent::initialize(
-        int32_t deviceId,
-        int32_t source,
-        int32_t displayId,
-        int32_t action,
-        int32_t flags,
-        int32_t keyCode,
-        int32_t scanCode,
-        int32_t metaState,
-        int32_t repeatCount,
-        nsecs_t downTime,
-        nsecs_t eventTime) {
-    InputEvent::initialize(deviceId, source, displayId);
+void KeyEvent::initialize(int32_t id, int32_t deviceId, uint32_t source, int32_t displayId,
+                          std::array<uint8_t, 32> hmac, int32_t action, int32_t flags,
+                          int32_t keyCode, int32_t scanCode, int32_t metaState, int32_t repeatCount,
+                          nsecs_t downTime, nsecs_t eventTime) {
+    InputEvent::initialize(id, deviceId, source, displayId, hmac);
     mAction = action;
     mFlags = flags;
     mKeyCode = keyCode;
@@ -250,15 +305,16 @@ void PointerProperties::copyFrom(const PointerProperties& other) {
 
 // --- MotionEvent ---
 
-void MotionEvent::initialize(int32_t deviceId, int32_t source, int32_t displayId, int32_t action,
-                             int32_t actionButton, int32_t flags, int32_t edgeFlags,
-                             int32_t metaState, int32_t buttonState,
-                             MotionClassification classification, float xOffset, float yOffset,
-                             float xPrecision, float yPrecision, float rawXCursorPosition,
-                             float rawYCursorPosition, nsecs_t downTime, nsecs_t eventTime,
-                             size_t pointerCount, const PointerProperties* pointerProperties,
+void MotionEvent::initialize(int32_t id, int32_t deviceId, uint32_t source, int32_t displayId,
+                             std::array<uint8_t, 32> hmac, int32_t action, int32_t actionButton,
+                             int32_t flags, int32_t edgeFlags, int32_t metaState,
+                             int32_t buttonState, MotionClassification classification, float xScale,
+                             float yScale, float xOffset, float yOffset, float xPrecision,
+                             float yPrecision, float rawXCursorPosition, float rawYCursorPosition,
+                             nsecs_t downTime, nsecs_t eventTime, size_t pointerCount,
+                             const PointerProperties* pointerProperties,
                              const PointerCoords* pointerCoords) {
-    InputEvent::initialize(deviceId, source, displayId);
+    InputEvent::initialize(id, deviceId, source, displayId, hmac);
     mAction = action;
     mActionButton = actionButton;
     mFlags = flags;
@@ -266,6 +322,8 @@ void MotionEvent::initialize(int32_t deviceId, int32_t source, int32_t displayId
     mMetaState = metaState;
     mButtonState = buttonState;
     mClassification = classification;
+    mXScale = xScale;
+    mYScale = yScale;
     mXOffset = xOffset;
     mYOffset = yOffset;
     mXPrecision = xPrecision;
@@ -281,7 +339,8 @@ void MotionEvent::initialize(int32_t deviceId, int32_t source, int32_t displayId
 }
 
 void MotionEvent::copyFrom(const MotionEvent* other, bool keepHistory) {
-    InputEvent::initialize(other->mDeviceId, other->mSource, other->mDisplayId);
+    InputEvent::initialize(other->mId, other->mDeviceId, other->mSource, other->mDisplayId,
+                           other->mHmac);
     mAction = other->mAction;
     mActionButton = other->mActionButton;
     mFlags = other->mFlags;
@@ -289,6 +348,8 @@ void MotionEvent::copyFrom(const MotionEvent* other, bool keepHistory) {
     mMetaState = other->mMetaState;
     mButtonState = other->mButtonState;
     mClassification = other->mClassification;
+    mXScale = other->mXScale;
+    mYScale = other->mYScale;
     mXOffset = other->mXOffset;
     mYOffset = other->mYOffset;
     mXPrecision = other->mXPrecision;
@@ -321,17 +382,17 @@ void MotionEvent::addSample(
 
 float MotionEvent::getXCursorPosition() const {
     const float rawX = getRawXCursorPosition();
-    return rawX + mXOffset;
+    return rawX * mXScale + mXOffset;
 }
 
 float MotionEvent::getYCursorPosition() const {
     const float rawY = getRawYCursorPosition();
-    return rawY + mYOffset;
+    return rawY * mYScale + mYOffset;
 }
 
 void MotionEvent::setCursorPosition(float x, float y) {
-    mRawXCursorPosition = x - mXOffset;
-    mRawYCursorPosition = y - mYOffset;
+    mRawXCursorPosition = (x - mXOffset) / mXScale;
+    mRawYCursorPosition = (y - mYOffset) / mYScale;
 }
 
 const PointerCoords* MotionEvent::getRawPointerCoords(size_t pointerIndex) const {
@@ -346,9 +407,9 @@ float MotionEvent::getAxisValue(int32_t axis, size_t pointerIndex) const {
     float value = getRawPointerCoords(pointerIndex)->getAxisValue(axis);
     switch (axis) {
     case AMOTION_EVENT_AXIS_X:
-        return value + mXOffset;
+        return value * mXScale + mXOffset;
     case AMOTION_EVENT_AXIS_Y:
-        return value + mYOffset;
+        return value * mYScale + mYOffset;
     }
     return value;
 }
@@ -368,9 +429,9 @@ float MotionEvent::getHistoricalAxisValue(int32_t axis, size_t pointerIndex,
     float value = getHistoricalRawPointerCoords(pointerIndex, historicalIndex)->getAxisValue(axis);
     switch (axis) {
     case AMOTION_EVENT_AXIS_X:
-        return value + mXOffset;
+        return value * mXScale + mXOffset;
     case AMOTION_EVENT_AXIS_Y:
-        return value + mYOffset;
+        return value * mYScale + mYOffset;
     }
     return value;
 }
@@ -442,11 +503,11 @@ void MotionEvent::transform(const float matrix[9]) {
     float oldXOffset = mXOffset;
     float oldYOffset = mYOffset;
     float newX, newY;
-    float rawX = getRawX(0);
-    float rawY = getRawY(0);
-    transformPoint(matrix, rawX + oldXOffset, rawY + oldYOffset, &newX, &newY);
-    mXOffset = newX - rawX;
-    mYOffset = newY - rawY;
+    float scaledRawX = getRawX(0) * mXScale;
+    float scaledRawY = getRawY(0) * mYScale;
+    transformPoint(matrix, scaledRawX + oldXOffset, scaledRawY + oldYOffset, &newX, &newY);
+    mXOffset = newX - scaledRawX;
+    mYOffset = newY - scaledRawY;
 
     // Determine how the origin is transformed by the matrix so that we
     // can transform orientation vectors.
@@ -455,22 +516,22 @@ void MotionEvent::transform(const float matrix[9]) {
 
     // Apply the transformation to cursor position.
     if (isValidCursorPosition(mRawXCursorPosition, mRawYCursorPosition)) {
-        float x = mRawXCursorPosition + oldXOffset;
-        float y = mRawYCursorPosition + oldYOffset;
+        float x = mRawXCursorPosition * mXScale + oldXOffset;
+        float y = mRawYCursorPosition * mYScale + oldYOffset;
         transformPoint(matrix, x, y, &x, &y);
-        mRawXCursorPosition = x - mXOffset;
-        mRawYCursorPosition = y - mYOffset;
+        mRawXCursorPosition = (x - mXOffset) / mXScale;
+        mRawYCursorPosition = (y - mYOffset) / mYScale;
     }
 
     // Apply the transformation to all samples.
     size_t numSamples = mSamplePointerCoords.size();
     for (size_t i = 0; i < numSamples; i++) {
         PointerCoords& c = mSamplePointerCoords.editItemAt(i);
-        float x = c.getAxisValue(AMOTION_EVENT_AXIS_X) + oldXOffset;
-        float y = c.getAxisValue(AMOTION_EVENT_AXIS_Y) + oldYOffset;
+        float x = c.getAxisValue(AMOTION_EVENT_AXIS_X) * mXScale + oldXOffset;
+        float y = c.getAxisValue(AMOTION_EVENT_AXIS_Y) * mYScale + oldYOffset;
         transformPoint(matrix, x, y, &x, &y);
-        c.setAxisValue(AMOTION_EVENT_AXIS_X, x - mXOffset);
-        c.setAxisValue(AMOTION_EVENT_AXIS_Y, y - mYOffset);
+        c.setAxisValue(AMOTION_EVENT_AXIS_X, (x - mXOffset) / mXScale);
+        c.setAxisValue(AMOTION_EVENT_AXIS_Y, (y - mYOffset) / mYScale);
 
         float orientation = c.getAxisValue(AMOTION_EVENT_AXIS_ORIENTATION);
         c.setAxisValue(AMOTION_EVENT_AXIS_ORIENTATION,
@@ -487,9 +548,16 @@ status_t MotionEvent::readFromParcel(Parcel* parcel) {
         return BAD_VALUE;
     }
 
+    mId = parcel->readInt32();
     mDeviceId = parcel->readInt32();
-    mSource = parcel->readInt32();
+    mSource = parcel->readUint32();
     mDisplayId = parcel->readInt32();
+    std::vector<uint8_t> hmac;
+    status_t result = parcel->readByteVector(&hmac);
+    if (result != OK || hmac.size() != 32) {
+        return BAD_VALUE;
+    }
+    std::move(hmac.begin(), hmac.begin() + hmac.size(), mHmac.begin());
     mAction = parcel->readInt32();
     mActionButton = parcel->readInt32();
     mFlags = parcel->readInt32();
@@ -497,6 +565,8 @@ status_t MotionEvent::readFromParcel(Parcel* parcel) {
     mMetaState = parcel->readInt32();
     mButtonState = parcel->readInt32();
     mClassification = static_cast<MotionClassification>(parcel->readByte());
+    mXScale = parcel->readFloat();
+    mYScale = parcel->readFloat();
     mXOffset = parcel->readFloat();
     mYOffset = parcel->readFloat();
     mXPrecision = parcel->readFloat();
@@ -540,9 +610,12 @@ status_t MotionEvent::writeToParcel(Parcel* parcel) const {
     parcel->writeInt32(pointerCount);
     parcel->writeInt32(sampleCount);
 
+    parcel->writeInt32(mId);
     parcel->writeInt32(mDeviceId);
-    parcel->writeInt32(mSource);
+    parcel->writeUint32(mSource);
     parcel->writeInt32(mDisplayId);
+    std::vector<uint8_t> hmac(mHmac.begin(), mHmac.end());
+    parcel->writeByteVector(hmac);
     parcel->writeInt32(mAction);
     parcel->writeInt32(mActionButton);
     parcel->writeInt32(mFlags);
@@ -550,6 +623,8 @@ status_t MotionEvent::writeToParcel(Parcel* parcel) const {
     parcel->writeInt32(mMetaState);
     parcel->writeInt32(mButtonState);
     parcel->writeByte(static_cast<int8_t>(mClassification));
+    parcel->writeFloat(mXScale);
+    parcel->writeFloat(mYScale);
     parcel->writeFloat(mXOffset);
     parcel->writeFloat(mYOffset);
     parcel->writeFloat(mXPrecision);
@@ -578,7 +653,7 @@ status_t MotionEvent::writeToParcel(Parcel* parcel) const {
 }
 #endif
 
-bool MotionEvent::isTouchEvent(int32_t source, int32_t action) {
+bool MotionEvent::isTouchEvent(uint32_t source, int32_t action) {
     if (source & AINPUT_SOURCE_CLASS_POINTER) {
         // Specifically excludes HOVER_MOVE and SCROLL.
         switch (action & AMOTION_EVENT_ACTION_MASK) {
@@ -605,9 +680,9 @@ int32_t MotionEvent::getAxisFromLabel(const char* label) {
 
 // --- FocusEvent ---
 
-void FocusEvent::initialize(bool hasFocus, bool inTouchMode) {
-    InputEvent::initialize(ReservedInputDeviceId::VIRTUAL_KEYBOARD_ID, AINPUT_SOURCE_UNKNOWN,
-                           ADISPLAY_ID_NONE);
+void FocusEvent::initialize(int32_t id, bool hasFocus, bool inTouchMode) {
+    InputEvent::initialize(id, ReservedInputDeviceId::VIRTUAL_KEYBOARD_ID, AINPUT_SOURCE_UNKNOWN,
+                           ADISPLAY_ID_NONE, INVALID_HMAC);
     mHasFocus = hasFocus;
     mInTouchMode = inTouchMode;
 }

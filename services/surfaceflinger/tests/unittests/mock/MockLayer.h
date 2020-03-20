@@ -28,8 +28,10 @@ public:
           : Layer(LayerCreationArgs(flinger, nullptr, "TestLayer", 800, 600, 0, {})) {}
 
     MOCK_CONST_METHOD0(getType, const char*());
+    MOCK_METHOD0(getFrameSelectionPriority, int32_t());
     MOCK_CONST_METHOD0(isVisible, bool());
     MOCK_METHOD0(createClone, sp<Layer>());
+    MOCK_CONST_METHOD0(getFrameRate, FrameRate());
 };
 
 } // namespace android::mock

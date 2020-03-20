@@ -27,7 +27,14 @@
 #include <ui/Rect.h>
 #include <ui/Region.h>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include "DisplayHardware/ComposerHal.h"
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
 
 namespace HWC2 {
 class Layer;
@@ -51,6 +58,9 @@ struct OutputLayerCompositionState {
 
     // The visibleRegion transformed to output space
     Region outputSpaceVisibleRegion;
+
+    // Region cast by the layer's shadow
+    Region shadowRegion;
 
     // If true, client composition will be used on this output
     bool forceClientComposition{false};

@@ -66,7 +66,6 @@ class SurfaceFlinger;
 class LayerDebugInfo;
 
 namespace compositionengine {
-class Layer;
 class OutputLayer;
 struct LayerFECompositionState;
 }
@@ -78,11 +77,11 @@ class SurfaceInterceptor;
 // ---------------------------------------------------------------------------
 
 struct LayerCreationArgs {
-    LayerCreationArgs(SurfaceFlinger* flinger, const sp<Client>& client, std::string name,
+    LayerCreationArgs(SurfaceFlinger* flinger, const sp<Client> client, std::string name,
                       uint32_t w, uint32_t h, uint32_t flags, LayerMetadata metadata);
 
     SurfaceFlinger* flinger;
-    const sp<Client>& client;
+    const sp<Client> client;
     std::string name;
     uint32_t w;
     uint32_t h;
@@ -94,8 +93,9 @@ struct LayerCreationArgs {
     uint32_t textureName;
 };
 
-class Layer : public compositionengine::LayerFE {
+class Layer : public virtual RefBase, compositionengine::LayerFE {
     static std::atomic<int32_t> sSequence;
+    static constexpr int32_t PRIORITY_UNSET = -1;
 
 public:
     mutable bool contentDirty{false};
@@ -133,6 +133,38 @@ public:
         FloatRect cropRect = FloatRect();
         // Radius of the rounded rectangle.
         float radius = 0.0f;
+    };
+
+    // FrameRateCompatibility specifies how we should interpret the frame rate associated with
+    // the layer.
+    enum class FrameRateCompatibility {
+        Default, // Layer didn't specify any specific handling strategy
+
+        ExactOrMultiple, // Layer needs the exact frame rate (or a multiple of it) to present the
+                         // content properly. Any other value will result in a pull down.
+
+        NoVote, // Layer doesn't have any requirements for the refresh rate and
+                // should not be considered when the display refresh rate is determined.
+    };
+
+    // Encapsulates the frame rate and compatibility of the layer. This information will be used
+    // when the display refresh rate is determined.
+    struct FrameRate {
+        float rate;
+        FrameRateCompatibility type;
+
+        FrameRate() : rate(0), type(FrameRateCompatibility::Default) {}
+        FrameRate(float rate, FrameRateCompatibility type) : rate(rate), type(type) {}
+
+        bool operator==(const FrameRate& other) const {
+            return rate == other.rate && type == other.type;
+        }
+
+        bool operator!=(const FrameRate& other) const { return !(*this == other); }
+
+        // Convert an ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_* value to a
+        // Layer::FrameRateCompatibility. Logs fatal if the compatibility value is invalid.
+        static FrameRateCompatibility convertCompatibility(int8_t compatibility);
     };
 
     struct State {
@@ -178,15 +210,17 @@ public:
 
         half4 color;
         float cornerRadius;
+        int backgroundBlurRadius;
 
         bool inputInfoChanged;
         InputWindowInfo inputInfo;
         wp<Layer> touchableRegionCrop;
 
-        // dataspace is only used by BufferStateLayer and ColorLayer
+        // dataspace is only used by BufferStateLayer and EffectLayer
         ui::Dataspace dataspace;
 
         // The fields below this point are only used by BufferStateLayer
+        uint64_t frameNumber;
         Geometry active;
 
         uint32_t transform;
@@ -220,6 +254,11 @@ public:
         // Length of the cast shadow. If the radius is > 0, a shadow of length shadowRadius will
         // be rendered around the layer.
         float shadowRadius;
+
+        // Priority of the layer assigned by Window Manager.
+        int32_t frameRateSelectionPriority;
+
+        FrameRate frameRate;
     };
 
     explicit Layer(const LayerCreationArgs& args);
@@ -293,6 +332,9 @@ public:
     // The shape of the rounded corner rectangle is specified by the crop rectangle of the layer
     // from which we inferred the rounded corner radius.
     virtual bool setCornerRadius(float cornerRadius);
+    // When non-zero, everything below this layer will be blurred by backgroundBlurRadius, which
+    // is specified in pixels.
+    virtual bool setBackgroundBlurRadius(int backgroundBlurRadius);
     virtual bool setTransparentRegionHint(const Region& transparent);
     virtual bool setFlags(uint8_t flags, uint8_t mask);
     virtual bool setLayerStack(uint32_t layerStack);
@@ -318,8 +360,8 @@ public:
     virtual bool setTransformToDisplayInverse(bool /*transformToDisplayInverse*/) { return false; };
     virtual bool setCrop(const Rect& /*crop*/) { return false; };
     virtual bool setFrame(const Rect& /*frame*/) { return false; };
-    virtual bool setBuffer(const sp<GraphicBuffer>& /*buffer*/, nsecs_t /*postTime*/,
-                           nsecs_t /*desiredPresentTime*/,
+    virtual bool setBuffer(const sp<GraphicBuffer>& /*buffer*/, const sp<Fence>& /*acquireFence*/,
+                           nsecs_t /*postTime*/, nsecs_t /*desiredPresentTime*/,
                            const client_cache_t& /*clientCacheId*/) {
         return false;
     };
@@ -333,9 +375,18 @@ public:
             const std::vector<sp<CallbackHandle>>& /*handles*/) {
         return false;
     };
+    virtual void forceSendCallbacks() {}
+    virtual bool addFrameEvent(const sp<Fence>& /*acquireFence*/, nsecs_t /*postedTime*/,
+                               nsecs_t /*requestedPresentTime*/) {
+        return false;
+    }
     virtual bool setBackgroundColor(const half3& color, float alpha, ui::Dataspace dataspace);
     virtual bool setColorSpaceAgnostic(const bool agnostic);
     bool setShadowRadius(float shadowRadius);
+    virtual bool setFrameRateSelectionPriority(int32_t priority);
+    //  If the variable is not set on the layer, it traverses up the tree to inherit the frame
+    //  rate priority from its parent.
+    virtual int32_t getFrameRateSelectionPriority() const;
 
     virtual ui::Dataspace getDataSpace() const { return ui::Dataspace::UNKNOWN; }
 
@@ -346,7 +397,8 @@ public:
     // visually.
     bool isLegacyDataSpace() const;
 
-    virtual std::shared_ptr<compositionengine::Layer> getCompositionLayer() const;
+    virtual sp<compositionengine::LayerFE> getCompositionEngineLayerFE() const;
+    virtual compositionengine::LayerFECompositionState* editCompositionState();
 
     // If we have received a new buffer this frame, we will pass its surface
     // damage down to hardware composer. Otherwise, we must send a region with
@@ -453,6 +505,10 @@ public:
 
     bool isRemovedFromCurrentState() const;
 
+    LayerProto* writeToProto(LayersProto& layersProto,
+                             uint32_t traceFlags = SurfaceTracing::TRACE_ALL,
+                             const sp<const DisplayDevice>& device = nullptr) const;
+
     // Write states that are modified by the main thread. This includes drawing
     // state as well as buffer data. This should be called in the main or tracing
     // thread.
@@ -488,6 +544,7 @@ public:
     virtual void updateCloneBufferInfo(){};
 
 protected:
+    sp<compositionengine::LayerFE> asLayerFE() const;
     sp<Layer> getClonedFrom() { return mClonedFrom != nullptr ? mClonedFrom.promote() : nullptr; }
     bool isClone() { return mClonedFrom != nullptr; }
     bool isClonedFromAlive() { return getClonedFrom() != nullptr; }
@@ -497,29 +554,35 @@ protected:
     void updateClonedDrawingState(std::map<sp<Layer>, sp<Layer>>& clonedLayersMap);
     void updateClonedChildren(const sp<Layer>& mirrorRoot,
                               std::map<sp<Layer>, sp<Layer>>& clonedLayersMap);
-    void updateClonedRelatives(std::map<sp<Layer>, sp<Layer>> clonedLayersMap);
+    void updateClonedRelatives(const std::map<sp<Layer>, sp<Layer>>& clonedLayersMap);
     void addChildToDrawing(const sp<Layer>& layer);
+    void updateClonedInputInfo(const std::map<sp<Layer>, sp<Layer>>& clonedLayersMap);
+    virtual std::optional<compositionengine::LayerFE::LayerSettings> prepareClientComposition(
+            compositionengine::LayerFE::ClientCompositionTargetSettings&);
+    virtual std::optional<compositionengine::LayerFE::LayerSettings> prepareShadowClientComposition(
+            const LayerFE::LayerSettings& layerSettings, const Rect& displayViewport,
+            ui::Dataspace outputDataspace);
+    // Modifies the passed in layer settings to clear the contents. If the blackout flag is set,
+    // the settings clears the content with a solid black fill.
+    void prepareClearClientComposition(LayerFE::LayerSettings& layerSettings, bool blackout) const;
 
 public:
     /*
      * compositionengine::LayerFE overrides
      */
+    const compositionengine::LayerFECompositionState* getCompositionState() const override;
     bool onPreComposition(nsecs_t) override;
-    void latchCompositionState(compositionengine::LayerFECompositionState&,
-                               compositionengine::LayerFE::StateSubset subset) const override;
-    void latchCursorCompositionState(compositionengine::LayerFECompositionState&) const override;
-    std::optional<renderengine::LayerSettings> prepareClientComposition(
+    void prepareCompositionState(compositionengine::LayerFE::StateSubset subset) override;
+    std::vector<compositionengine::LayerFE::LayerSettings> prepareClientCompositionList(
             compositionengine::LayerFE::ClientCompositionTargetSettings&) override;
-    std::optional<renderengine::LayerSettings> prepareShadowClientComposition(
-            const renderengine::LayerSettings& layerSettings, const Rect& displayViewport,
-            ui::Dataspace outputDataspace) override;
     void onLayerDisplayed(const sp<Fence>& releaseFence) override;
     const char* getDebugName() const override;
 
 protected:
-    void latchBasicGeometry(compositionengine::LayerFECompositionState& outState) const;
-    void latchGeometry(compositionengine::LayerFECompositionState& outState) const;
-    virtual void latchPerFrameState(compositionengine::LayerFECompositionState& outState) const;
+    void prepareBasicGeometryCompositionState();
+    void prepareGeometryCompositionState();
+    virtual void preparePerFrameCompositionState();
+    void prepareCursorCompositionState();
 
 public:
     virtual void setDefaultBufferSize(uint32_t /*w*/, uint32_t /*h*/) {}
@@ -547,6 +610,8 @@ public:
     // If a buffer was replaced this frame, release the former buffer
     virtual void releasePendingBuffer(nsecs_t /*dequeueReadyTime*/) { }
 
+    virtual void finalizeFrameEventHistory(const std::shared_ptr<FenceTime>& /*glDoneFence*/,
+                                           const CompositorTiming& /*compositorTiming*/) {}
     /*
      * doTransaction - process the transaction. This is a good place to figure
      * out which attributes of the surface have changed.
@@ -648,16 +713,27 @@ public:
     // down the hierarchy).
     half getAlpha() const;
     half4 getColor() const;
+    int32_t getBackgroundBlurRadius() const;
+    bool drawShadows() const { return mEffectiveShadowRadius > 0.f; };
 
     // Returns how rounded corners should be drawn for this layer.
     // This will traverse the hierarchy until it reaches its root, finding topmost rounded
     // corner definition and converting it into current layer's coordinates.
     // As of now, only 1 corner radius per display list is supported. Subsequent ones will be
     // ignored.
-    RoundedCornerState getRoundedCornerState() const;
+    virtual RoundedCornerState getRoundedCornerState() const;
 
     renderengine::ShadowSettings getShadowSettings(const Rect& viewport) const;
 
+    /**
+     * Traverse this layer and it's hierarchy of children directly. Unlike traverseInZOrder
+     * which will not emit children who have relativeZOrder to another layer, this method
+     * just directly emits all children. It also emits them in no particular order.
+     * So this method is not suitable for graphical operations, as it doesn't represent
+     * the scene state, but it's also more efficient than traverseInZOrder and so useful for
+     * book-keeping.
+     */
+    void traverse(LayerVector::StateSet stateSet, const LayerVector::Visitor& visitor);
     void traverseInReverseZOrder(LayerVector::StateSet stateSet,
                                  const LayerVector::Visitor& visitor);
     void traverseInZOrder(LayerVector::StateSet stateSet, const LayerVector::Visitor& visitor);
@@ -724,6 +800,9 @@ public:
      */
     Rect getCroppedBufferSize(const Layer::State& s) const;
 
+    bool setFrameRate(FrameRate frameRate);
+    virtual FrameRate getFrameRate() const;
+
 protected:
     // constant
     sp<SurfaceFlinger> mFlinger;
@@ -750,6 +829,7 @@ protected:
 
     // For unit tests
     friend class TestableSurfaceFlinger;
+    friend class RefreshRateSelectionTest;
 
     virtual void commitTransaction(const State& stateToCommit);
 
@@ -917,6 +997,10 @@ protected:
     // Window types from WindowManager.LayoutParams
     const int mWindowType;
 
+    // Called when mDrawingState has changed. If we or one of our children/relatives hasInput()
+    // then we will dirty the setInputWindows cache.
+    bool maybeDirtyInput();
+
 private:
     /**
      * Returns an unsorted vector of all layers that are part of this tree.
@@ -972,6 +1056,10 @@ private:
 
     // Returns true if the layer can draw shadows on its border.
     virtual bool canDrawShadows() const { return true; }
+
+    // Find the root of the cloned hierarchy, this means the first non cloned parent.
+    // This will return null if first non cloned parent is not found.
+    sp<Layer> getClonedRoot();
 };
 
 } // namespace android

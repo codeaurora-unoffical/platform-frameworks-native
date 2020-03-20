@@ -26,7 +26,7 @@ namespace android::scheduler {
 class TimeKeeper;
 class VSyncTracker;
 
-enum class ScheduleResult { Scheduled, ReScheduled, CannotSchedule, Error };
+enum class ScheduleResult { Scheduled, CannotSchedule, Error };
 enum class CancelResult { Cancelled, TooLate, Error };
 
 /*
@@ -37,6 +37,14 @@ public:
     using CallbackToken = StrongTyping<size_t, class CallbackTokenTag, Compare, Hash>;
 
     virtual ~VSyncDispatch();
+
+    /*
+     * A callback that can be registered to be awoken at a given time relative to a vsync event.
+     * \param [in] vsyncTime The timestamp of the vsync the callback is for.
+     * \param [in] targetWakeupTime The timestamp of intended wakeup time of the cb.
+     *
+     */
+    using Callback = std::function<void(nsecs_t vsyncTime, nsecs_t targetWakeupTime)>;
 
     /*
      * Registers a callback that will be called at designated points on the vsync timeline.
@@ -51,7 +59,7 @@ public:
      *                          invocation of callbackFn.
      *
      */
-    virtual CallbackToken registerCallback(std::function<void(nsecs_t)> const& callbackFn,
+    virtual CallbackToken registerCallback(Callback const& callbackFn,
                                            std::string callbackName) = 0;
 
     /*
@@ -83,7 +91,6 @@ public:
      * \param [in] earliestVsync   The targeted display time. This will be snapped to the closest
      *                             predicted vsync time after earliestVsync.
      * \return                     A ScheduleResult::Scheduled if callback was scheduled.
-     *                             A ScheduleResult::ReScheduled if callback was rescheduled.
      *                             A ScheduleResult::CannotSchedule
      *                             if (workDuration - earliestVsync) is in the past, or
      *                             if a callback was dispatched for the predictedVsync already.
@@ -113,7 +120,7 @@ protected:
  */
 class VSyncCallbackRegistration {
 public:
-    VSyncCallbackRegistration(VSyncDispatch&, std::function<void(nsecs_t)> const& callbackFn,
+    VSyncCallbackRegistration(VSyncDispatch&, VSyncDispatch::Callback const& callbackFn,
                               std::string const& callbackName);
     VSyncCallbackRegistration(VSyncCallbackRegistration&&);
     VSyncCallbackRegistration& operator=(VSyncCallbackRegistration&&);

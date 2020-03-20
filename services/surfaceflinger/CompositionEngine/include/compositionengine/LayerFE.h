@@ -20,7 +20,15 @@
 #include <ostream>
 #include <unordered_set>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include <renderengine/LayerSettings.h>
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
+
 #include <utils/RefBase.h>
 #include <utils/Timers.h>
 
@@ -36,6 +44,9 @@ struct LayerFECompositionState;
 // of the front-end layer
 class LayerFE : public virtual RefBase {
 public:
+    // Gets the raw front-end composition state data for the layer
+    virtual const LayerFECompositionState* getCompositionState() const = 0;
+
     // Called before composition starts. Should return true if this layer has
     // pending updates which would require an extra display refresh cycle to
     // process.
@@ -52,19 +63,18 @@ public:
         // content (buffer or color) state for the layer.
         GeometryAndContent,
 
-        // Gets the per frame content (buffer or color) state the layer.
+        // Gets the per frame content (buffer or color) state for the layer.
         Content,
+
+        // Gets the cursor state for the layer.
+        Cursor,
     };
 
-    // Latches the output-independent composition state for the layer. The
+    // Prepares the output-independent composition state for the layer. The
     // StateSubset argument selects what portion of the state is actually needed
     // by the CompositionEngine code, since computing everything may be
     // expensive.
-    virtual void latchCompositionState(LayerFECompositionState&, StateSubset) const = 0;
-
-    // Latches the minimal bit of state for the cursor for a fast asynchronous
-    // update.
-    virtual void latchCursorCompositionState(LayerFECompositionState&) const = 0;
+    virtual void prepareCompositionState(StateSubset) = 0;
 
     struct ClientCompositionTargetSettings {
         // The clip region, or visible region that is being rendered to
@@ -87,19 +97,38 @@ public:
         // Modified by each call to prepareClientComposition to indicate the
         // region of the target buffer that should be cleared.
         Region& clearRegion;
+
+        // Viewport of the target being rendered to. This is used to determine
+        // the shadow light position.
+        const Rect& viewport;
+
+        // Dataspace of the output so we can optimize how to render the shadow
+        // by avoiding unnecessary color space conversions.
+        const ui::Dataspace dataspace;
+
+        // True if the region excluding the shadow is visible.
+        const bool realContentIsVisible;
+
+        // If set to true, change the layer settings to render a clear output.
+        // This may be requested by the HWC
+        const bool clearContent;
     };
 
-    // Returns the LayerSettings to pass to RenderEngine::drawLayers, or
-    // nullopt_t if the layer does not render
-    virtual std::optional<renderengine::LayerSettings> prepareClientComposition(
-            ClientCompositionTargetSettings&) = 0;
+    // A superset of LayerSettings required by RenderEngine to compose a layer
+    // and buffer info to determine duplicate client composition requests.
+    struct LayerSettings : renderengine::LayerSettings {
+        // Currently latched buffer if, 0 if invalid.
+        uint64_t bufferId = 0;
 
-    // Returns the LayerSettings used to draw shadows around a layer. It is passed
-    // to RenderEngine::drawLayers. Returns nullopt_t if the layer does not render
-    // shadows.
-    virtual std::optional<renderengine::LayerSettings> prepareShadowClientComposition(
-            const renderengine::LayerSettings& layerSettings, const Rect& displayViewport,
-            ui::Dataspace outputDataspace) = 0;
+        // Currently latched frame number, 0 if invalid.
+        uint64_t frameNumber = 0;
+    };
+
+    // Returns the z-ordered list of LayerSettings to pass to RenderEngine::drawLayers. The list
+    // may contain shadows casted by the layer or the content of the layer itself.  If the layer
+    // does not render then an empty list will be returned.
+    virtual std::vector<LayerSettings> prepareClientCompositionList(
+            ClientCompositionTargetSettings&) = 0;
 
     // Called after the layer is displayed to update the presentation fence
     virtual void onLayerDisplayed(const sp<Fence>&) = 0;
@@ -122,7 +151,17 @@ static inline bool operator==(const LayerFE::ClientCompositionTargetSettings& lh
             lhs.useIdentityTransform == rhs.useIdentityTransform &&
             lhs.needsFiltering == rhs.needsFiltering && lhs.isSecure == rhs.isSecure &&
             lhs.supportsProtectedContent == rhs.supportsProtectedContent &&
-            lhs.clearRegion.hasSameRects(rhs.clearRegion);
+            lhs.clearRegion.hasSameRects(rhs.clearRegion) && lhs.viewport == rhs.viewport &&
+            lhs.dataspace == rhs.dataspace &&
+            lhs.realContentIsVisible == rhs.realContentIsVisible &&
+            lhs.clearContent == rhs.clearContent;
+}
+
+static inline bool operator==(const LayerFE::LayerSettings& lhs,
+                              const LayerFE::LayerSettings& rhs) {
+    return static_cast<const renderengine::LayerSettings&>(lhs) ==
+            static_cast<const renderengine::LayerSettings&>(rhs) &&
+            lhs.bufferId == rhs.bufferId && lhs.frameNumber == rhs.frameNumber;
 }
 
 // Defining PrintTo helps with Google Tests.
@@ -137,6 +176,20 @@ static inline void PrintTo(const LayerFE::ClientCompositionTargetSettings& setti
     *os << "\n    .supportsProtectedContent = " << settings.supportsProtectedContent;
     *os << "\n    .clearRegion = ";
     PrintTo(settings.clearRegion, os);
+    *os << "\n    .viewport = ";
+    PrintTo(settings.viewport, os);
+    *os << "\n    .dataspace = ";
+    PrintTo(settings.dataspace, os);
+    *os << "\n    .realContentIsVisible = " << settings.realContentIsVisible;
+    *os << "\n    .clearContent = " << settings.clearContent;
+    *os << "\n}";
+}
+
+static inline void PrintTo(const LayerFE::LayerSettings& settings, ::std::ostream* os) {
+    *os << "LayerFE::LayerSettings{";
+    PrintTo(static_cast<const renderengine::LayerSettings&>(settings), os);
+    *os << "\n    .bufferId = " << settings.bufferId;
+    *os << "\n    .frameNumber = " << settings.frameNumber;
     *os << "\n}";
 }
 

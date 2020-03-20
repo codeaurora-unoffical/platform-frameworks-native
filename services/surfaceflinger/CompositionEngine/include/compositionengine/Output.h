@@ -41,7 +41,6 @@ class Layer;
 namespace android::compositionengine {
 
 class DisplayColorProfile;
-class Layer;
 class LayerFE;
 class RenderSurface;
 class OutputLayer;
@@ -162,8 +161,9 @@ public:
     virtual void setCompositionEnabled(bool) = 0;
 
     // Sets the projection state to use
-    virtual void setProjection(const ui::Transform&, int32_t orientation, const Rect& frame,
-                               const Rect& viewport, const Rect& scissor, bool needsFiltering) = 0;
+    virtual void setProjection(const ui::Transform&, uint32_t orientation, const Rect& frame,
+                               const Rect& viewport, const Rect& sourceClip,
+                               const Rect& destinationClip, bool needsFiltering) = 0;
     // Sets the bounds to use
     virtual void setBounds(const ui::Size&) = 0;
 
@@ -215,18 +215,17 @@ public:
     virtual bool belongsInOutput(std::optional<uint32_t> layerStackId, bool internalOnly) const = 0;
 
     // Determines if a layer belongs to the output.
-    virtual bool belongsInOutput(const Layer*) const = 0;
+    virtual bool belongsInOutput(const sp<LayerFE>&) const = 0;
 
     // Returns a pointer to the output layer corresponding to the given layer on
     // this output, or nullptr if the layer does not have one
-    virtual OutputLayer* getOutputLayerForLayer(Layer*) const = 0;
+    virtual OutputLayer* getOutputLayerForLayer(const sp<LayerFE>&) const = 0;
 
     // Immediately clears all layers from the output.
     virtual void clearOutputLayers() = 0;
 
     // For tests use only. Creates and appends an OutputLayer into the output.
-    virtual OutputLayer* injectOutputLayerForTest(const std::shared_ptr<Layer>&,
-                                                  const sp<LayerFE>&) = 0;
+    virtual OutputLayer* injectOutputLayerForTest(const sp<LayerFE>&) = 0;
 
     // Gets the count of output layers managed by this output
     virtual size_t getOutputLayerCount() const = 0;
@@ -256,7 +255,7 @@ protected:
 
     virtual void rebuildLayerStacks(const CompositionRefreshArgs&, LayerFESet&) = 0;
     virtual void collectVisibleLayers(const CompositionRefreshArgs&, CoverageState&) = 0;
-    virtual void ensureOutputLayerIfVisible(std::shared_ptr<Layer>, CoverageState&) = 0;
+    virtual void ensureOutputLayerIfVisible(sp<LayerFE>&, CoverageState&) = 0;
     virtual void setReleasedLayers(const CompositionRefreshArgs&) = 0;
 
     virtual void updateAndWriteCompositionState(const CompositionRefreshArgs&) = 0;
@@ -266,17 +265,19 @@ protected:
     virtual void prepareFrame() = 0;
     virtual void devOptRepaintFlash(const CompositionRefreshArgs&) = 0;
     virtual void finishFrame(const CompositionRefreshArgs&) = 0;
-    virtual std::optional<base::unique_fd> composeSurfaces(const Region&) = 0;
+    virtual std::optional<base::unique_fd> composeSurfaces(
+            const Region&, const compositionengine::CompositionRefreshArgs& refreshArgs) = 0;
     virtual void postFramebuffer() = 0;
     virtual void chooseCompositionStrategy() = 0;
     virtual bool getSkipColorTransform() const = 0;
     virtual FrameFences presentAndGetFrameFences() = 0;
-    virtual std::vector<renderengine::LayerSettings> generateClientCompositionRequests(
+    virtual std::vector<LayerFE::LayerSettings> generateClientCompositionRequests(
             bool supportsProtectedContent, Region& clearRegion, ui::Dataspace outputDataspace) = 0;
     virtual void appendRegionFlashRequests(
             const Region& flashRegion,
-            std::vector<renderengine::LayerSettings>& clientCompositionLayers) = 0;
+            std::vector<LayerFE::LayerSettings>& clientCompositionLayers) = 0;
     virtual void setExpensiveRenderingExpected(bool enabled) = 0;
+    virtual void cacheClientCompositionRequests(uint32_t cacheSize) = 0;
 };
 
 } // namespace android::compositionengine

@@ -32,6 +32,7 @@
 #include <renderengine/RenderEngine.h>
 #include <renderengine/private/Description.h>
 #include <sys/types.h>
+#include "GLShadowTexture.h"
 #include "ImageManager.h"
 
 #define EGL_NO_CONFIG ((EGLConfig)0)
@@ -46,6 +47,7 @@ class Texture;
 namespace gl {
 
 class GLImage;
+class BlurFilter;
 
 class GLESRenderEngine : public impl::RenderEngine {
 public:
@@ -70,7 +72,8 @@ public:
     bool isProtected() const override { return mInProtectedContext; }
     bool supportsProtectedContent() const override;
     bool useProtectedContext(bool useProtectedContext) override;
-    status_t drawLayers(const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+    status_t drawLayers(const DisplaySettings& display,
+                        const std::vector<const LayerSettings*>& layers,
                         ANativeWindowBuffer* buffer, const bool useFramebufferCache,
                         base::unique_fd&& bufferFence, base::unique_fd* drawFence) override;
 
@@ -117,6 +120,7 @@ private:
     std::unique_ptr<Framebuffer> createFramebuffer();
     std::unique_ptr<Image> createImage();
     void checkErrors() const;
+    void checkErrors(const char* tag) const;
     void setScissor(const Rect& region);
     void disableScissor();
     bool waitSync(EGLSyncKHR sync, EGLint flags);
@@ -174,12 +178,12 @@ private:
     EGLSurface mDummySurface;
     EGLContext mProtectedEGLContext;
     EGLSurface mProtectedDummySurface;
-    GLuint mProtectedTexName;
     GLint mMaxViewportDims[2];
     GLint mMaxTextureSize;
     GLuint mVpWidth;
     GLuint mVpHeight;
     Description mState;
+    GLShadowTexture mShadowTexture;
 
     mat4 mSrgbToXyz;
     mat4 mDisplayP3ToXyz;
@@ -228,6 +232,9 @@ private:
 
     std::unique_ptr<Framebuffer> mDrawingBuffer;
 
+    // Blur effect processor, only instantiated when a layer requests it.
+    BlurFilter* mBlurFilter = nullptr;
+
     class FlushTracer {
     public:
         FlushTracer(GLESRenderEngine* engine);
@@ -251,6 +258,9 @@ private:
     };
     friend class FlushTracer;
     friend class ImageManager;
+    friend class GLFramebuffer;
+    friend class BlurFilter;
+    friend class GenericProgram;
     std::unique_ptr<FlushTracer> mFlushTracer;
     std::unique_ptr<ImageManager> mImageManager = std::make_unique<ImageManager>(this);
 };

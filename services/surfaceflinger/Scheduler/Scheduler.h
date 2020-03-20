@@ -23,7 +23,11 @@
 #include <optional>
 #include <unordered_map>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
 #include <ui/GraphicTypes.h>
+#pragma clang diagnostic pop
 
 #include "EventControlThread.h"
 #include "EventThread.h"
@@ -47,6 +51,7 @@ public:
     virtual void changeRefreshRate(const scheduler::RefreshRateConfigs::RefreshRate&,
                                    scheduler::RefreshRateConfigEvent) = 0;
     virtual void repaintEverythingForHWC() = 0;
+    virtual void kernelTimerChanged(bool expired) = 0;
 };
 
 class Scheduler {
@@ -58,7 +63,8 @@ public:
     enum class TransactionStart { EARLY, NORMAL };
 
     Scheduler(impl::EventControlThread::SetVSyncEnabledFunction,
-              const scheduler::RefreshRateConfigs&, ISchedulerCallback& schedulerCallback);
+              const scheduler::RefreshRateConfigs&, ISchedulerCallback& schedulerCallback,
+              bool useContentDetectionV2, bool useContentDetection);
 
     virtual ~Scheduler();
 
@@ -66,7 +72,6 @@ public:
 
     using ConnectionHandle = scheduler::ConnectionHandle;
     ConnectionHandle createConnection(const char* connectionName, nsecs_t phaseOffsetNs,
-                                      nsecs_t offsetThresholdForNextVsync,
                                       impl::EventThread::InterceptVSyncsCallback);
 
     sp<IDisplayEventConnection> createDisplayEventConnection(ConnectionHandle,
@@ -75,7 +80,8 @@ public:
     sp<EventThreadConnection> getEventConnection(ConnectionHandle);
 
     void onHotplugReceived(ConnectionHandle, PhysicalDisplayId, bool connected);
-    void onConfigChanged(ConnectionHandle, PhysicalDisplayId, HwcConfigIndexType configId);
+    void onConfigChanged(ConnectionHandle, PhysicalDisplayId, HwcConfigIndexType configId,
+                         nsecs_t vsyncPeriod);
 
     void onScreenAcquired(ConnectionHandle);
     void onScreenReleased(ConnectionHandle);
@@ -104,7 +110,8 @@ public:
 
     // Passes a vsync sample to DispSync. periodFlushed will be true if
     // DispSync detected that the vsync period changed, and false otherwise.
-    void addResyncSample(nsecs_t timestamp, bool* periodFlushed);
+    void addResyncSample(nsecs_t timestamp, std::optional<nsecs_t> hwcVsyncPeriod,
+                         bool* periodFlushed);
     void addPresentFence(const std::shared_ptr<FenceTime>&);
     void setIgnorePresentFences(bool ignore);
     nsecs_t getDispSyncExpectedPresentTime();
@@ -136,6 +143,11 @@ public:
     // Notifies the scheduler when the display was refreshed
     void onDisplayRefreshed(nsecs_t timestamp);
 
+    // Notifies the scheduler when the display size has changed. Called from SF's main thread
+    void onPrimaryDisplayAreaChanged(uint32_t displayArea);
+
+    size_t getEventThreadConnectionCount(ConnectionHandle handle);
+
 private:
     friend class TestableScheduler;
 
@@ -147,10 +159,10 @@ private:
 
     // Used by tests to inject mocks.
     Scheduler(std::unique_ptr<DispSync>, std::unique_ptr<EventControlThread>,
-              const scheduler::RefreshRateConfigs&, ISchedulerCallback& schedulerCallback);
+              const scheduler::RefreshRateConfigs&, ISchedulerCallback& schedulerCallback,
+              bool useContentDetectionV2, bool useContentDetection);
 
-    std::unique_ptr<VSyncSource> makePrimaryDispSyncSource(const char* name, nsecs_t phaseOffsetNs,
-                                                           nsecs_t offsetThresholdForNextVsync);
+    std::unique_ptr<VSyncSource> makePrimaryDispSyncSource(const char* name, nsecs_t phaseOffsetNs);
 
     // Create a connection on the given EventThread.
     ConnectionHandle createConnection(std::unique_ptr<EventThread>);
@@ -169,7 +181,10 @@ private:
 
     void setVsyncPeriod(nsecs_t period);
 
-    HwcConfigIndexType calculateRefreshRateType() REQUIRES(mFeatureStateLock);
+    // This function checks whether individual features that are affecting the refresh rate
+    // selection were initialized, prioritizes them, and calculates the HwcConfigIndexType
+    // for the suggested refresh rate.
+    HwcConfigIndexType calculateRefreshRateConfigIndexType() REQUIRES(mFeatureStateLock);
 
     // Stores EventThread associated with a given VSyncSource, and an initial EventThreadConnection.
     struct Connection {
@@ -194,7 +209,7 @@ private:
     std::unique_ptr<EventControlThread> mEventControlThread;
 
     // Used to choose refresh rate if content detection is enabled.
-    std::optional<scheduler::LayerHistory> mLayerHistory;
+    std::unique_ptr<scheduler::LayerHistory> mLayerHistory;
 
     // Whether to use idle timer callbacks that support the kernel timer.
     const bool mSupportKernelTimer;
@@ -213,13 +228,13 @@ private:
     std::mutex mFeatureStateLock;
 
     struct {
-        ContentDetectionState contentDetection = ContentDetectionState::Off;
+        ContentDetectionState contentDetectionV1 = ContentDetectionState::Off;
         TimerState idleTimer = TimerState::Reset;
         TouchState touch = TouchState::Inactive;
         TimerState displayPowerTimer = TimerState::Expired;
 
         std::optional<HwcConfigIndexType> configId;
-        uint32_t contentRefreshRate = 0;
+        scheduler::LayerHistory::Summary contentRequirements;
 
         bool isDisplayPowerStateNormal = true;
     } mFeatures GUARDED_BY(mFeatureStateLock);
@@ -230,6 +245,11 @@ private:
     std::optional<HWC2::VsyncPeriodChangeTimeline> mLastVsyncPeriodChangeTimeline
             GUARDED_BY(mVsyncTimelineLock);
     static constexpr std::chrono::nanoseconds MAX_VSYNC_APPLIED_TIME = 200ms;
+
+    // This variable indicates whether to use the content detection feature at all.
+    const bool mUseContentDetection;
+    // This variable indicates whether to use V2 version of the content detection.
+    const bool mUseContentDetectionV2;
 };
 
 } // namespace android

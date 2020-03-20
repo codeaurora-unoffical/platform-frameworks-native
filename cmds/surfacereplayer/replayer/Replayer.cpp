@@ -424,6 +424,9 @@ status_t Replayer::doSurfaceTransaction(
             case SurfaceChange::SurfaceChangeCase::kDetachChildren:
                 setDetachChildrenChange(transaction, change.id(), change.detach_children());
                 break;
+            case SurfaceChange::SurfaceChangeCase::kShadowRadius:
+                setShadowRadiusChange(transaction, change.id(), change.shadow_radius());
+                break;
             default:
                 status = 1;
                 break;
@@ -505,6 +508,14 @@ void Replayer::setCornerRadius(SurfaceComposerClient::Transaction& t,
     ALOGV("Layer %d: Setting Corner Radius -- cornerRadius=%d", id, cc.corner_radius());
 
     t.setCornerRadius(mLayers[id], cc.corner_radius());
+}
+
+void Replayer::setBackgroundBlurRadius(SurfaceComposerClient::Transaction& t,
+        layer_id id, const BackgroundBlurRadiusChange& cc) {
+    ALOGV("Layer %d: Setting Background Blur Radius -- backgroundBlurRadius=%d", id,
+        cc.background_blur_radius());
+
+    t.setBackgroundBlurRadius(mLayers[id], cc.background_blur_radius());
 }
 
 void Replayer::setMatrix(SurfaceComposerClient::Transaction& t,
@@ -603,7 +614,7 @@ void Replayer::setDisplayProjection(SurfaceComposerClient::Transaction& t,
             pc.viewport().bottom());
     Rect frame = Rect(pc.frame().left(), pc.frame().top(), pc.frame().right(), pc.frame().bottom());
 
-    t.setDisplayProjection(mDisplays[id], pc.orientation(), viewport, frame);
+    t.setDisplayProjection(mDisplays[id], ui::toRotation(pc.orientation()), viewport, frame);
 }
 
 status_t Replayer::createSurfaceControl(
@@ -723,4 +734,9 @@ void Replayer::setReparentChildrenChange(SurfaceComposerClient::Transaction& t,
         return;
     }
     t.reparentChildren(mLayers[id], mLayers[c.parent_id()]->getHandle());
+}
+
+void Replayer::setShadowRadiusChange(SurfaceComposerClient::Transaction& t,
+        layer_id id, const ShadowRadiusChange& c) {
+    t.setShadowRadius(mLayers[id], c.radius());
 }

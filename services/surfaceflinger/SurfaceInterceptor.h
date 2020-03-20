@@ -152,6 +152,8 @@ private:
     void addLayerStackLocked(Transaction* transaction, int32_t layerId, uint32_t layerStack);
     void addCropLocked(Transaction* transaction, int32_t layerId, const Rect& rect);
     void addCornerRadiusLocked(Transaction* transaction, int32_t layerId, float cornerRadius);
+    void addBackgroundBlurRadiusLocked(Transaction* transaction, int32_t layerId,
+                                       int32_t backgroundBlurRadius);
     void addDeferTransactionLocked(Transaction* transaction, int32_t layerId,
             const sp<const Layer>& layer, uint64_t frameNumber);
     void addOverrideScalingModeLocked(Transaction* transaction, int32_t layerId,
@@ -165,6 +167,7 @@ private:
     void addDetachChildrenLocked(Transaction* transaction, int32_t layerId, bool detached);
     void addRelativeParentLocked(Transaction* transaction, int32_t layerId, int32_t parentId,
                                  int z);
+    void addShadowRadiusLocked(Transaction* transaction, int32_t layerId, float shadowRadius);
 
     // Add display transactions to the trace
     DisplayChange* createDisplayChangeLocked(Transaction* transaction, int32_t sequenceId);

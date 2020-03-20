@@ -25,12 +25,13 @@
 #include <compositionengine/mock/CompositionEngine.h>
 #include <compositionengine/mock/DisplayColorProfile.h>
 #include <compositionengine/mock/DisplaySurface.h>
-#include <compositionengine/mock/Layer.h>
 #include <compositionengine/mock/LayerFE.h>
 #include <compositionengine/mock/NativeWindow.h>
 #include <compositionengine/mock/OutputLayer.h>
 #include <compositionengine/mock/RenderSurface.h>
 #include <gtest/gtest.h>
+#include <ui/DisplayInfo.h>
+#include <ui/Rect.h>
 
 #include "MockHWC2.h"
 #include "MockHWComposer.h"
@@ -41,8 +42,11 @@ namespace {
 
 using testing::_;
 using testing::DoAll;
+using testing::Eq;
 using testing::InSequence;
 using testing::NiceMock;
+using testing::Pointee;
+using testing::Ref;
 using testing::Return;
 using testing::ReturnRef;
 using testing::Sequence;
@@ -50,99 +54,320 @@ using testing::SetArgPointee;
 using testing::StrictMock;
 
 constexpr DisplayId DEFAULT_DISPLAY_ID = DisplayId{42};
+constexpr DisplayId VIRTUAL_DISPLAY_ID = DisplayId{43};
 constexpr int32_t DEFAULT_DISPLAY_WIDTH = 1920;
 constexpr int32_t DEFAULT_DISPLAY_HEIGHT = 1080;
+constexpr int32_t DEFAULT_LAYER_STACK = 123;
 
-struct DisplayTest : public testing::Test {
-    class Display : public impl::Display {
+struct Layer {
+    Layer() {
+        EXPECT_CALL(*outputLayer, getLayerFE()).WillRepeatedly(ReturnRef(*layerFE));
+        EXPECT_CALL(*outputLayer, getHwcLayer()).WillRepeatedly(Return(&hwc2Layer));
+    }
+
+    sp<mock::LayerFE> layerFE = new StrictMock<mock::LayerFE>();
+    StrictMock<mock::OutputLayer>* outputLayer = new StrictMock<mock::OutputLayer>();
+    StrictMock<HWC2::mock::Layer> hwc2Layer;
+};
+
+struct LayerNoHWC2Layer {
+    LayerNoHWC2Layer() {
+        EXPECT_CALL(*outputLayer, getLayerFE()).WillRepeatedly(ReturnRef(*layerFE));
+        EXPECT_CALL(*outputLayer, getHwcLayer()).WillRepeatedly(Return(nullptr));
+    }
+
+    sp<mock::LayerFE> layerFE = new StrictMock<mock::LayerFE>();
+    StrictMock<mock::OutputLayer>* outputLayer = new StrictMock<mock::OutputLayer>();
+};
+
+struct DisplayTestCommon : public testing::Test {
+    // Uses the full implementation of a display
+    class FullImplDisplay : public impl::Display {
     public:
-        explicit Display(const compositionengine::DisplayCreationArgs& args)
-              : impl::Display(args) {}
-
         using impl::Display::injectOutputLayerForTest;
         virtual void injectOutputLayerForTest(std::unique_ptr<compositionengine::OutputLayer>) = 0;
+
+        using impl::Display::maybeAllocateDisplayIdForVirtualDisplay;
     };
 
+    // Uses a special implementation with key internal member functions set up
+    // as mock implementations, to allow for easier testing.
+    struct PartialMockDisplay : public impl::Display {
+        PartialMockDisplay(const compositionengine::CompositionEngine& compositionEngine)
+              : mCompositionEngine(compositionEngine) {}
+
+        // compositionengine::Output overrides
+        const OutputCompositionState& getState() const override { return mState; }
+        OutputCompositionState& editState() override { return mState; }
+
+        // compositionengine::impl::Output overrides
+        const CompositionEngine& getCompositionEngine() const override {
+            return mCompositionEngine;
+        };
+
+        // Mock implementation overrides
+        MOCK_CONST_METHOD0(getOutputLayerCount, size_t());
+        MOCK_CONST_METHOD1(getOutputLayerOrderedByZByIndex,
+                           compositionengine::OutputLayer*(size_t));
+        MOCK_METHOD2(ensureOutputLayer,
+                     compositionengine::OutputLayer*(std::optional<size_t>, const sp<LayerFE>&));
+        MOCK_METHOD0(finalizePendingOutputLayers, void());
+        MOCK_METHOD0(clearOutputLayers, void());
+        MOCK_CONST_METHOD1(dumpState, void(std::string&));
+        MOCK_METHOD1(injectOutputLayerForTest, compositionengine::OutputLayer*(const sp<LayerFE>&));
+        MOCK_METHOD1(injectOutputLayerForTest, void(std::unique_ptr<OutputLayer>));
+        MOCK_CONST_METHOD0(anyLayersRequireClientComposition, bool());
+        MOCK_CONST_METHOD0(allLayersRequireClientComposition, bool());
+        MOCK_METHOD1(applyChangedTypesToLayers, void(const impl::Display::ChangedTypes&));
+        MOCK_METHOD1(applyDisplayRequests, void(const impl::Display::DisplayRequests&));
+        MOCK_METHOD1(applyLayerRequestsToLayers, void(const impl::Display::LayerRequests&));
+
+        const compositionengine::CompositionEngine& mCompositionEngine;
+        impl::OutputCompositionState mState;
+    };
+
+    static std::string getDisplayNameFromCurrentTest() {
+        const ::testing::TestInfo* const test_info =
+                ::testing::UnitTest::GetInstance()->current_test_info();
+        return std::string("display for ") + test_info->test_case_name() + "." + test_info->name();
+    }
+
+    template <typename Display>
     static std::shared_ptr<Display> createDisplay(
             const compositionengine::CompositionEngine& compositionEngine,
-            compositionengine::DisplayCreationArgs&& args) {
+            compositionengine::DisplayCreationArgs args) {
+        args.name = getDisplayNameFromCurrentTest();
         return impl::createDisplayTemplated<Display>(compositionEngine, args);
     }
 
-    DisplayTest() {
-        EXPECT_CALL(mCompositionEngine, getHwComposer()).WillRepeatedly(ReturnRef(mHwComposer));
-        EXPECT_CALL(*mLayer1, getHwcLayer()).WillRepeatedly(Return(&mHWC2Layer1));
-        EXPECT_CALL(*mLayer2, getHwcLayer()).WillRepeatedly(Return(&mHWC2Layer2));
-        EXPECT_CALL(*mLayer3, getHwcLayer()).WillRepeatedly(Return(nullptr));
+    template <typename Display>
+    static std::shared_ptr<StrictMock<Display>> createPartialMockDisplay(
+            const compositionengine::CompositionEngine& compositionEngine,
+            compositionengine::DisplayCreationArgs args) {
+        args.name = getDisplayNameFromCurrentTest();
+        auto display = std::make_shared<StrictMock<Display>>(compositionEngine);
 
-        mDisplay->injectOutputLayerForTest(
-                std::unique_ptr<compositionengine::OutputLayer>(mLayer1));
-        mDisplay->injectOutputLayerForTest(
-                std::unique_ptr<compositionengine::OutputLayer>(mLayer2));
-        mDisplay->injectOutputLayerForTest(
-                std::unique_ptr<compositionengine::OutputLayer>(mLayer3));
+        display->setConfiguration(args);
+
+        return display;
+    }
+
+    DisplayTestCommon() {
+        EXPECT_CALL(mCompositionEngine, getHwComposer()).WillRepeatedly(ReturnRef(mHwComposer));
+    }
+
+    DisplayCreationArgs getDisplayCreationArgsForPhysicalHWCDisplay() {
+        return DisplayCreationArgsBuilder()
+                .setPhysical({DEFAULT_DISPLAY_ID, DisplayConnectionType::Internal})
+                .setPixels({DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT})
+                .setPixelFormat(static_cast<ui::PixelFormat>(PIXEL_FORMAT_RGBA_8888))
+                .setIsSecure(true)
+                .setLayerStackId(DEFAULT_LAYER_STACK)
+                .setPowerAdvisor(&mPowerAdvisor)
+                .build();
+    }
+
+    DisplayCreationArgs getDisplayCreationArgsForNonHWCVirtualDisplay() {
+        return DisplayCreationArgsBuilder()
+                .setUseHwcVirtualDisplays(false)
+                .setPixels({DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT})
+                .setPixelFormat(static_cast<ui::PixelFormat>(PIXEL_FORMAT_RGBA_8888))
+                .setIsSecure(false)
+                .setLayerStackId(DEFAULT_LAYER_STACK)
+                .setPowerAdvisor(&mPowerAdvisor)
+                .build();
     }
 
     StrictMock<android::mock::HWComposer> mHwComposer;
     StrictMock<Hwc2::mock::PowerAdvisor> mPowerAdvisor;
     StrictMock<mock::CompositionEngine> mCompositionEngine;
     sp<mock::NativeWindow> mNativeWindow = new StrictMock<mock::NativeWindow>();
-    StrictMock<HWC2::mock::Layer> mHWC2Layer1;
-    StrictMock<HWC2::mock::Layer> mHWC2Layer2;
-    StrictMock<HWC2::mock::Layer> mHWC2LayerUnknown;
-    mock::OutputLayer* mLayer1 = new StrictMock<mock::OutputLayer>();
-    mock::OutputLayer* mLayer2 = new StrictMock<mock::OutputLayer>();
-    mock::OutputLayer* mLayer3 = new StrictMock<mock::OutputLayer>();
-    std::shared_ptr<Display> mDisplay = createDisplay(mCompositionEngine,
-                                                      DisplayCreationArgsBuilder()
-                                                              .setDisplayId(DEFAULT_DISPLAY_ID)
-                                                              .setPowerAdvisor(&mPowerAdvisor)
-                                                              .build());
+};
+
+struct PartialMockDisplayTestCommon : public DisplayTestCommon {
+    using Display = DisplayTestCommon::PartialMockDisplay;
+    std::shared_ptr<Display> mDisplay =
+            createPartialMockDisplay<Display>(mCompositionEngine,
+                                              getDisplayCreationArgsForPhysicalHWCDisplay());
+};
+
+struct FullDisplayImplTestCommon : public DisplayTestCommon {
+    using Display = DisplayTestCommon::FullImplDisplay;
+    std::shared_ptr<Display> mDisplay =
+            createDisplay<Display>(mCompositionEngine,
+                                   getDisplayCreationArgsForPhysicalHWCDisplay());
+};
+
+struct DisplayWithLayersTestCommon : public FullDisplayImplTestCommon {
+    DisplayWithLayersTestCommon() {
+        mDisplay->injectOutputLayerForTest(
+                std::unique_ptr<compositionengine::OutputLayer>(mLayer1.outputLayer));
+        mDisplay->injectOutputLayerForTest(
+                std::unique_ptr<compositionengine::OutputLayer>(mLayer2.outputLayer));
+        mDisplay->injectOutputLayerForTest(
+                std::unique_ptr<compositionengine::OutputLayer>(mLayer3.outputLayer));
+    }
+
+    Layer mLayer1;
+    Layer mLayer2;
+    LayerNoHWC2Layer mLayer3;
+    StrictMock<HWC2::mock::Layer> hwc2LayerUnknown;
+    std::shared_ptr<Display> mDisplay =
+            createDisplay<Display>(mCompositionEngine,
+                                   getDisplayCreationArgsForPhysicalHWCDisplay());
 };
 
 /*
  * Basic construction
  */
 
-TEST_F(DisplayTest, canInstantiateDisplay) {
-    {
-        constexpr DisplayId display1 = DisplayId{123u};
-        auto display =
-                impl::createDisplay(mCompositionEngine,
-                                    DisplayCreationArgsBuilder().setDisplayId(display1).build());
-        EXPECT_FALSE(display->isSecure());
-        EXPECT_FALSE(display->isVirtual());
-        EXPECT_EQ(display1, display->getId());
-    }
+struct DisplayCreationTest : public DisplayTestCommon {
+    using Display = DisplayTestCommon::FullImplDisplay;
+};
 
-    {
-        constexpr DisplayId display2 = DisplayId{546u};
-        auto display =
-                impl::createDisplay(mCompositionEngine,
-                                    DisplayCreationArgsBuilder().setDisplayId(display2).build());
-        EXPECT_FALSE(display->isSecure());
-        EXPECT_FALSE(display->isVirtual());
-        EXPECT_EQ(display2, display->getId());
-    }
+TEST_F(DisplayCreationTest, createPhysicalInternalDisplay) {
+    auto display =
+            impl::createDisplay(mCompositionEngine, getDisplayCreationArgsForPhysicalHWCDisplay());
+    EXPECT_TRUE(display->isSecure());
+    EXPECT_FALSE(display->isVirtual());
+    EXPECT_EQ(DEFAULT_DISPLAY_ID, display->getId());
+}
 
-    {
-        constexpr DisplayId display3 = DisplayId{789u};
-        auto display = impl::createDisplay(mCompositionEngine,
-                                           DisplayCreationArgsBuilder()
-                                                   .setIsVirtual(true)
-                                                   .setDisplayId(display3)
-                                                   .build());
-        EXPECT_FALSE(display->isSecure());
-        EXPECT_TRUE(display->isVirtual());
-        EXPECT_EQ(display3, display->getId());
-    }
+TEST_F(DisplayCreationTest, createNonHwcVirtualDisplay) {
+    auto display = impl::createDisplay(mCompositionEngine,
+                                       getDisplayCreationArgsForNonHWCVirtualDisplay());
+    EXPECT_FALSE(display->isSecure());
+    EXPECT_TRUE(display->isVirtual());
+    EXPECT_EQ(std::nullopt, display->getId());
+}
+
+/*
+ * Display::setConfiguration()
+ */
+
+using DisplaySetConfigurationTest = PartialMockDisplayTestCommon;
+
+TEST_F(DisplaySetConfigurationTest, configuresInternalSecurePhysicalDisplay) {
+    mDisplay->setConfiguration(
+            DisplayCreationArgsBuilder()
+                    .setUseHwcVirtualDisplays(true)
+                    .setPhysical({DEFAULT_DISPLAY_ID, DisplayConnectionType::Internal})
+                    .setPixels(ui::Size(DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_WIDTH))
+                    .setPixelFormat(static_cast<ui::PixelFormat>(PIXEL_FORMAT_RGBA_8888))
+                    .setIsSecure(true)
+                    .setLayerStackId(DEFAULT_LAYER_STACK)
+                    .setPowerAdvisor(&mPowerAdvisor)
+                    .setName(getDisplayNameFromCurrentTest())
+                    .build());
+
+    EXPECT_EQ(DEFAULT_DISPLAY_ID, mDisplay->getId());
+    EXPECT_TRUE(mDisplay->isSecure());
+    EXPECT_FALSE(mDisplay->isVirtual());
+    EXPECT_EQ(DEFAULT_LAYER_STACK, mDisplay->getState().layerStackId);
+    EXPECT_TRUE(mDisplay->getState().layerStackInternal);
+    EXPECT_FALSE(mDisplay->isValid());
+}
+
+TEST_F(DisplaySetConfigurationTest, configuresExternalInsecurePhysicalDisplay) {
+    mDisplay->setConfiguration(
+            DisplayCreationArgsBuilder()
+                    .setUseHwcVirtualDisplays(true)
+                    .setPhysical({DEFAULT_DISPLAY_ID, DisplayConnectionType::External})
+                    .setPixels(ui::Size(DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_WIDTH))
+                    .setPixelFormat(static_cast<ui::PixelFormat>(PIXEL_FORMAT_RGBA_8888))
+                    .setIsSecure(false)
+                    .setLayerStackId(DEFAULT_LAYER_STACK)
+                    .setPowerAdvisor(&mPowerAdvisor)
+                    .setName(getDisplayNameFromCurrentTest())
+                    .build());
+
+    EXPECT_EQ(DEFAULT_DISPLAY_ID, mDisplay->getId());
+    EXPECT_FALSE(mDisplay->isSecure());
+    EXPECT_FALSE(mDisplay->isVirtual());
+    EXPECT_EQ(DEFAULT_LAYER_STACK, mDisplay->getState().layerStackId);
+    EXPECT_FALSE(mDisplay->getState().layerStackInternal);
+    EXPECT_FALSE(mDisplay->isValid());
+}
+
+TEST_F(DisplaySetConfigurationTest, configuresHwcBackedVirtualDisplay) {
+    EXPECT_CALL(mHwComposer,
+                allocateVirtualDisplay(DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_WIDTH,
+                                       Pointee(Eq(static_cast<ui::PixelFormat>(
+                                               PIXEL_FORMAT_RGBA_8888)))))
+            .WillOnce(Return(VIRTUAL_DISPLAY_ID));
+
+    mDisplay->setConfiguration(
+            DisplayCreationArgsBuilder()
+                    .setUseHwcVirtualDisplays(true)
+                    .setPixels(ui::Size(DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_WIDTH))
+                    .setPixelFormat(static_cast<ui::PixelFormat>(PIXEL_FORMAT_RGBA_8888))
+                    .setIsSecure(false)
+                    .setLayerStackId(DEFAULT_LAYER_STACK)
+                    .setPowerAdvisor(&mPowerAdvisor)
+                    .setName(getDisplayNameFromCurrentTest())
+                    .build());
+
+    EXPECT_EQ(VIRTUAL_DISPLAY_ID, mDisplay->getId());
+    EXPECT_FALSE(mDisplay->isSecure());
+    EXPECT_TRUE(mDisplay->isVirtual());
+    EXPECT_EQ(DEFAULT_LAYER_STACK, mDisplay->getState().layerStackId);
+    EXPECT_FALSE(mDisplay->getState().layerStackInternal);
+    EXPECT_FALSE(mDisplay->isValid());
+}
+
+TEST_F(DisplaySetConfigurationTest, configuresNonHwcBackedVirtualDisplayIfHwcAllocationFails) {
+    EXPECT_CALL(mHwComposer,
+                allocateVirtualDisplay(DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_WIDTH,
+                                       Pointee(Eq(static_cast<ui::PixelFormat>(
+                                               PIXEL_FORMAT_RGBA_8888)))))
+            .WillOnce(Return(std::nullopt));
+
+    mDisplay->setConfiguration(
+            DisplayCreationArgsBuilder()
+                    .setUseHwcVirtualDisplays(true)
+                    .setPixels(ui::Size(DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_WIDTH))
+                    .setPixelFormat(static_cast<ui::PixelFormat>(PIXEL_FORMAT_RGBA_8888))
+                    .setIsSecure(false)
+                    .setLayerStackId(DEFAULT_LAYER_STACK)
+                    .setPowerAdvisor(&mPowerAdvisor)
+                    .setName(getDisplayNameFromCurrentTest())
+                    .build());
+
+    EXPECT_EQ(std::nullopt, mDisplay->getId());
+    EXPECT_FALSE(mDisplay->isSecure());
+    EXPECT_TRUE(mDisplay->isVirtual());
+    EXPECT_EQ(DEFAULT_LAYER_STACK, mDisplay->getState().layerStackId);
+    EXPECT_FALSE(mDisplay->getState().layerStackInternal);
+    EXPECT_FALSE(mDisplay->isValid());
+}
+
+TEST_F(DisplaySetConfigurationTest, configuresNonHwcBackedVirtualDisplayIfShouldNotUseHwc) {
+    mDisplay->setConfiguration(
+            DisplayCreationArgsBuilder()
+                    .setUseHwcVirtualDisplays(false)
+                    .setPixels(ui::Size(DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_WIDTH))
+                    .setPixelFormat(static_cast<ui::PixelFormat>(PIXEL_FORMAT_RGBA_8888))
+                    .setIsSecure(false)
+                    .setLayerStackId(DEFAULT_LAYER_STACK)
+                    .setPowerAdvisor(&mPowerAdvisor)
+                    .setName(getDisplayNameFromCurrentTest())
+                    .build());
+
+    EXPECT_EQ(std::nullopt, mDisplay->getId());
+    EXPECT_FALSE(mDisplay->isSecure());
+    EXPECT_TRUE(mDisplay->isVirtual());
+    EXPECT_EQ(DEFAULT_LAYER_STACK, mDisplay->getState().layerStackId);
+    EXPECT_FALSE(mDisplay->getState().layerStackInternal);
+    EXPECT_FALSE(mDisplay->isValid());
 }
 
 /*
  * Display::disconnect()
  */
 
-TEST_F(DisplayTest, disconnectDisconnectsDisplay) {
+using DisplayDisconnectTest = PartialMockDisplayTestCommon;
+
+TEST_F(DisplayDisconnectTest, disconnectsDisplay) {
     // The first call to disconnect will disconnect the display with the HWC and
     // set mHwcId to -1.
     EXPECT_CALL(mHwComposer, disconnectDisplay(DEFAULT_DISPLAY_ID)).Times(1);
@@ -159,7 +384,9 @@ TEST_F(DisplayTest, disconnectDisconnectsDisplay) {
  * Display::setColorTransform()
  */
 
-TEST_F(DisplayTest, setColorTransformSetsTransform) {
+using DisplaySetColorTransformTest = PartialMockDisplayTestCommon;
+
+TEST_F(DisplaySetColorTransformTest, setsTransform) {
     // No change does nothing
     CompositionRefreshArgs refreshArgs;
     refreshArgs.colorTransformMatrix = std::nullopt;
@@ -186,7 +413,9 @@ TEST_F(DisplayTest, setColorTransformSetsTransform) {
  * Display::setColorMode()
  */
 
-TEST_F(DisplayTest, setColorModeSetsModeUnlessNoChange) {
+using DisplaySetColorModeTest = PartialMockDisplayTestCommon;
+
+TEST_F(DisplaySetColorModeTest, setsModeUnlessNoChange) {
     using ColorProfile = Output::ColorProfile;
 
     mock::RenderSurface* renderSurface = new StrictMock<mock::RenderSurface>();
@@ -229,11 +458,11 @@ TEST_F(DisplayTest, setColorModeSetsModeUnlessNoChange) {
     EXPECT_EQ(ui::Dataspace::UNKNOWN, mDisplay->getState().targetDataspace);
 }
 
-TEST_F(DisplayTest, setColorModeDoesNothingForVirtualDisplay) {
+TEST_F(DisplaySetColorModeTest, doesNothingForVirtualDisplay) {
     using ColorProfile = Output::ColorProfile;
 
-    std::shared_ptr<impl::Display> virtualDisplay{
-            impl::createDisplay(mCompositionEngine, DisplayCreationArgs{true, DEFAULT_DISPLAY_ID})};
+    auto args = getDisplayCreationArgsForNonHWCVirtualDisplay();
+    std::shared_ptr<impl::Display> virtualDisplay = impl::createDisplay(mCompositionEngine, args);
 
     mock::DisplayColorProfile* colorProfile = new StrictMock<mock::DisplayColorProfile>();
     virtualDisplay->setDisplayColorProfileForTest(
@@ -258,7 +487,9 @@ TEST_F(DisplayTest, setColorModeDoesNothingForVirtualDisplay) {
  * Display::createDisplayColorProfile()
  */
 
-TEST_F(DisplayTest, createDisplayColorProfileSetsDisplayColorProfile) {
+using DisplayCreateColorProfileTest = PartialMockDisplayTestCommon;
+
+TEST_F(DisplayCreateColorProfileTest, setsDisplayColorProfile) {
     EXPECT_TRUE(mDisplay->getDisplayColorProfile() == nullptr);
     mDisplay->createDisplayColorProfile(
             DisplayColorProfileCreationArgs{false, HdrCapabilities(), 0,
@@ -270,7 +501,9 @@ TEST_F(DisplayTest, createDisplayColorProfileSetsDisplayColorProfile) {
  * Display::createRenderSurface()
  */
 
-TEST_F(DisplayTest, createRenderSurfaceSetsRenderSurface) {
+using DisplayCreateRenderSurfaceTest = PartialMockDisplayTestCommon;
+
+TEST_F(DisplayCreateRenderSurfaceTest, setsRenderSurface) {
     EXPECT_CALL(*mNativeWindow, disconnect(NATIVE_WINDOW_API_EGL)).WillRepeatedly(Return(NO_ERROR));
     EXPECT_TRUE(mDisplay->getRenderSurface() == nullptr);
     mDisplay->createRenderSurface(RenderSurfaceCreationArgs{640, 480, mNativeWindow, nullptr});
@@ -281,14 +514,15 @@ TEST_F(DisplayTest, createRenderSurfaceSetsRenderSurface) {
  * Display::createOutputLayer()
  */
 
-TEST_F(DisplayTest, createOutputLayerSetsHwcLayer) {
+using DisplayCreateOutputLayerTest = FullDisplayImplTestCommon;
+
+TEST_F(DisplayCreateOutputLayerTest, setsHwcLayer) {
     sp<mock::LayerFE> layerFE = new StrictMock<mock::LayerFE>();
-    auto layer = std::make_shared<StrictMock<mock::Layer>>();
     StrictMock<HWC2::mock::Layer> hwcLayer;
 
     EXPECT_CALL(mHwComposer, createLayer(DEFAULT_DISPLAY_ID)).WillOnce(Return(&hwcLayer));
 
-    auto outputLayer = mDisplay->createOutputLayer(layer, layerFE);
+    auto outputLayer = mDisplay->createOutputLayer(layerFE);
 
     EXPECT_EQ(&hwcLayer, outputLayer->getHwcLayer());
 
@@ -300,12 +534,13 @@ TEST_F(DisplayTest, createOutputLayerSetsHwcLayer) {
  * Display::setReleasedLayers()
  */
 
-TEST_F(DisplayTest, setReleasedLayersDoesNothingIfNotHwcDisplay) {
-    std::shared_ptr<impl::Display> nonHwcDisplay{
-            impl::createDisplay(mCompositionEngine, DisplayCreationArgsBuilder().build())};
+using DisplaySetReleasedLayersTest = DisplayWithLayersTestCommon;
+
+TEST_F(DisplaySetReleasedLayersTest, doesNothingIfNotHwcDisplay) {
+    auto args = getDisplayCreationArgsForNonHWCVirtualDisplay();
+    std::shared_ptr<impl::Display> nonHwcDisplay = impl::createDisplay(mCompositionEngine, args);
 
     sp<mock::LayerFE> layerXLayerFE = new StrictMock<mock::LayerFE>();
-    mock::Layer layerXLayer;
 
     {
         Output::ReleasedLayers releasedLayers;
@@ -314,7 +549,7 @@ TEST_F(DisplayTest, setReleasedLayersDoesNothingIfNotHwcDisplay) {
     }
 
     CompositionRefreshArgs refreshArgs;
-    refreshArgs.layersWithQueuedFrames.push_back(&layerXLayer);
+    refreshArgs.layersWithQueuedFrames.push_back(layerXLayerFE);
 
     nonHwcDisplay->setReleasedLayers(refreshArgs);
 
@@ -322,7 +557,7 @@ TEST_F(DisplayTest, setReleasedLayersDoesNothingIfNotHwcDisplay) {
     ASSERT_EQ(1, releasedLayers.size());
 }
 
-TEST_F(DisplayTest, setReleasedLayersDoesNothingIfNoLayersWithQueuedFrames) {
+TEST_F(DisplaySetReleasedLayersTest, doesNothingIfNoLayersWithQueuedFrames) {
     sp<mock::LayerFE> layerXLayerFE = new StrictMock<mock::LayerFE>();
 
     {
@@ -338,98 +573,32 @@ TEST_F(DisplayTest, setReleasedLayersDoesNothingIfNoLayersWithQueuedFrames) {
     ASSERT_EQ(1, releasedLayers.size());
 }
 
-TEST_F(DisplayTest, setReleasedLayers) {
-    sp<mock::LayerFE> layer1LayerFE = new StrictMock<mock::LayerFE>();
-    sp<mock::LayerFE> layer2LayerFE = new StrictMock<mock::LayerFE>();
-    sp<mock::LayerFE> layer3LayerFE = new StrictMock<mock::LayerFE>();
-    sp<mock::LayerFE> layerXLayerFE = new StrictMock<mock::LayerFE>();
-    mock::Layer layer1Layer;
-    mock::Layer layer2Layer;
-    mock::Layer layer3Layer;
-    mock::Layer layerXLayer;
-
-    EXPECT_CALL(*mLayer1, getLayer()).WillRepeatedly(ReturnRef(layer1Layer));
-    EXPECT_CALL(*mLayer1, getLayerFE()).WillRepeatedly(ReturnRef(*layer1LayerFE.get()));
-    EXPECT_CALL(*mLayer2, getLayer()).WillRepeatedly(ReturnRef(layer2Layer));
-    EXPECT_CALL(*mLayer2, getLayerFE()).WillRepeatedly(ReturnRef(*layer2LayerFE.get()));
-    EXPECT_CALL(*mLayer3, getLayer()).WillRepeatedly(ReturnRef(layer3Layer));
-    EXPECT_CALL(*mLayer3, getLayerFE()).WillRepeatedly(ReturnRef(*layer3LayerFE.get()));
+TEST_F(DisplaySetReleasedLayersTest, setReleasedLayers) {
+    sp<mock::LayerFE> unknownLayer = new StrictMock<mock::LayerFE>();
 
     CompositionRefreshArgs refreshArgs;
-    refreshArgs.layersWithQueuedFrames.push_back(&layer1Layer);
-    refreshArgs.layersWithQueuedFrames.push_back(&layer2Layer);
-    refreshArgs.layersWithQueuedFrames.push_back(&layerXLayer);
-    refreshArgs.layersWithQueuedFrames.push_back(nullptr);
+    refreshArgs.layersWithQueuedFrames.push_back(mLayer1.layerFE);
+    refreshArgs.layersWithQueuedFrames.push_back(mLayer2.layerFE);
+    refreshArgs.layersWithQueuedFrames.push_back(unknownLayer);
 
     mDisplay->setReleasedLayers(refreshArgs);
 
     const auto& releasedLayers = mDisplay->getReleasedLayersForTest();
     ASSERT_EQ(2, releasedLayers.size());
-    ASSERT_EQ(layer1LayerFE.get(), releasedLayers[0].promote().get());
-    ASSERT_EQ(layer2LayerFE.get(), releasedLayers[1].promote().get());
+    ASSERT_EQ(mLayer1.layerFE.get(), releasedLayers[0].promote().get());
+    ASSERT_EQ(mLayer2.layerFE.get(), releasedLayers[1].promote().get());
 }
 
 /*
  * Display::chooseCompositionStrategy()
  */
 
-struct DisplayChooseCompositionStrategyTest : public testing::Test {
-    struct DisplayPartialMock : public impl::Display {
-        DisplayPartialMock(const compositionengine::CompositionEngine& compositionEngine,
-                           const compositionengine::DisplayCreationArgs& args)
-              : impl::Display(args), mCompositionEngine(compositionEngine) {}
-
-        // Sets up the helper functions called by chooseCompositionStrategy to
-        // use a mock implementations.
-        MOCK_CONST_METHOD0(anyLayersRequireClientComposition, bool());
-        MOCK_CONST_METHOD0(allLayersRequireClientComposition, bool());
-        MOCK_METHOD1(applyChangedTypesToLayers, void(const impl::Display::ChangedTypes&));
-        MOCK_METHOD1(applyDisplayRequests, void(const impl::Display::DisplayRequests&));
-        MOCK_METHOD1(applyLayerRequestsToLayers, void(const impl::Display::LayerRequests&));
-
-        // compositionengine::Output overrides
-        const OutputCompositionState& getState() const override { return mState; }
-        OutputCompositionState& editState() override { return mState; }
-
-        // compositionengine::impl::Output overrides
-        const CompositionEngine& getCompositionEngine() const override {
-            return mCompositionEngine;
-        };
-
-        // These need implementations though are not expected to be called.
-        MOCK_CONST_METHOD0(getOutputLayerCount, size_t());
-        MOCK_CONST_METHOD1(getOutputLayerOrderedByZByIndex,
-                           compositionengine::OutputLayer*(size_t));
-        MOCK_METHOD3(ensureOutputLayer,
-                     compositionengine::OutputLayer*(
-                             std::optional<size_t>,
-                             const std::shared_ptr<compositionengine::Layer>&, const sp<LayerFE>&));
-        MOCK_METHOD0(finalizePendingOutputLayers, void());
-        MOCK_METHOD0(clearOutputLayers, void());
-        MOCK_CONST_METHOD1(dumpState, void(std::string&));
-        MOCK_METHOD2(injectOutputLayerForTest,
-                     compositionengine::OutputLayer*(
-                             const std::shared_ptr<compositionengine::Layer>&, const sp<LayerFE>&));
-        MOCK_METHOD1(injectOutputLayerForTest, void(std::unique_ptr<OutputLayer>));
-
-        const compositionengine::CompositionEngine& mCompositionEngine;
-        impl::OutputCompositionState mState;
-    };
-
-    DisplayChooseCompositionStrategyTest() {
-        EXPECT_CALL(mCompositionEngine, getHwComposer()).WillRepeatedly(ReturnRef(mHwComposer));
-    }
-
-    StrictMock<android::mock::HWComposer> mHwComposer;
-    StrictMock<mock::CompositionEngine> mCompositionEngine;
-    StrictMock<DisplayPartialMock>
-            mDisplay{mCompositionEngine,
-                     DisplayCreationArgsBuilder().setDisplayId(DEFAULT_DISPLAY_ID).build()};
-};
+using DisplayChooseCompositionStrategyTest = PartialMockDisplayTestCommon;
 
 TEST_F(DisplayChooseCompositionStrategyTest, takesEarlyOutIfNotAHwcDisplay) {
-    std::shared_ptr<impl::Display> nonHwcDisplay{
-            impl::createDisplay(mCompositionEngine, DisplayCreationArgsBuilder().build())};
+    auto args = getDisplayCreationArgsForNonHWCVirtualDisplay();
+    std::shared_ptr<Display> nonHwcDisplay =
+            createPartialMockDisplay<Display>(mCompositionEngine, args);
     EXPECT_FALSE(nonHwcDisplay->getId());
 
     nonHwcDisplay->chooseCompositionStrategy();
@@ -440,33 +609,36 @@ TEST_F(DisplayChooseCompositionStrategyTest, takesEarlyOutIfNotAHwcDisplay) {
 }
 
 TEST_F(DisplayChooseCompositionStrategyTest, takesEarlyOutOnHwcError) {
-    EXPECT_CALL(mDisplay, anyLayersRequireClientComposition()).WillOnce(Return(false));
+    EXPECT_CALL(*mDisplay, anyLayersRequireClientComposition()).WillOnce(Return(false));
     EXPECT_CALL(mHwComposer, getDeviceCompositionChanges(DEFAULT_DISPLAY_ID, false, _))
             .WillOnce(Return(INVALID_OPERATION));
 
-    mDisplay.chooseCompositionStrategy();
+    mDisplay->chooseCompositionStrategy();
 
-    auto& state = mDisplay.getState();
+    auto& state = mDisplay->getState();
     EXPECT_TRUE(state.usesClientComposition);
     EXPECT_FALSE(state.usesDeviceComposition);
 }
 
 TEST_F(DisplayChooseCompositionStrategyTest, normalOperation) {
-    // Since two calls are made to anyLayersRequireClientComposition with different return values,
-    // use a Sequence to control the matching so the values are returned in a known order.
+    // Since two calls are made to anyLayersRequireClientComposition with different return
+    // values, use a Sequence to control the matching so the values are returned in a known
+    // order.
     Sequence s;
-    EXPECT_CALL(mDisplay, anyLayersRequireClientComposition()).InSequence(s).WillOnce(Return(true));
-    EXPECT_CALL(mDisplay, anyLayersRequireClientComposition())
+    EXPECT_CALL(*mDisplay, anyLayersRequireClientComposition())
+            .InSequence(s)
+            .WillOnce(Return(true));
+    EXPECT_CALL(*mDisplay, anyLayersRequireClientComposition())
             .InSequence(s)
             .WillOnce(Return(false));
 
     EXPECT_CALL(mHwComposer, getDeviceCompositionChanges(DEFAULT_DISPLAY_ID, true, _))
             .WillOnce(Return(NO_ERROR));
-    EXPECT_CALL(mDisplay, allLayersRequireClientComposition()).WillOnce(Return(false));
+    EXPECT_CALL(*mDisplay, allLayersRequireClientComposition()).WillOnce(Return(false));
 
-    mDisplay.chooseCompositionStrategy();
+    mDisplay->chooseCompositionStrategy();
 
-    auto& state = mDisplay.getState();
+    auto& state = mDisplay->getState();
     EXPECT_FALSE(state.usesClientComposition);
     EXPECT_TRUE(state.usesDeviceComposition);
 }
@@ -478,24 +650,27 @@ TEST_F(DisplayChooseCompositionStrategyTest, normalOperationWithChanges) {
             {{nullptr, HWC2::LayerRequest::ClearClientTarget}},
     };
 
-    // Since two calls are made to anyLayersRequireClientComposition with different return values,
-    // use a Sequence to control the matching so the values are returned in a known order.
+    // Since two calls are made to anyLayersRequireClientComposition with different return
+    // values, use a Sequence to control the matching so the values are returned in a known
+    // order.
     Sequence s;
-    EXPECT_CALL(mDisplay, anyLayersRequireClientComposition()).InSequence(s).WillOnce(Return(true));
-    EXPECT_CALL(mDisplay, anyLayersRequireClientComposition())
+    EXPECT_CALL(*mDisplay, anyLayersRequireClientComposition())
+            .InSequence(s)
+            .WillOnce(Return(true));
+    EXPECT_CALL(*mDisplay, anyLayersRequireClientComposition())
             .InSequence(s)
             .WillOnce(Return(false));
 
     EXPECT_CALL(mHwComposer, getDeviceCompositionChanges(DEFAULT_DISPLAY_ID, true, _))
             .WillOnce(DoAll(SetArgPointee<2>(changes), Return(NO_ERROR)));
-    EXPECT_CALL(mDisplay, applyChangedTypesToLayers(changes.changedTypes)).Times(1);
-    EXPECT_CALL(mDisplay, applyDisplayRequests(changes.displayRequests)).Times(1);
-    EXPECT_CALL(mDisplay, applyLayerRequestsToLayers(changes.layerRequests)).Times(1);
-    EXPECT_CALL(mDisplay, allLayersRequireClientComposition()).WillOnce(Return(false));
+    EXPECT_CALL(*mDisplay, applyChangedTypesToLayers(changes.changedTypes)).Times(1);
+    EXPECT_CALL(*mDisplay, applyDisplayRequests(changes.displayRequests)).Times(1);
+    EXPECT_CALL(*mDisplay, applyLayerRequestsToLayers(changes.layerRequests)).Times(1);
+    EXPECT_CALL(*mDisplay, allLayersRequireClientComposition()).WillOnce(Return(false));
 
-    mDisplay.chooseCompositionStrategy();
+    mDisplay->chooseCompositionStrategy();
 
-    auto& state = mDisplay.getState();
+    auto& state = mDisplay->getState();
     EXPECT_FALSE(state.usesClientComposition);
     EXPECT_TRUE(state.usesDeviceComposition);
 }
@@ -504,13 +679,15 @@ TEST_F(DisplayChooseCompositionStrategyTest, normalOperationWithChanges) {
  * Display::getSkipColorTransform()
  */
 
-TEST_F(DisplayTest, getSkipColorTransformDoesNothingIfNonHwcDisplay) {
-    auto nonHwcDisplay{
-            impl::createDisplay(mCompositionEngine, DisplayCreationArgsBuilder().build())};
+using DisplayGetSkipColorTransformTest = DisplayWithLayersTestCommon;
+
+TEST_F(DisplayGetSkipColorTransformTest, doesNothingIfNonHwcDisplay) {
+    auto args = getDisplayCreationArgsForNonHWCVirtualDisplay();
+    auto nonHwcDisplay{impl::createDisplay(mCompositionEngine, args)};
     EXPECT_FALSE(nonHwcDisplay->getSkipColorTransform());
 }
 
-TEST_F(DisplayTest, getSkipColorTransformChecksHwcCapability) {
+TEST_F(DisplayGetSkipColorTransformTest, checksHwcCapability) {
     EXPECT_CALL(mHwComposer,
                 hasDisplayCapability(std::make_optional(DEFAULT_DISPLAY_ID),
                                      HWC2::DisplayCapability::SkipClientColorTransform))
@@ -522,17 +699,19 @@ TEST_F(DisplayTest, getSkipColorTransformChecksHwcCapability) {
  * Display::anyLayersRequireClientComposition()
  */
 
-TEST_F(DisplayTest, anyLayersRequireClientCompositionReturnsFalse) {
-    EXPECT_CALL(*mLayer1, requiresClientComposition()).WillOnce(Return(false));
-    EXPECT_CALL(*mLayer2, requiresClientComposition()).WillOnce(Return(false));
-    EXPECT_CALL(*mLayer3, requiresClientComposition()).WillOnce(Return(false));
+using DisplayAnyLayersRequireClientCompositionTest = DisplayWithLayersTestCommon;
+
+TEST_F(DisplayAnyLayersRequireClientCompositionTest, returnsFalse) {
+    EXPECT_CALL(*mLayer1.outputLayer, requiresClientComposition()).WillOnce(Return(false));
+    EXPECT_CALL(*mLayer2.outputLayer, requiresClientComposition()).WillOnce(Return(false));
+    EXPECT_CALL(*mLayer3.outputLayer, requiresClientComposition()).WillOnce(Return(false));
 
     EXPECT_FALSE(mDisplay->anyLayersRequireClientComposition());
 }
 
-TEST_F(DisplayTest, anyLayersRequireClientCompositionReturnsTrue) {
-    EXPECT_CALL(*mLayer1, requiresClientComposition()).WillOnce(Return(false));
-    EXPECT_CALL(*mLayer2, requiresClientComposition()).WillOnce(Return(true));
+TEST_F(DisplayAnyLayersRequireClientCompositionTest, returnsTrue) {
+    EXPECT_CALL(*mLayer1.outputLayer, requiresClientComposition()).WillOnce(Return(false));
+    EXPECT_CALL(*mLayer2.outputLayer, requiresClientComposition()).WillOnce(Return(true));
 
     EXPECT_TRUE(mDisplay->anyLayersRequireClientComposition());
 }
@@ -541,17 +720,19 @@ TEST_F(DisplayTest, anyLayersRequireClientCompositionReturnsTrue) {
  * Display::allLayersRequireClientComposition()
  */
 
-TEST_F(DisplayTest, allLayersRequireClientCompositionReturnsTrue) {
-    EXPECT_CALL(*mLayer1, requiresClientComposition()).WillOnce(Return(true));
-    EXPECT_CALL(*mLayer2, requiresClientComposition()).WillOnce(Return(true));
-    EXPECT_CALL(*mLayer3, requiresClientComposition()).WillOnce(Return(true));
+using DisplayAllLayersRequireClientCompositionTest = DisplayWithLayersTestCommon;
+
+TEST_F(DisplayAllLayersRequireClientCompositionTest, returnsTrue) {
+    EXPECT_CALL(*mLayer1.outputLayer, requiresClientComposition()).WillOnce(Return(true));
+    EXPECT_CALL(*mLayer2.outputLayer, requiresClientComposition()).WillOnce(Return(true));
+    EXPECT_CALL(*mLayer3.outputLayer, requiresClientComposition()).WillOnce(Return(true));
 
     EXPECT_TRUE(mDisplay->allLayersRequireClientComposition());
 }
 
-TEST_F(DisplayTest, allLayersRequireClientCompositionReturnsFalse) {
-    EXPECT_CALL(*mLayer1, requiresClientComposition()).WillOnce(Return(true));
-    EXPECT_CALL(*mLayer2, requiresClientComposition()).WillOnce(Return(false));
+TEST_F(DisplayAllLayersRequireClientCompositionTest, returnsFalse) {
+    EXPECT_CALL(*mLayer1.outputLayer, requiresClientComposition()).WillOnce(Return(true));
+    EXPECT_CALL(*mLayer2.outputLayer, requiresClientComposition()).WillOnce(Return(false));
 
     EXPECT_FALSE(mDisplay->allLayersRequireClientComposition());
 }
@@ -560,22 +741,24 @@ TEST_F(DisplayTest, allLayersRequireClientCompositionReturnsFalse) {
  * Display::applyChangedTypesToLayers()
  */
 
-TEST_F(DisplayTest, applyChangedTypesToLayersTakesEarlyOutIfNoChangedLayers) {
+using DisplayApplyChangedTypesToLayersTest = DisplayWithLayersTestCommon;
+
+TEST_F(DisplayApplyChangedTypesToLayersTest, takesEarlyOutIfNoChangedLayers) {
     mDisplay->applyChangedTypesToLayers(impl::Display::ChangedTypes());
 }
 
-TEST_F(DisplayTest, applyChangedTypesToLayersAppliesChanges) {
-    EXPECT_CALL(*mLayer1,
+TEST_F(DisplayApplyChangedTypesToLayersTest, appliesChanges) {
+    EXPECT_CALL(*mLayer1.outputLayer,
                 applyDeviceCompositionTypeChange(Hwc2::IComposerClient::Composition::CLIENT))
             .Times(1);
-    EXPECT_CALL(*mLayer2,
+    EXPECT_CALL(*mLayer2.outputLayer,
                 applyDeviceCompositionTypeChange(Hwc2::IComposerClient::Composition::DEVICE))
             .Times(1);
 
     mDisplay->applyChangedTypesToLayers(impl::Display::ChangedTypes{
-            {&mHWC2Layer1, HWC2::Composition::Client},
-            {&mHWC2Layer2, HWC2::Composition::Device},
-            {&mHWC2LayerUnknown, HWC2::Composition::SolidColor},
+            {&mLayer1.hwc2Layer, HWC2::Composition::Client},
+            {&mLayer2.hwc2Layer, HWC2::Composition::Device},
+            {&hwc2LayerUnknown, HWC2::Composition::SolidColor},
     });
 }
 
@@ -583,28 +766,30 @@ TEST_F(DisplayTest, applyChangedTypesToLayersAppliesChanges) {
  * Display::applyDisplayRequests()
  */
 
-TEST_F(DisplayTest, applyDisplayRequestsToLayersHandlesNoRequests) {
+using DisplayApplyDisplayRequestsTest = DisplayWithLayersTestCommon;
+
+TEST_F(DisplayApplyDisplayRequestsTest, handlesNoRequests) {
     mDisplay->applyDisplayRequests(static_cast<HWC2::DisplayRequest>(0));
 
     auto& state = mDisplay->getState();
     EXPECT_FALSE(state.flipClientTarget);
 }
 
-TEST_F(DisplayTest, applyDisplayRequestsToLayersHandlesFlipClientTarget) {
+TEST_F(DisplayApplyDisplayRequestsTest, handlesFlipClientTarget) {
     mDisplay->applyDisplayRequests(HWC2::DisplayRequest::FlipClientTarget);
 
     auto& state = mDisplay->getState();
     EXPECT_TRUE(state.flipClientTarget);
 }
 
-TEST_F(DisplayTest, applyDisplayRequestsToLayersHandlesWriteClientTargetToOutput) {
+TEST_F(DisplayApplyDisplayRequestsTest, handlesWriteClientTargetToOutput) {
     mDisplay->applyDisplayRequests(HWC2::DisplayRequest::WriteClientTargetToOutput);
 
     auto& state = mDisplay->getState();
     EXPECT_FALSE(state.flipClientTarget);
 }
 
-TEST_F(DisplayTest, applyDisplayRequestsToLayersHandlesAllRequestFlagsSet) {
+TEST_F(DisplayApplyDisplayRequestsTest, handlesAllRequestFlagsSet) {
     mDisplay->applyDisplayRequests(static_cast<HWC2::DisplayRequest>(~0));
 
     auto& state = mDisplay->getState();
@@ -615,26 +800,28 @@ TEST_F(DisplayTest, applyDisplayRequestsToLayersHandlesAllRequestFlagsSet) {
  * Display::applyLayerRequestsToLayers()
  */
 
-TEST_F(DisplayTest, applyLayerRequestsToLayersPreparesAllLayers) {
-    EXPECT_CALL(*mLayer1, prepareForDeviceLayerRequests()).Times(1);
-    EXPECT_CALL(*mLayer2, prepareForDeviceLayerRequests()).Times(1);
-    EXPECT_CALL(*mLayer3, prepareForDeviceLayerRequests()).Times(1);
+using DisplayApplyLayerRequestsToLayersTest = DisplayWithLayersTestCommon;
+
+TEST_F(DisplayApplyLayerRequestsToLayersTest, preparesAllLayers) {
+    EXPECT_CALL(*mLayer1.outputLayer, prepareForDeviceLayerRequests()).Times(1);
+    EXPECT_CALL(*mLayer2.outputLayer, prepareForDeviceLayerRequests()).Times(1);
+    EXPECT_CALL(*mLayer3.outputLayer, prepareForDeviceLayerRequests()).Times(1);
 
     mDisplay->applyLayerRequestsToLayers(impl::Display::LayerRequests());
 }
 
-TEST_F(DisplayTest, applyLayerRequestsToLayers2) {
-    EXPECT_CALL(*mLayer1, prepareForDeviceLayerRequests()).Times(1);
-    EXPECT_CALL(*mLayer2, prepareForDeviceLayerRequests()).Times(1);
-    EXPECT_CALL(*mLayer3, prepareForDeviceLayerRequests()).Times(1);
+TEST_F(DisplayApplyLayerRequestsToLayersTest, appliesDeviceLayerRequests) {
+    EXPECT_CALL(*mLayer1.outputLayer, prepareForDeviceLayerRequests()).Times(1);
+    EXPECT_CALL(*mLayer2.outputLayer, prepareForDeviceLayerRequests()).Times(1);
+    EXPECT_CALL(*mLayer3.outputLayer, prepareForDeviceLayerRequests()).Times(1);
 
-    EXPECT_CALL(*mLayer1,
+    EXPECT_CALL(*mLayer1.outputLayer,
                 applyDeviceLayerRequest(Hwc2::IComposerClient::LayerRequest::CLEAR_CLIENT_TARGET))
             .Times(1);
 
     mDisplay->applyLayerRequestsToLayers(impl::Display::LayerRequests{
-            {&mHWC2Layer1, HWC2::LayerRequest::ClearClientTarget},
-            {&mHWC2LayerUnknown, HWC2::LayerRequest::ClearClientTarget},
+            {&mLayer1.hwc2Layer, HWC2::LayerRequest::ClearClientTarget},
+            {&hwc2LayerUnknown, HWC2::LayerRequest::ClearClientTarget},
     });
 }
 
@@ -642,9 +829,11 @@ TEST_F(DisplayTest, applyLayerRequestsToLayers2) {
  * Display::presentAndGetFrameFences()
  */
 
-TEST_F(DisplayTest, presentAndGetFrameFencesReturnsNoFencesOnNonHwcDisplay) {
-    auto nonHwcDisplay{
-            impl::createDisplay(mCompositionEngine, DisplayCreationArgsBuilder().build())};
+using DisplayPresentAndGetFrameFencesTest = DisplayWithLayersTestCommon;
+
+TEST_F(DisplayPresentAndGetFrameFencesTest, returnsNoFencesOnNonHwcDisplay) {
+    auto args = getDisplayCreationArgsForNonHWCVirtualDisplay();
+    auto nonHwcDisplay{impl::createDisplay(mCompositionEngine, args)};
 
     auto result = nonHwcDisplay->presentAndGetFrameFences();
 
@@ -653,16 +842,16 @@ TEST_F(DisplayTest, presentAndGetFrameFencesReturnsNoFencesOnNonHwcDisplay) {
     EXPECT_EQ(0u, result.layerFences.size());
 }
 
-TEST_F(DisplayTest, presentAndGetFrameFencesReturnsPresentAndLayerFences) {
+TEST_F(DisplayPresentAndGetFrameFencesTest, returnsPresentAndLayerFences) {
     sp<Fence> presentFence = new Fence();
     sp<Fence> layer1Fence = new Fence();
     sp<Fence> layer2Fence = new Fence();
 
     EXPECT_CALL(mHwComposer, presentAndGetReleaseFences(DEFAULT_DISPLAY_ID)).Times(1);
     EXPECT_CALL(mHwComposer, getPresentFence(DEFAULT_DISPLAY_ID)).WillOnce(Return(presentFence));
-    EXPECT_CALL(mHwComposer, getLayerReleaseFence(DEFAULT_DISPLAY_ID, &mHWC2Layer1))
+    EXPECT_CALL(mHwComposer, getLayerReleaseFence(DEFAULT_DISPLAY_ID, &mLayer1.hwc2Layer))
             .WillOnce(Return(layer1Fence));
-    EXPECT_CALL(mHwComposer, getLayerReleaseFence(DEFAULT_DISPLAY_ID, &mHWC2Layer2))
+    EXPECT_CALL(mHwComposer, getLayerReleaseFence(DEFAULT_DISPLAY_ID, &mLayer2.hwc2Layer))
             .WillOnce(Return(layer2Fence));
     EXPECT_CALL(mHwComposer, clearReleaseFences(DEFAULT_DISPLAY_ID)).Times(1);
 
@@ -671,17 +860,19 @@ TEST_F(DisplayTest, presentAndGetFrameFencesReturnsPresentAndLayerFences) {
     EXPECT_EQ(presentFence, result.presentFence);
 
     EXPECT_EQ(2u, result.layerFences.size());
-    ASSERT_EQ(1, result.layerFences.count(&mHWC2Layer1));
-    EXPECT_EQ(layer1Fence, result.layerFences[&mHWC2Layer1]);
-    ASSERT_EQ(1, result.layerFences.count(&mHWC2Layer2));
-    EXPECT_EQ(layer2Fence, result.layerFences[&mHWC2Layer2]);
+    ASSERT_EQ(1, result.layerFences.count(&mLayer1.hwc2Layer));
+    EXPECT_EQ(layer1Fence, result.layerFences[&mLayer1.hwc2Layer]);
+    ASSERT_EQ(1, result.layerFences.count(&mLayer2.hwc2Layer));
+    EXPECT_EQ(layer2Fence, result.layerFences[&mLayer2.hwc2Layer]);
 }
 
 /*
  * Display::setExpensiveRenderingExpected()
  */
 
-TEST_F(DisplayTest, setExpensiveRenderingExpectedForwardsToPowerAdvisor) {
+using DisplaySetExpensiveRenderingExpectedTest = DisplayWithLayersTestCommon;
+
+TEST_F(DisplaySetExpensiveRenderingExpectedTest, forwardsToPowerAdvisor) {
     EXPECT_CALL(mPowerAdvisor, setExpensiveRenderingExpected(DEFAULT_DISPLAY_ID, true)).Times(1);
     mDisplay->setExpensiveRenderingExpected(true);
 
@@ -693,12 +884,17 @@ TEST_F(DisplayTest, setExpensiveRenderingExpectedForwardsToPowerAdvisor) {
  * Display::finishFrame()
  */
 
-TEST_F(DisplayTest, finishFrameDoesNotSkipCompositionIfNotDirtyOnHwcDisplay) {
+using DisplayFinishFrameTest = DisplayWithLayersTestCommon;
+
+TEST_F(DisplayFinishFrameTest, doesNotSkipCompositionIfNotDirtyOnHwcDisplay) {
     mock::RenderSurface* renderSurface = new StrictMock<mock::RenderSurface>();
     mDisplay->setRenderSurfaceForTest(std::unique_ptr<RenderSurface>(renderSurface));
 
     // We expect no calls to queueBuffer if composition was skipped.
     EXPECT_CALL(*renderSurface, queueBuffer(_)).Times(1);
+
+    // Expect a call to signal no expensive rendering since there is no client composition.
+    EXPECT_CALL(mPowerAdvisor, setExpensiveRenderingExpected(DEFAULT_DISPLAY_ID, false));
 
     mDisplay->editState().isEnabled = true;
     mDisplay->editState().usesClientComposition = false;
@@ -711,9 +907,9 @@ TEST_F(DisplayTest, finishFrameDoesNotSkipCompositionIfNotDirtyOnHwcDisplay) {
     mDisplay->finishFrame(refreshArgs);
 }
 
-TEST_F(DisplayTest, finishFrameSkipsCompositionIfNotDirty) {
-    std::shared_ptr<impl::Display> nonHwcDisplay{
-            impl::createDisplay(mCompositionEngine, DisplayCreationArgsBuilder().build())};
+TEST_F(DisplayFinishFrameTest, skipsCompositionIfNotDirty) {
+    auto args = getDisplayCreationArgsForNonHWCVirtualDisplay();
+    std::shared_ptr<impl::Display> nonHwcDisplay = impl::createDisplay(mCompositionEngine, args);
 
     mock::RenderSurface* renderSurface = new StrictMock<mock::RenderSurface>();
     nonHwcDisplay->setRenderSurfaceForTest(std::unique_ptr<RenderSurface>(renderSurface));
@@ -732,9 +928,9 @@ TEST_F(DisplayTest, finishFrameSkipsCompositionIfNotDirty) {
     nonHwcDisplay->finishFrame(refreshArgs);
 }
 
-TEST_F(DisplayTest, finishFramePerformsCompositionIfDirty) {
-    std::shared_ptr<impl::Display> nonHwcDisplay{
-            impl::createDisplay(mCompositionEngine, DisplayCreationArgsBuilder().build())};
+TEST_F(DisplayFinishFrameTest, performsCompositionIfDirty) {
+    auto args = getDisplayCreationArgsForNonHWCVirtualDisplay();
+    std::shared_ptr<impl::Display> nonHwcDisplay = impl::createDisplay(mCompositionEngine, args);
 
     mock::RenderSurface* renderSurface = new StrictMock<mock::RenderSurface>();
     nonHwcDisplay->setRenderSurfaceForTest(std::unique_ptr<RenderSurface>(renderSurface));
@@ -753,9 +949,9 @@ TEST_F(DisplayTest, finishFramePerformsCompositionIfDirty) {
     nonHwcDisplay->finishFrame(refreshArgs);
 }
 
-TEST_F(DisplayTest, finishFramePerformsCompositionIfRepaintEverything) {
-    std::shared_ptr<impl::Display> nonHwcDisplay{
-            impl::createDisplay(mCompositionEngine, DisplayCreationArgsBuilder().build())};
+TEST_F(DisplayFinishFrameTest, performsCompositionIfRepaintEverything) {
+    auto args = getDisplayCreationArgsForNonHWCVirtualDisplay();
+    std::shared_ptr<impl::Display> nonHwcDisplay = impl::createDisplay(mCompositionEngine, args);
 
     mock::RenderSurface* renderSurface = new StrictMock<mock::RenderSurface>();
     nonHwcDisplay->setRenderSurfaceForTest(std::unique_ptr<RenderSurface>(renderSurface));
@@ -781,18 +977,9 @@ TEST_F(DisplayTest, finishFramePerformsCompositionIfRepaintEverything) {
 struct DisplayFunctionalTest : public testing::Test {
     class Display : public impl::Display {
     public:
-        explicit Display(const compositionengine::DisplayCreationArgs& args)
-              : impl::Display(args) {}
-
         using impl::Display::injectOutputLayerForTest;
         virtual void injectOutputLayerForTest(std::unique_ptr<compositionengine::OutputLayer>) = 0;
     };
-
-    static std::shared_ptr<Display> createDisplay(
-            const compositionengine::CompositionEngine& compositionEngine,
-            compositionengine::DisplayCreationArgs&& args) {
-        return impl::createDisplayTemplated<Display>(compositionEngine, args);
-    }
 
     DisplayFunctionalTest() {
         EXPECT_CALL(mCompositionEngine, getHwComposer()).WillRepeatedly(ReturnRef(mHwComposer));
@@ -805,11 +992,18 @@ struct DisplayFunctionalTest : public testing::Test {
     NiceMock<mock::CompositionEngine> mCompositionEngine;
     sp<mock::NativeWindow> mNativeWindow = new NiceMock<mock::NativeWindow>();
     sp<mock::DisplaySurface> mDisplaySurface = new NiceMock<mock::DisplaySurface>();
-    std::shared_ptr<Display> mDisplay = createDisplay(mCompositionEngine,
-                                                      DisplayCreationArgsBuilder()
-                                                              .setDisplayId(DEFAULT_DISPLAY_ID)
-                                                              .setPowerAdvisor(&mPowerAdvisor)
-                                                              .build());
+    std::shared_ptr<Display> mDisplay = impl::createDisplayTemplated<
+            Display>(mCompositionEngine,
+                     DisplayCreationArgsBuilder()
+                             .setPhysical({DEFAULT_DISPLAY_ID, DisplayConnectionType::Internal})
+                             .setPixels({DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT})
+                             .setPixelFormat(static_cast<ui::PixelFormat>(PIXEL_FORMAT_RGBA_8888))
+                             .setIsSecure(true)
+                             .setLayerStackId(DEFAULT_LAYER_STACK)
+                             .setPowerAdvisor(&mPowerAdvisor)
+                             .build()
+
+    );
     impl::RenderSurface* mRenderSurface =
             new impl::RenderSurface{mCompositionEngine, *mDisplay,
                                     RenderSurfaceCreationArgs{DEFAULT_DISPLAY_WIDTH,

@@ -14,6 +14,12 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
+#include <ui/DisplayState.h>
+
 #include "LayerTransactionTest.h"
 
 namespace android {
@@ -30,12 +36,14 @@ protected:
         ASSERT_EQ(NO_ERROR, mClient->initCheck());
 
         mMainDisplay = SurfaceComposerClient::getInternalDisplayToken();
-        SurfaceComposerClient::getDisplayInfo(mMainDisplay, &mMainDisplayInfo);
+        SurfaceComposerClient::getDisplayState(mMainDisplay, &mMainDisplayState);
+        SurfaceComposerClient::getActiveDisplayConfig(mMainDisplay, &mMainDisplayConfig);
 
         sp<IGraphicBufferConsumer> consumer;
         BufferQueue::createBufferQueue(&mProducer, &consumer);
         consumer->setConsumerName(String8("Virtual disp consumer"));
-        consumer->setDefaultBufferSize(mMainDisplayInfo.w, mMainDisplayInfo.h);
+        consumer->setDefaultBufferSize(mMainDisplayConfig.resolution.getWidth(),
+                                       mMainDisplayConfig.resolution.getHeight());
     }
 
     virtual void TearDown() {
@@ -44,21 +52,21 @@ protected:
         mColorLayer = 0;
     }
 
-    void createDisplay(const Rect& layerStackRect, uint32_t layerStack) {
+    void createDisplay(const ui::Size& layerStackSize, uint32_t layerStack) {
         mVirtualDisplay =
                 SurfaceComposerClient::createDisplay(String8("VirtualDisplay"), false /*secure*/);
         asTransaction([&](Transaction& t) {
             t.setDisplaySurface(mVirtualDisplay, mProducer);
             t.setDisplayLayerStack(mVirtualDisplay, layerStack);
-            t.setDisplayProjection(mVirtualDisplay, mMainDisplayInfo.orientation, layerStackRect,
-                                   Rect(mMainDisplayInfo.w, mMainDisplayInfo.h));
+            t.setDisplayProjection(mVirtualDisplay, mMainDisplayState.orientation,
+                                   Rect(layerStackSize), Rect(mMainDisplayConfig.resolution));
         });
     }
 
     void createColorLayer(uint32_t layerStack) {
         mColorLayer =
                 createSurface(mClient, "ColorLayer", 0 /* buffer width */, 0 /* buffer height */,
-                              PIXEL_FORMAT_RGBA_8888, ISurfaceComposerClient::eFXSurfaceColor);
+                              PIXEL_FORMAT_RGBA_8888, ISurfaceComposerClient::eFXSurfaceEffect);
         ASSERT_TRUE(mColorLayer != nullptr);
         ASSERT_TRUE(mColorLayer->isValid());
         asTransaction([&](Transaction& t) {
@@ -72,7 +80,8 @@ protected:
         });
     }
 
-    DisplayInfo mMainDisplayInfo;
+    ui::DisplayState mMainDisplayState;
+    DisplayConfig mMainDisplayConfig;
     sp<IBinder> mMainDisplay;
     sp<IBinder> mVirtualDisplay;
     sp<IGraphicBufferProducer> mProducer;
@@ -81,7 +90,7 @@ protected:
 };
 
 TEST_F(MultiDisplayLayerBoundsTest, RenderLayerInVirtualDisplay) {
-    createDisplay({mMainDisplayInfo.viewportW, mMainDisplayInfo.viewportH}, 1 /* layerStack */);
+    createDisplay(mMainDisplayState.viewport, 1 /* layerStack */);
     createColorLayer(1 /* layerStack */);
 
     asTransaction([&](Transaction& t) { t.setPosition(mColorLayer, 10, 10); });
@@ -104,7 +113,7 @@ TEST_F(MultiDisplayLayerBoundsTest, RenderLayerInMirroredVirtualDisplay) {
 
     // Assumption here is that the new mirrored display has the same viewport as the
     // primary display that it is mirroring.
-    createDisplay({mMainDisplayInfo.viewportW, mMainDisplayInfo.viewportH}, 0 /* layerStack */);
+    createDisplay(mMainDisplayState.viewport, 0 /* layerStack */);
     createColorLayer(0 /* layerStack */);
 
     asTransaction([&](Transaction& t) { t.setPosition(mColorLayer, 10, 10); });
@@ -122,3 +131,6 @@ TEST_F(MultiDisplayLayerBoundsTest, RenderLayerInMirroredVirtualDisplay) {
 }
 
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

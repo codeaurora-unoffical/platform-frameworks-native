@@ -25,6 +25,7 @@
 
 #include <gui/HdrMetadata.h>
 #include <math/mat4.h>
+#include <ui/DisplayInfo.h>
 #include <ui/GraphicTypes.h>
 #include <ui/HdrCapabilities.h>
 #include <ui/Region.h>
@@ -52,7 +53,6 @@ namespace android {
 
 namespace HWC2 {
 
-class Display;
 class Layer;
 using VsyncPeriodChangeConstraints = hwc_vsync_period_change_constraints_t;
 using VsyncPeriodChangeTimeline = hwc_vsync_period_change_timeline_t;
@@ -77,58 +77,9 @@ class ComposerCallback {
     virtual void onVsyncPeriodTimingChangedReceived(
             int32_t sequenceId, hwc2_display_t display,
             const hwc_vsync_period_change_timeline_t& updatedTimeline) = 0;
+    virtual void onSeamlessPossible(int32_t sequenceId, hwc2_display_t display) = 0;
 
     virtual ~ComposerCallback() = default;
-};
-
-// C++ Wrapper around hwc2_device_t. Load all functions pointers
-// and handle callback registration.
-class Device
-{
-public:
-    explicit Device(std::unique_ptr<android::Hwc2::Composer> composer);
-
-    void registerCallback(ComposerCallback* callback, int32_t sequenceId);
-
-    // Required by HWC2
-
-    std::string dump() const;
-
-    const std::unordered_set<Capability>& getCapabilities() const {
-        return mCapabilities;
-    };
-
-    uint32_t getMaxVirtualDisplayCount() const;
-    Error getDisplayIdentificationData(hwc2_display_t hwcDisplayId, uint8_t* outPort,
-                                       std::vector<uint8_t>* outData) const;
-
-    Error createVirtualDisplay(uint32_t width, uint32_t height,
-            android::ui::PixelFormat* format, Display** outDisplay);
-    void destroyDisplay(hwc2_display_t displayId);
-
-    void onHotplug(hwc2_display_t displayId, Connection connection);
-
-    // Other Device methods
-
-    Display* getDisplayById(hwc2_display_t id);
-
-    android::Hwc2::Composer* getComposer() { return mComposer.get(); }
-
-    // We buffer most state changes and flush them implicitly with
-    // Display::validate, Display::present, and Display::presentOrValidate.
-    // This method provides an explicit way to flush state changes to HWC.
-    Error flushCommands();
-
-private:
-    // Initialization methods
-
-    void loadCapabilities();
-
-    // Member variables
-    std::unique_ptr<android::Hwc2::Composer> mComposer;
-    std::unordered_set<Capability> mCapabilities;
-    std::unordered_map<hwc2_display_t, std::unique_ptr<Display>> mDisplays;
-    bool mRegisteredCallback = false;
 };
 
 // Convenience C++ class to access hwc2_device_t Display functions directly.
@@ -241,7 +192,8 @@ public:
     [[clang::warn_unused_result]] virtual Error getRequests(
             DisplayRequest* outDisplayRequests,
             std::unordered_map<Layer*, LayerRequest>* outLayerRequests) = 0;
-    [[clang::warn_unused_result]] virtual Error getType(DisplayType* outType) const = 0;
+    [[clang::warn_unused_result]] virtual Error getConnectionType(
+            android::DisplayConnectionType*) const = 0;
     [[clang::warn_unused_result]] virtual Error supportsDoze(bool* outSupport) const = 0;
     [[clang::warn_unused_result]] virtual Error getHdrCapabilities(
             android::HdrCapabilities* outCapabilities) const = 0;
@@ -283,6 +235,10 @@ public:
             const std::shared_ptr<const HWC2::Display::Config>& config,
             const VsyncPeriodChangeConstraints& constraints,
             VsyncPeriodChangeTimeline* outTimeline) = 0;
+    [[clang::warn_unused_result]] virtual Error setAutoLowLatencyMode(bool on) const = 0;
+    [[clang::warn_unused_result]] virtual Error getSupportedContentTypes(
+            std::vector<HWC2::ContentType>*) const = 0;
+    [[clang::warn_unused_result]] virtual Error setContentType(HWC2::ContentType) const = 0;
 };
 
 namespace impl {
@@ -314,7 +270,7 @@ public:
     Error getName(std::string* outName) const override;
     Error getRequests(DisplayRequest* outDisplayRequests,
                       std::unordered_map<Layer*, LayerRequest>* outLayerRequests) override;
-    Error getType(DisplayType* outType) const override;
+    Error getConnectionType(android::DisplayConnectionType*) const override;
     Error supportsDoze(bool* outSupport) const override;
     Error getHdrCapabilities(android::HdrCapabilities* outCapabilities) const override;
     Error getDisplayedContentSamplingAttributes(android::ui::PixelFormat* outFormat,
@@ -346,7 +302,10 @@ public:
     Error setActiveConfigWithConstraints(const std::shared_ptr<const HWC2::Display::Config>& config,
                                          const VsyncPeriodChangeConstraints& constraints,
                                          VsyncPeriodChangeTimeline* outTimeline) override;
-
+    Error setAutoLowLatencyMode(bool on) const override;
+    Error getSupportedContentTypes(
+            std::vector<HWC2::ContentType>* outSupportedContentTypes) const override;
+    Error setContentType(HWC2::ContentType contentType) const override;
     // Other Display methods
     hwc2_display_t getId() const override { return mId; }
     bool isConnected() const override { return mIsConnected; }
@@ -375,16 +334,17 @@ private:
     android::Hwc2::Composer& mComposer;
     const std::unordered_set<Capability>& mCapabilities;
 
-    hwc2_display_t mId;
-    bool mIsConnected;
+    const hwc2_display_t mId;
     DisplayType mType;
-    std::unordered_map<hwc2_layer_t, std::unique_ptr<Layer>> mLayers;
+    bool mIsConnected = false;
 
+    std::unordered_map<hwc2_layer_t, std::unique_ptr<Layer>> mLayers;
     std::unordered_map<hwc2_config_t, std::shared_ptr<const Config>> mConfigs;
 
     std::once_flag mDisplayCapabilityQueryFlag;
     std::unordered_set<DisplayCapability> mDisplayCapabilities;
 };
+
 } // namespace impl
 
 class Layer {
@@ -417,6 +377,10 @@ public:
 
     // Composer HAL 2.3
     [[clang::warn_unused_result]] virtual Error setColorTransform(const android::mat4& matrix) = 0;
+
+    // Composer HAL 2.4
+    [[clang::warn_unused_result]] virtual Error setLayerGenericMetadata(
+            const std::string& name, bool mandatory, const std::vector<uint8_t>& value) = 0;
 };
 
 namespace impl {
@@ -425,8 +389,7 @@ namespace impl {
 
 class Layer : public HWC2::Layer {
 public:
-    Layer(android::Hwc2::Composer& composer,
-          const std::unordered_set<Capability>& capabilities,
+    Layer(android::Hwc2::Composer& composer, const std::unordered_set<Capability>& capabilities,
           hwc2_display_t displayId, hwc2_layer_t layerId);
     ~Layer() override;
 
@@ -454,6 +417,10 @@ public:
 
     // Composer HAL 2.3
     Error setColorTransform(const android::mat4& matrix) override;
+
+    // Composer HAL 2.4
+    Error setLayerGenericMetadata(const std::string& name, bool mandatory,
+                                  const std::vector<uint8_t>& value) override;
 
 private:
     // These are references to data owned by HWC2::Device, which will outlive

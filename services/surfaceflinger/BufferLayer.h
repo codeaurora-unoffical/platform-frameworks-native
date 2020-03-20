@@ -54,7 +54,8 @@ public:
     // Overriden from Layer
     // -----------------------------------------------------------------------
 public:
-    std::shared_ptr<compositionengine::Layer> getCompositionLayer() const override;
+    sp<compositionengine::LayerFE> getCompositionEngineLayerFE() const override;
+    compositionengine::LayerFECompositionState* editCompositionState() override;
 
     // If we have received a new buffer this frame, we will pass its surface
     // damage down to hardware composer. Otherwise, we must send a region with
@@ -172,13 +173,15 @@ protected:
     BufferInfo mBufferInfo;
     virtual void gatherBufferInfo() = 0;
 
+    std::optional<compositionengine::LayerFE::LayerSettings> prepareClientComposition(
+            compositionengine::LayerFE::ClientCompositionTargetSettings&) override;
+
     /*
      * compositionengine::LayerFE overrides
      */
+    const compositionengine::LayerFECompositionState* getCompositionState() const override;
     bool onPreComposition(nsecs_t) override;
-    void latchPerFrameState(compositionengine::LayerFECompositionState&) const override;
-    std::optional<renderengine::LayerSettings> prepareClientComposition(
-            compositionengine::LayerFE::ClientCompositionTargetSettings&) override;
+    void preparePerFrameCompositionState() override;
 
     // Loads the corresponding system property once per process
     static bool latchUnsignaledBuffers();
@@ -200,17 +203,17 @@ protected:
     void updateCloneBufferInfo() override;
     uint64_t mPreviousFrameNumber = 0;
 
+    virtual uint64_t getHeadFrameNumber(nsecs_t expectedPresentTime) const;
+
 private:
     // Returns true if this layer requires filtering
     bool needsFiltering(const sp<const DisplayDevice>& displayDevice) const override;
-
-    uint64_t getHeadFrameNumber(nsecs_t expectedPresentTime) const;
 
     // BufferStateLayers can return Rect::INVALID_RECT if the layer does not have a display frame
     // and its parent layer is not bounded
     Rect getBufferSize(const State& s) const override;
 
-    std::shared_ptr<compositionengine::Layer> mCompositionLayer;
+    std::unique_ptr<compositionengine::LayerFECompositionState> mCompositionState;
 
     FloatRect computeSourceBounds(const FloatRect& parentBounds) const override;
 };

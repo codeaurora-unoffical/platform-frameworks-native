@@ -14,12 +14,15 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #undef LOG_TAG
 #define LOG_TAG "BufferQueueLayer"
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 #include "BufferQueueLayer.h"
 
-#include <compositionengine/Layer.h>
 #include <compositionengine/LayerFECompositionState.h>
 #include <gui/BufferQueueConsumer.h>
 #include <system/window.h>
@@ -113,6 +116,10 @@ bool BufferQueueLayer::shouldPresentNow(nsecs_t expectedPresentTime) const {
              "relative to expectedPresent %" PRId64,
              getDebugName(), addedTime, expectedPresentTime);
 
+    if (!isPlausible) {
+        mFlinger->mTimeStats->incrementBadDesiredPresent(getSequence());
+    }
+
     const bool isDue = addedTime < expectedPresentTime;
     return isDue || !isPlausible;
 }
@@ -138,7 +145,14 @@ bool BufferQueueLayer::fenceHasSignaled() const {
         // able to be latched. To avoid this, grab this buffer anyway.
         return true;
     }
-    return mQueueItems[0].mFenceTime->getSignalTime() != Fence::SIGNAL_TIME_PENDING;
+    const bool fenceSignaled =
+            mQueueItems[0].mFenceTime->getSignalTime() != Fence::SIGNAL_TIME_PENDING;
+    if (!fenceSignaled) {
+        mFlinger->mTimeStats->incrementLatchSkipped(getSequence(),
+                                                    TimeStats::LatchSkipReason::LateAcquire);
+    }
+
+    return fenceSignaled;
 }
 
 bool BufferQueueLayer::framePresentTimeIsCurrent(nsecs_t expectedPresentTime) const {
@@ -196,9 +210,9 @@ bool BufferQueueLayer::latchSidebandStream(bool& recomputeVisibleRegions) {
     if (mSidebandStreamChanged.compare_exchange_strong(sidebandStreamChanged, false)) {
         // mSidebandStreamChanged was changed to false
         mSidebandStream = mConsumer->getSidebandStream();
-        auto& layerCompositionState = getCompositionLayer()->editFEState();
-        layerCompositionState.sidebandStream = mSidebandStream;
-        if (layerCompositionState.sidebandStream != nullptr) {
+        auto* layerCompositionState = editCompositionState();
+        layerCompositionState->sidebandStream = mSidebandStream;
+        if (layerCompositionState->sidebandStream != nullptr) {
             setTransactionFlags(eTransactionNeeded);
             mFlinger->setTransactionFlags(eTraversalNeeded);
         }
@@ -332,8 +346,8 @@ status_t BufferQueueLayer::updateActiveBuffer() {
     mPreviousBufferId = getCurrentBufferId();
     mBufferInfo.mBuffer =
             mConsumer->getCurrentBuffer(&mBufferInfo.mBufferSlot, &mBufferInfo.mFence);
-    auto& layerCompositionState = getCompositionLayer()->editFEState();
-    layerCompositionState.buffer = mBufferInfo.mBuffer;
+    auto* layerCompositionState = editCompositionState();
+    layerCompositionState->buffer = mBufferInfo.mBuffer;
 
     if (mBufferInfo.mBuffer == nullptr) {
         // this can only happen if the very first buffer was rejected.
@@ -353,18 +367,19 @@ status_t BufferQueueLayer::updateFrameNumber(nsecs_t latchTime) {
     return NO_ERROR;
 }
 
-void BufferQueueLayer::latchPerFrameState(
-        compositionengine::LayerFECompositionState& compositionState) const {
-    BufferLayer::latchPerFrameState(compositionState);
-    if (compositionState.compositionType == Hwc2::IComposerClient::Composition::SIDEBAND) {
+void BufferQueueLayer::preparePerFrameCompositionState() {
+    BufferLayer::preparePerFrameCompositionState();
+
+    auto* compositionState = editCompositionState();
+    if (compositionState->compositionType == Hwc2::IComposerClient::Composition::SIDEBAND) {
         return;
     }
 
-    compositionState.buffer = mBufferInfo.mBuffer;
-    compositionState.bufferSlot = (mBufferInfo.mBufferSlot == BufferQueue::INVALID_BUFFER_SLOT)
+    compositionState->buffer = mBufferInfo.mBuffer;
+    compositionState->bufferSlot = (mBufferInfo.mBufferSlot == BufferQueue::INVALID_BUFFER_SLOT)
             ? 0
             : mBufferInfo.mBufferSlot;
-    compositionState.acquireFence = mBufferInfo.mFence;
+    compositionState->acquireFence = mBufferInfo.mFence;
 }
 
 // -----------------------------------------------------------------------
@@ -414,6 +429,7 @@ void BufferQueueLayer::onFrameAvailable(const BufferItem& item) {
             status_t result = mQueueItemCondition.waitRelative(mQueueItemLock, ms2ns(500));
             if (result != NO_ERROR) {
                 ALOGE("[%s] Timed out waiting on callback", getDebugName());
+                break;
             }
         }
 
@@ -442,6 +458,7 @@ void BufferQueueLayer::onFrameReplaced(const BufferItem& item) {
             status_t result = mQueueItemCondition.waitRelative(mQueueItemLock, ms2ns(500));
             if (result != NO_ERROR) {
                 ALOGE("[%s] Timed out waiting on callback", getDebugName());
+                break;
             }
         }
 
@@ -455,6 +472,10 @@ void BufferQueueLayer::onFrameReplaced(const BufferItem& item) {
         mLastFrameNumberReceived = item.mFrameNumber;
         mQueueItemCondition.broadcast();
     }
+
+    const int32_t layerId = getSequence();
+    mFlinger->mFrameTracer->traceTimestamp(layerId, item.mGraphicBuffer->getId(), item.mFrameNumber,
+                                           systemTime(), FrameTracer::FrameEvent::QUEUE);
     mConsumer->onBufferAvailable(item);
 }
 
@@ -608,3 +629,6 @@ void BufferQueueLayer::ContentsChangedListener::abandon() {
 // -----------------------------------------------------------------------
 
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

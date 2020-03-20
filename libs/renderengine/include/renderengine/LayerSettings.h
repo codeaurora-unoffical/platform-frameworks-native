@@ -52,7 +52,7 @@ struct Buffer {
     // Transform matrix to apply to texture coordinates.
     mat4 textureTransform = mat4();
 
-    // Wheteher to use pre-multiplied alpha
+    // Whether to use pre-multiplied alpha.
     bool usePremultipliedAlpha = true;
 
     // Override flag that alpha for each pixel in the buffer *must* be 1.0.
@@ -149,8 +149,12 @@ struct LayerSettings {
     bool disableBlending = false;
 
     ShadowSettings shadow;
+
+    int backgroundBlurRadius = 0;
 };
 
+// Keep in sync with custom comparison function in
+// compositionengine/impl/ClientCompositionRequestCache.cpp
 static inline bool operator==(const Buffer& lhs, const Buffer& rhs) {
     return lhs.buffer == rhs.buffer && lhs.fence == rhs.fence &&
             lhs.textureName == rhs.textureName &&
@@ -182,7 +186,8 @@ static inline bool operator==(const LayerSettings& lhs, const LayerSettings& rhs
     return lhs.geometry == rhs.geometry && lhs.source == rhs.source && lhs.alpha == rhs.alpha &&
             lhs.sourceDataspace == rhs.sourceDataspace &&
             lhs.colorTransform == rhs.colorTransform &&
-            lhs.disableBlending == rhs.disableBlending && lhs.shadow == rhs.shadow;
+            lhs.disableBlending == rhs.disableBlending && lhs.shadow == rhs.shadow &&
+            lhs.backgroundBlurRadius == rhs.backgroundBlurRadius;
 }
 
 // Defining PrintTo helps with Google Tests.
@@ -243,6 +248,7 @@ static inline void PrintTo(const LayerSettings& settings, ::std::ostream* os) {
     PrintTo(settings.sourceDataspace, os);
     *os << "\n    .colorTransform = " << settings.colorTransform;
     *os << "\n    .disableBlending = " << settings.disableBlending;
+    *os << "\n    .backgroundBlurRadius = " << settings.backgroundBlurRadius;
     *os << "\n    .shadow = ";
     PrintTo(settings.shadow, os);
     *os << "\n}";

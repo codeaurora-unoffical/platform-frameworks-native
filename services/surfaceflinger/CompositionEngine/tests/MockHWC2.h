@@ -20,12 +20,20 @@
 #include <ui/Fence.h>
 #include <ui/FloatRect.h>
 #include <ui/GraphicBuffer.h>
-#include <ui/GraphicTypes.h>
+
 #include <ui/Rect.h>
 #include <ui/Region.h>
 #include <ui/Transform.h>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
+#include <ui/GraphicTypes.h>
 #include "DisplayHardware/HWC2.h"
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
 
 namespace HWC2 {
 namespace mock {
@@ -57,6 +65,8 @@ public:
     MOCK_METHOD2(setInfo, Error(uint32_t, uint32_t));
 
     MOCK_METHOD1(setColorTransform, Error(const android::mat4&));
+    MOCK_METHOD3(setLayerGenericMetadata,
+                 Error(const std::string&, bool, const std::vector<uint8_t>&));
 };
 
 } // namespace mock

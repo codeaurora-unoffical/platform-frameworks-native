@@ -21,11 +21,12 @@
 #include <android/hardware/graphics/common/1.2/types.h>
 #include <gui/BufferQueueCore.h>
 #include <gui/BufferQueueProducer.h>
+#include <gui/FrameTimestamps.h>
 #include <gui/IGraphicBufferProducer.h>
 #include <gui/IProducerListener.h>
 #include <gui/SurfaceComposerClient.h>
 #include <private/gui/ComposerService.h>
-#include <ui/DisplayInfo.h>
+#include <ui/DisplayConfig.h>
 #include <ui/GraphicBuffer.h>
 #include <ui/GraphicTypes.h>
 #include <ui/Transform.h>
@@ -69,7 +70,7 @@ public:
 
     void waitForCallbacks() {
         std::unique_lock lock{mBlastBufferQueueAdapter->mMutex};
-        while (mBlastBufferQueueAdapter->mPendingCallbacks > 0) {
+        while (mBlastBufferQueueAdapter->mSubmitted.size() > 0) {
             mBlastBufferQueueAdapter->mCallbackCV.wait(lock);
         }
     }
@@ -103,10 +104,11 @@ protected:
         t.apply();
         t.clear();
 
-        DisplayInfo info;
-        ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getDisplayInfo(mDisplayToken, &info));
-        mDisplayWidth = info.w;
-        mDisplayHeight = info.h;
+        DisplayConfig config;
+        ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getActiveDisplayConfig(mDisplayToken, &config));
+        const ui::Size& resolution = config.resolution;
+        mDisplayWidth = resolution.getWidth();
+        mDisplayHeight = resolution.getHeight();
 
         mSurfaceControl = mClient->createSurface(String8("TestSurface"), mDisplayWidth,
                                                  mDisplayHeight, PIXEL_FORMAT_RGBA_8888,
@@ -114,7 +116,7 @@ protected:
                                                  /*parent*/ nullptr);
         t.setLayerStack(mSurfaceControl, 0)
                 .setLayer(mSurfaceControl, std::numeric_limits<int32_t>::max())
-                .setFrame(mSurfaceControl, Rect(0, 0, mDisplayWidth, mDisplayHeight))
+                .setFrame(mSurfaceControl, Rect(resolution))
                 .show(mSurfaceControl)
                 .setDataspace(mSurfaceControl, ui::Dataspace::V0_SRGB)
                 .apply();
@@ -123,11 +125,12 @@ protected:
     void setUpProducer(BLASTBufferQueueHelper adapter, sp<IGraphicBufferProducer>& producer) {
         auto igbProducer = adapter.getIGraphicBufferProducer();
         ASSERT_NE(nullptr, igbProducer.get());
+        ASSERT_EQ(NO_ERROR, igbProducer->setMaxDequeuedBufferCount(2));
         IGraphicBufferProducer::QueueBufferOutput qbOutput;
         ASSERT_EQ(NO_ERROR,
                   igbProducer->connect(new DummyProducerListener, NATIVE_WINDOW_API_CPU, false,
                                        &qbOutput));
-        ASSERT_NE(ui::Transform::orientation_flags::ROT_INVALID, qbOutput.transformHint);
+        ASSERT_NE(ui::Transform::ROT_INVALID, qbOutput.transformHint);
         producer = igbProducer;
     }
 
@@ -236,6 +239,33 @@ TEST_F(BLASTBufferQueueTest, SetNextTransaction) {
     ASSERT_EQ(&next, adapter.getNextTransaction());
 }
 
+TEST_F(BLASTBufferQueueTest, DISABLED_onFrameAvailable_ApplyDesiredPresentTime) {
+    BLASTBufferQueueHelper adapter(mSurfaceControl, mDisplayWidth, mDisplayHeight);
+    sp<IGraphicBufferProducer> igbProducer;
+    setUpProducer(adapter, igbProducer);
+
+    int slot;
+    sp<Fence> fence;
+    sp<GraphicBuffer> buf;
+    auto ret = igbProducer->dequeueBuffer(&slot, &fence, mDisplayWidth, mDisplayHeight,
+                                          PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_SW_WRITE_OFTEN,
+                                          nullptr, nullptr);
+    ASSERT_EQ(IGraphicBufferProducer::BUFFER_NEEDS_REALLOCATION, ret);
+    ASSERT_EQ(OK, igbProducer->requestBuffer(slot, &buf));
+
+    nsecs_t desiredPresentTime = systemTime() + nsecs_t(5 * 1e8);
+    IGraphicBufferProducer::QueueBufferOutput qbOutput;
+    IGraphicBufferProducer::QueueBufferInput input(desiredPresentTime, false, HAL_DATASPACE_UNKNOWN,
+                                                   Rect(mDisplayWidth, mDisplayHeight),
+                                                   NATIVE_WINDOW_SCALING_MODE_FREEZE, 0,
+                                                   Fence::NO_FENCE);
+    igbProducer->queueBuffer(slot, input, &qbOutput);
+    ASSERT_NE(ui::Transform::ROT_INVALID, qbOutput.transformHint);
+
+    adapter.waitForCallbacks();
+    ASSERT_GE(systemTime(), desiredPresentTime);
+}
+
 TEST_F(BLASTBufferQueueTest, onFrameAvailable_Apply) {
     uint8_t r = 255;
     uint8_t g = 0;
@@ -266,7 +296,7 @@ TEST_F(BLASTBufferQueueTest, onFrameAvailable_Apply) {
                                                    NATIVE_WINDOW_SCALING_MODE_FREEZE, 0,
                                                    Fence::NO_FENCE);
     igbProducer->queueBuffer(slot, input, &qbOutput);
-    ASSERT_NE(ui::Transform::orientation_flags::ROT_INVALID, qbOutput.transformHint);
+    ASSERT_NE(ui::Transform::ROT_INVALID, qbOutput.transformHint);
 
     adapter.waitForCallbacks();
 
@@ -302,7 +332,7 @@ TEST_F(BLASTBufferQueueTest, TripleBuffering) {
         igbProducer->cancelBuffer(allocated[i].first, allocated[i].second);
     }
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 100; i++) {
         int slot;
         sp<Fence> fence;
         sp<GraphicBuffer> buf;
@@ -349,7 +379,7 @@ TEST_F(BLASTBufferQueueTest, SetCrop_Item) {
                                                    NATIVE_WINDOW_SCALING_MODE_FREEZE, 0,
                                                    Fence::NO_FENCE);
     igbProducer->queueBuffer(slot, input, &qbOutput);
-    ASSERT_NE(ui::Transform::orientation_flags::ROT_INVALID, qbOutput.transformHint);
+    ASSERT_NE(ui::Transform::ROT_INVALID, qbOutput.transformHint);
 
     adapter.waitForCallbacks();
     // capture screen and verify that it is red
@@ -373,7 +403,7 @@ TEST_F(BLASTBufferQueueTest, SetCrop_ScalingModeScaleCrop) {
     int32_t finalCropSideLength = bufferSideLength / 2;
 
     auto bg = mClient->createSurface(String8("BGTest"), 0, 0, PIXEL_FORMAT_RGBA_8888,
-                                     ISurfaceComposerClient::eFXSurfaceColor);
+                                     ISurfaceComposerClient::eFXSurfaceEffect);
     ASSERT_NE(nullptr, bg.get());
     Transaction t;
     t.setLayerStack(bg, 0)
@@ -410,7 +440,7 @@ TEST_F(BLASTBufferQueueTest, SetCrop_ScalingModeScaleCrop) {
                                                    NATIVE_WINDOW_SCALING_MODE_SCALE_CROP, 0,
                                                    Fence::NO_FENCE);
     igbProducer->queueBuffer(slot, input, &qbOutput);
-    ASSERT_NE(ui::Transform::orientation_flags::ROT_INVALID, qbOutput.transformHint);
+    ASSERT_NE(ui::Transform::ROT_INVALID, qbOutput.transformHint);
 
     adapter.waitForCallbacks();
     // capture screen and verify that it is red
@@ -456,7 +486,7 @@ public:
                                                        NATIVE_WINDOW_SCALING_MODE_FREEZE, tr,
                                                        Fence::NO_FENCE);
         igbProducer->queueBuffer(slot, input, &qbOutput);
-        ASSERT_NE(ui::Transform::orientation_flags::ROT_INVALID, qbOutput.transformHint);
+        ASSERT_NE(ui::Transform::ROT_INVALID, qbOutput.transformHint);
 
         adapter.waitForCallbacks();
         bool capturedSecureLayers;
@@ -617,5 +647,80 @@ TEST_F(BLASTBufferQueueTransformTest, setTransform_ROT_180) {
 
 TEST_F(BLASTBufferQueueTransformTest, setTransform_ROT_270) {
     test(ui::Transform::ROT_270);
+}
+
+class BLASTFrameEventHistoryTest : public BLASTBufferQueueTest {
+public:
+    void setUpAndQueueBuffer(const sp<IGraphicBufferProducer>& igbProducer,
+                             nsecs_t* requestedPresentTime, nsecs_t* postedTime,
+                             IGraphicBufferProducer::QueueBufferOutput* qbOutput,
+                             bool getFrameTimestamps) {
+        int slot;
+        sp<Fence> fence;
+        sp<GraphicBuffer> buf;
+        auto ret = igbProducer->dequeueBuffer(&slot, &fence, mDisplayWidth, mDisplayHeight,
+                                              PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_SW_WRITE_OFTEN,
+                                              nullptr, nullptr);
+        ASSERT_EQ(IGraphicBufferProducer::BUFFER_NEEDS_REALLOCATION, ret);
+        ASSERT_EQ(OK, igbProducer->requestBuffer(slot, &buf));
+
+        nsecs_t requestedTime = systemTime();
+        if (requestedPresentTime) *requestedPresentTime = requestedTime;
+        IGraphicBufferProducer::QueueBufferInput input(requestedTime, false, HAL_DATASPACE_UNKNOWN,
+                                                       Rect(mDisplayWidth, mDisplayHeight),
+                                                       NATIVE_WINDOW_SCALING_MODE_FREEZE, 0,
+                                                       Fence::NO_FENCE, /*sticky*/ 0,
+                                                       getFrameTimestamps);
+        if (postedTime) *postedTime = systemTime();
+        igbProducer->queueBuffer(slot, input, qbOutput);
+    }
+};
+
+TEST_F(BLASTFrameEventHistoryTest, FrameEventHistory_Basic) {
+    BLASTBufferQueueHelper adapter(mSurfaceControl, mDisplayWidth, mDisplayHeight);
+    sp<IGraphicBufferProducer> igbProducer;
+    ProducerFrameEventHistory history;
+    setUpProducer(adapter, igbProducer);
+
+    IGraphicBufferProducer::QueueBufferOutput qbOutput;
+    nsecs_t requestedPresentTimeA = 0;
+    nsecs_t postedTimeA = 0;
+    setUpAndQueueBuffer(igbProducer, &requestedPresentTimeA, &postedTimeA, &qbOutput, true);
+    history.applyDelta(qbOutput.frameTimestamps);
+
+    FrameEvents* events = nullptr;
+    events = history.getFrame(1);
+    ASSERT_NE(nullptr, events);
+    ASSERT_EQ(1, events->frameNumber);
+    ASSERT_EQ(requestedPresentTimeA, events->requestedPresentTime);
+    ASSERT_GE(events->postedTime, postedTimeA);
+
+    adapter.waitForCallbacks();
+
+    // queue another buffer so we query for frame event deltas
+    nsecs_t requestedPresentTimeB = 0;
+    nsecs_t postedTimeB = 0;
+    setUpAndQueueBuffer(igbProducer, &requestedPresentTimeB, &postedTimeB, &qbOutput, true);
+    history.applyDelta(qbOutput.frameTimestamps);
+    events = history.getFrame(1);
+    ASSERT_NE(nullptr, events);
+
+    // frame number, requestedPresentTime, and postTime should not have changed
+    ASSERT_EQ(1, events->frameNumber);
+    ASSERT_EQ(requestedPresentTimeA, events->requestedPresentTime);
+    ASSERT_GE(events->postedTime, postedTimeA);
+
+    ASSERT_GE(events->latchTime, postedTimeA);
+    ASSERT_GE(events->dequeueReadyTime, events->latchTime);
+    ASSERT_NE(nullptr, events->gpuCompositionDoneFence);
+    ASSERT_NE(nullptr, events->displayPresentFence);
+    ASSERT_NE(nullptr, events->releaseFence);
+
+    // we should also have gotten the initial values for the next frame
+    events = history.getFrame(2);
+    ASSERT_NE(nullptr, events);
+    ASSERT_EQ(2, events->frameNumber);
+    ASSERT_EQ(requestedPresentTimeB, events->requestedPresentTime);
+    ASSERT_GE(events->postedTime, postedTimeB);
 }
 } // namespace android

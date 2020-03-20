@@ -34,13 +34,19 @@ static const char* native_processes_to_dump[] = {
         "/system/bin/mediametrics", // media.metrics
         "/system/bin/mediaserver",
         "/system/bin/netd",
-        "/system/bin/vold",
         "/system/bin/sdcard",
-        "/system/bin/statsd",
+        "/apex/com.android.os.statsd/bin/statsd",
         "/system/bin/surfaceflinger",
         "/system/bin/vehicle_network_service",
         "/vendor/bin/hw/android.hardware.media.omx@1.0-service", // media.codec
         "/apex/com.android.media.swcodec/bin/mediaswcodec", // media.swcodec
+        NULL,
+};
+
+
+// Native processes to dump on debuggable builds.
+static const char* debuggable_native_processes_to_dump[] = {
+        "/system/bin/vold",
         NULL,
 };
 
@@ -49,7 +55,9 @@ static const char* hal_interfaces_to_dump[] {
         "android.hardware.audio@2.0::IDevicesFactory",
         "android.hardware.audio@4.0::IDevicesFactory",
         "android.hardware.audio@5.0::IDevicesFactory",
+        "android.hardware.audio@6.0::IDevicesFactory",
         "android.hardware.biometrics.face@1.0::IBiometricsFace",
+        "android.hardware.biometrics.fingerprint@2.1::IBiometricsFingerprint",
         "android.hardware.bluetooth@1.0::IBluetoothHci",
         "android.hardware.camera.provider@2.4::ICameraProvider",
         "android.hardware.drm@1.0::IDrmFactory",
@@ -106,6 +114,15 @@ bool should_dump_native_traces(const char* path) {
             return true;
         }
     }
+
+    if (android::base::GetBoolProperty("ro.debuggable", false)) {
+        for (const char** p = debuggable_native_processes_to_dump; *p; p++) {
+            if (!strcmp(*p, path)) {
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 

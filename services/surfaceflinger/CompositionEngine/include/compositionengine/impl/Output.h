@@ -18,8 +18,10 @@
 
 #include <compositionengine/CompositionEngine.h>
 #include <compositionengine/Output.h>
+#include <compositionengine/impl/ClientCompositionRequestCache.h>
 #include <compositionengine/impl/OutputCompositionState.h>
-
+#include <renderengine/DisplaySettings.h>
+#include <renderengine/LayerSettings.h>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -36,8 +38,9 @@ public:
     bool isValid() const override;
     std::optional<DisplayId> getDisplayId() const override;
     void setCompositionEnabled(bool) override;
-    void setProjection(const ui::Transform&, int32_t orientation, const Rect& frame,
-                       const Rect& viewport, const Rect& scissor, bool needsFiltering) override;
+    void setProjection(const ui::Transform&, uint32_t orientation, const Rect& frame,
+                       const Rect& viewport, const Rect& sourceClip, const Rect& destinationClip,
+                       bool needsFiltering) override;
     void setBounds(const ui::Size&) override;
     void setLayerStackFilter(uint32_t layerStackId, bool isInternal) override;
 
@@ -57,10 +60,9 @@ public:
 
     Region getDirtyRegion(bool repaintEverything) const override;
     bool belongsInOutput(std::optional<uint32_t>, bool) const override;
-    bool belongsInOutput(const compositionengine::Layer*) const override;
+    bool belongsInOutput(const sp<LayerFE>&) const override;
 
-    compositionengine::OutputLayer* getOutputLayerForLayer(
-            compositionengine::Layer*) const override;
+    compositionengine::OutputLayer* getOutputLayerForLayer(const sp<LayerFE>&) const override;
 
     void setReleasedLayers(ReleasedLayers&&) override;
 
@@ -70,7 +72,7 @@ public:
     void rebuildLayerStacks(const CompositionRefreshArgs&, LayerFESet&) override;
     void collectVisibleLayers(const CompositionRefreshArgs&,
                               compositionengine::Output::CoverageState&) override;
-    void ensureOutputLayerIfVisible(std::shared_ptr<compositionengine::Layer>,
+    void ensureOutputLayerIfVisible(sp<compositionengine::LayerFE>&,
                                     compositionengine::Output::CoverageState&) override;
     void setReleasedLayers(const compositionengine::CompositionRefreshArgs&) override;
 
@@ -81,8 +83,10 @@ public:
     void prepareFrame() override;
     void devOptRepaintFlash(const CompositionRefreshArgs&) override;
     void finishFrame(const CompositionRefreshArgs&) override;
-    std::optional<base::unique_fd> composeSurfaces(const Region&) override;
+    std::optional<base::unique_fd> composeSurfaces(
+            const Region&, const compositionengine::CompositionRefreshArgs& refreshArgs) override;
     void postFramebuffer() override;
+    void cacheClientCompositionRequests(uint32_t) override;
 
     // Testing
     const ReleasedLayers& getReleasedLayersForTest() const;
@@ -90,32 +94,30 @@ public:
     void setRenderSurfaceForTest(std::unique_ptr<compositionengine::RenderSurface>);
 
 protected:
-    std::unique_ptr<compositionengine::OutputLayer> createOutputLayer(
-            const std::shared_ptr<compositionengine::Layer>&, const sp<LayerFE>&) const;
-    std::optional<size_t> findCurrentOutputLayerForLayer(compositionengine::Layer*) const;
+    std::unique_ptr<compositionengine::OutputLayer> createOutputLayer(const sp<LayerFE>&) const;
+    std::optional<size_t> findCurrentOutputLayerForLayer(
+            const sp<compositionengine::LayerFE>&) const;
     void chooseCompositionStrategy() override;
     bool getSkipColorTransform() const override;
     compositionengine::Output::FrameFences presentAndGetFrameFences() override;
-    std::vector<renderengine::LayerSettings> generateClientCompositionRequests(
+    std::vector<LayerFE::LayerSettings> generateClientCompositionRequests(
             bool supportsProtectedContent, Region& clearRegion,
             ui::Dataspace outputDataspace) override;
-    void appendRegionFlashRequests(const Region&,
-                                   std::vector<renderengine::LayerSettings>&) override;
+    void appendRegionFlashRequests(const Region&, std::vector<LayerFE::LayerSettings>&) override;
     void setExpensiveRenderingExpected(bool enabled) override;
     void dumpBase(std::string&) const;
 
     // Implemented by the final implementation for the final state it uses.
-    virtual compositionengine::OutputLayer* ensureOutputLayer(
-            std::optional<size_t>, const std::shared_ptr<compositionengine::Layer>&,
-            const sp<LayerFE>&) = 0;
-    virtual compositionengine::OutputLayer* injectOutputLayerForTest(
-            const std::shared_ptr<compositionengine::Layer>&, const sp<LayerFE>&) = 0;
+    virtual compositionengine::OutputLayer* ensureOutputLayer(std::optional<size_t>,
+                                                              const sp<LayerFE>&) = 0;
+    virtual compositionengine::OutputLayer* injectOutputLayerForTest(const sp<LayerFE>&) = 0;
     virtual void finalizePendingOutputLayers() = 0;
     virtual const compositionengine::CompositionEngine& getCompositionEngine() const = 0;
     virtual void dumpState(std::string& out) const = 0;
 
 private:
     void dirtyEntireOutput();
+    compositionengine::OutputLayer* findLayerRequestingBackgroundComposition() const;
     ui::Dataspace getBestDataspace(ui::Dataspace*, bool*) const;
     compositionengine::Output::ColorProfile pickColorProfile(
             const compositionengine::CompositionRefreshArgs&) const;
@@ -126,6 +128,8 @@ private:
     std::unique_ptr<compositionengine::RenderSurface> mRenderSurface;
 
     ReleasedLayers mReleasedLayers;
+    OutputLayer* mLayerRequestingBackgroundBlur = nullptr;
+    std::unique_ptr<ClientCompositionRequestCache> mClientCompositionRequestCache;
 };
 
 // This template factory function standardizes the implementation details of the
@@ -175,11 +179,10 @@ std::shared_ptr<BaseOutput> createOutputTemplated(const CompositionEngine& compo
         };
 
         OutputLayer* ensureOutputLayer(std::optional<size_t> prevIndex,
-                                       const std::shared_ptr<compositionengine::Layer>& layer,
                                        const sp<LayerFE>& layerFE) {
             auto outputLayer = (prevIndex && *prevIndex <= mCurrentOutputLayersOrderedByZ.size())
                     ? std::move(mCurrentOutputLayersOrderedByZ[*prevIndex])
-                    : BaseOutput::createOutputLayer(layer, layerFE);
+                    : BaseOutput::createOutputLayer(layerFE);
             auto result = outputLayer.get();
             mPendingOutputLayersOrderedByZ.emplace_back(std::move(outputLayer));
             return result;
@@ -196,10 +199,8 @@ std::shared_ptr<BaseOutput> createOutputTemplated(const CompositionEngine& compo
 
         void dumpState(std::string& out) const override { mState.dump(out); }
 
-        OutputLayer* injectOutputLayerForTest(
-                const std::shared_ptr<compositionengine::Layer>& layer,
-                const sp<LayerFE>& layerFE) override {
-            auto outputLayer = BaseOutput::createOutputLayer(layer, layerFE);
+        OutputLayer* injectOutputLayerForTest(const sp<LayerFE>& layerFE) override {
+            auto outputLayer = BaseOutput::createOutputLayer(layerFE);
             auto result = outputLayer.get();
             mCurrentOutputLayersOrderedByZ.emplace_back(std::move(outputLayer));
             return result;

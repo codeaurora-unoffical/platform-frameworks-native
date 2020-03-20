@@ -81,8 +81,8 @@ status_t DumpstateService::Start() {
 
 binder::Status DumpstateService::startBugreport(int32_t calling_uid,
                                                 const std::string& calling_package,
-                                                const android::base::unique_fd& bugreport_fd,
-                                                const android::base::unique_fd& screenshot_fd,
+                                                android::base::unique_fd bugreport_fd,
+                                                android::base::unique_fd screenshot_fd,
                                                 int bugreport_mode,
                                                 const sp<IDumpstateListener>& listener) {
     MYLOGI("startBugreport() with mode: %d\n", bugreport_mode);
@@ -120,7 +120,7 @@ binder::Status DumpstateService::startBugreport(int32_t calling_uid,
     options->Initialize(static_cast<Dumpstate::BugreportMode>(bugreport_mode), bugreport_fd,
                         screenshot_fd);
 
-    if (bugreport_fd.get() == -1 || (options->do_fb && screenshot_fd.get() == -1)) {
+    if (bugreport_fd.get() == -1 || (options->do_screenshot && screenshot_fd.get() == -1)) {
         MYLOGE("Invalid filedescriptor");
         signalErrorAndExit(listener, IDumpstateListener::BUGREPORT_ERROR_INVALID_INPUT);
     }

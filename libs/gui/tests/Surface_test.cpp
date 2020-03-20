@@ -718,15 +718,18 @@ public:
     }
 
     void setPowerMode(const sp<IBinder>& /*display*/, int /*mode*/) override {}
-    status_t getDisplayConfigs(const sp<IBinder>& /*display*/,
-            Vector<DisplayInfo>* /*configs*/) override { return NO_ERROR; }
+    status_t getDisplayInfo(const sp<IBinder>& /*display*/, DisplayInfo*) override {
+        return NO_ERROR;
+    }
+    status_t getDisplayConfigs(const sp<IBinder>& /*display*/, Vector<DisplayConfig>*) override {
+        return NO_ERROR;
+    }
+    status_t getDisplayState(const sp<IBinder>& /*display*/, ui::DisplayState*) override {
+        return NO_ERROR;
+    }
     status_t getDisplayStats(const sp<IBinder>& /*display*/,
             DisplayStatInfo* /*stats*/) override { return NO_ERROR; }
     int getActiveConfig(const sp<IBinder>& /*display*/) override { return 0; }
-    status_t setActiveConfig(const sp<IBinder>& /*display*/, int /*id*/)
-            override {
-        return NO_ERROR;
-    }
     status_t getDisplayColorModes(const sp<IBinder>& /*display*/,
             Vector<ColorMode>* /*outColorModes*/) override {
         return NO_ERROR;
@@ -742,21 +745,30 @@ public:
     status_t setActiveColorMode(const sp<IBinder>& /*display*/,
         ColorMode /*colorMode*/) override { return NO_ERROR; }
     status_t captureScreen(const sp<IBinder>& /*display*/, sp<GraphicBuffer>* /*outBuffer*/,
-                           bool& /* outCapturedSecureLayers */,
-                           const ui::Dataspace /*reqDataspace*/,
-                           const ui::PixelFormat /*reqPixelFormat*/, Rect /*sourceCrop*/,
+                           bool& /*outCapturedSecureLayers*/, ui::Dataspace /*reqDataspace*/,
+                           ui::PixelFormat /*reqPixelFormat*/, const Rect& /*sourceCrop*/,
                            uint32_t /*reqWidth*/, uint32_t /*reqHeight*/,
-                           bool /*useIdentityTransform*/, Rotation /*rotation*/,
+                           bool /*useIdentityTransform*/, ui::Rotation,
                            bool /*captureSecureLayers*/) override {
         return NO_ERROR;
     }
+    status_t getAutoLowLatencyModeSupport(const sp<IBinder>& /*display*/,
+                                          bool* /*outSupport*/) const override {
+        return NO_ERROR;
+    }
+    void setAutoLowLatencyMode(const sp<IBinder>& /*display*/, bool /*on*/) override {}
+    status_t getGameContentTypeSupport(const sp<IBinder>& /*display*/,
+                                       bool* /*outSupport*/) const override {
+        return NO_ERROR;
+    }
+    void setGameContentType(const sp<IBinder>& /*display*/, bool /*on*/) override {}
     status_t captureScreen(uint64_t /*displayOrLayerStack*/, ui::Dataspace* /*outDataspace*/,
                            sp<GraphicBuffer>* /*outBuffer*/) override {
         return NO_ERROR;
     }
     virtual status_t captureLayers(
             const sp<IBinder>& /*parentHandle*/, sp<GraphicBuffer>* /*outBuffer*/,
-            const ui::Dataspace /*reqDataspace*/, const ui::PixelFormat /*reqPixelFormat*/,
+            ui::Dataspace /*reqDataspace*/, ui::PixelFormat /*reqPixelFormat*/,
             const Rect& /*sourceCrop*/,
             const std::unordered_set<sp<IBinder>,
                                      ISurfaceComposer::SpHash<IBinder>>& /*excludeHandles*/,
@@ -823,21 +835,13 @@ public:
             const sp<IRegionSamplingListener>& /*listener*/) override {
         return NO_ERROR;
     }
-    status_t setAllowedDisplayConfigs(const sp<IBinder>& /*displayToken*/,
-                                      const std::vector<int32_t>& /*allowedConfigs*/) override {
-        return NO_ERROR;
-    }
-    status_t getAllowedDisplayConfigs(const sp<IBinder>& /*displayToken*/,
-                                      std::vector<int32_t>* /*outAllowedConfigs*/) override {
-        return NO_ERROR;
-    }
     status_t setDesiredDisplayConfigSpecs(const sp<IBinder>& /*displayToken*/,
-                                          int32_t /*defaultModeId*/, float /*minRefreshRate*/,
-                                          float /*maxRefreshRate*/) override {
+                                          int32_t /*defaultConfig*/, float /*minRefreshRate*/,
+                                          float /*maxRefreshRate*/) {
         return NO_ERROR;
     }
     status_t getDesiredDisplayConfigSpecs(const sp<IBinder>& /*displayToken*/,
-                                          int32_t* /*outDefaultModeId*/,
+                                          int32_t* /*outDefaultConfig*/,
                                           float* /*outMinRefreshRate*/,
                                           float* /*outMaxRefreshRate*/) override {
         return NO_ERROR;
@@ -847,6 +851,11 @@ public:
     status_t setGlobalShadowSettings(const half4& /*ambientColor*/, const half4& /*spotColor*/,
                                      float /*lightPosY*/, float /*lightPosZ*/,
                                      float /*lightRadius*/) override {
+        return NO_ERROR;
+    }
+
+    status_t setFrameRate(const sp<IGraphicBufferProducer>& /*surface*/, float /*frameRate*/,
+                          int8_t /*compatibility*/) override {
         return NO_ERROR;
     }
 

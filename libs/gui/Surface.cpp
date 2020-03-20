@@ -43,12 +43,24 @@
 #include <gui/IProducerListener.h>
 
 #include <gui/ISurfaceComposer.h>
+#include <gui/LayerState.h>
 #include <private/gui/ComposerService.h>
 
 namespace android {
 
 using ui::ColorMode;
 using ui::Dataspace;
+
+namespace {
+
+bool isInterceptorRegistrationOp(int op) {
+    return op == NATIVE_WINDOW_SET_CANCEL_INTERCEPTOR ||
+            op == NATIVE_WINDOW_SET_DEQUEUE_INTERCEPTOR ||
+            op == NATIVE_WINDOW_SET_PERFORM_INTERCEPTOR ||
+            op == NATIVE_WINDOW_SET_QUEUE_INTERCEPTOR;
+}
+
+} // namespace
 
 Surface::Surface(const sp<IGraphicBufferProducer>& bufferProducer, bool controlledByApp)
       : mGraphicBufferProducer(bufferProducer),
@@ -366,17 +378,57 @@ int Surface::hook_setSwapInterval(ANativeWindow* window, int interval) {
 int Surface::hook_dequeueBuffer(ANativeWindow* window,
         ANativeWindowBuffer** buffer, int* fenceFd) {
     Surface* c = getSelf(window);
+    {
+        std::shared_lock<std::shared_mutex> lock(c->mInterceptorMutex);
+        if (c->mDequeueInterceptor != nullptr) {
+            auto interceptor = c->mDequeueInterceptor;
+            auto data = c->mDequeueInterceptorData;
+            return interceptor(window, Surface::dequeueBufferInternal, data, buffer, fenceFd);
+        }
+    }
+    return c->dequeueBuffer(buffer, fenceFd);
+}
+
+int Surface::dequeueBufferInternal(ANativeWindow* window, ANativeWindowBuffer** buffer,
+                                   int* fenceFd) {
+    Surface* c = getSelf(window);
     return c->dequeueBuffer(buffer, fenceFd);
 }
 
 int Surface::hook_cancelBuffer(ANativeWindow* window,
         ANativeWindowBuffer* buffer, int fenceFd) {
     Surface* c = getSelf(window);
+    {
+        std::shared_lock<std::shared_mutex> lock(c->mInterceptorMutex);
+        if (c->mCancelInterceptor != nullptr) {
+            auto interceptor = c->mCancelInterceptor;
+            auto data = c->mCancelInterceptorData;
+            return interceptor(window, Surface::cancelBufferInternal, data, buffer, fenceFd);
+        }
+    }
+    return c->cancelBuffer(buffer, fenceFd);
+}
+
+int Surface::cancelBufferInternal(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd) {
+    Surface* c = getSelf(window);
     return c->cancelBuffer(buffer, fenceFd);
 }
 
 int Surface::hook_queueBuffer(ANativeWindow* window,
         ANativeWindowBuffer* buffer, int fenceFd) {
+    Surface* c = getSelf(window);
+    {
+        std::shared_lock<std::shared_mutex> lock(c->mInterceptorMutex);
+        if (c->mQueueInterceptor != nullptr) {
+            auto interceptor = c->mQueueInterceptor;
+            auto data = c->mQueueInterceptorData;
+            return interceptor(window, Surface::queueBufferInternal, data, buffer, fenceFd);
+        }
+    }
+    return c->queueBuffer(buffer, fenceFd);
+}
+
+int Surface::queueBufferInternal(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd) {
     Surface* c = getSelf(window);
     return c->queueBuffer(buffer, fenceFd);
 }
@@ -420,19 +472,36 @@ int Surface::hook_queueBuffer_DEPRECATED(ANativeWindow* window,
     return c->queueBuffer(buffer, -1);
 }
 
-int Surface::hook_query(const ANativeWindow* window,
-                                int what, int* value) {
-    const Surface* c = getSelf(window);
-    return c->query(what, value);
-}
-
 int Surface::hook_perform(ANativeWindow* window, int operation, ...) {
     va_list args;
     va_start(args, operation);
     Surface* c = getSelf(window);
-    int result = c->perform(operation, args);
+    int result;
+    // Don't acquire shared ownership of the interceptor mutex if we're going to
+    // do interceptor registration, as otherwise we'll deadlock on acquiring
+    // exclusive ownership.
+    if (!isInterceptorRegistrationOp(operation)) {
+        std::shared_lock<std::shared_mutex> lock(c->mInterceptorMutex);
+        if (c->mPerformInterceptor != nullptr) {
+            result = c->mPerformInterceptor(window, Surface::performInternal,
+                                            c->mPerformInterceptorData, operation, args);
+            va_end(args);
+            return result;
+        }
+    }
+    result = c->perform(operation, args);
     va_end(args);
     return result;
+}
+
+int Surface::performInternal(ANativeWindow* window, int operation, va_list args) {
+    Surface* c = getSelf(window);
+    return c->perform(operation, args);
+}
+
+int Surface::hook_query(const ANativeWindow* window, int what, int* value) {
+    const Surface* c = getSelf(window);
+    return c->query(what, value);
 }
 
 int Surface::setSwapInterval(int interval) {
@@ -1093,6 +1162,28 @@ int Surface::perform(int operation, va_list args)
     case NATIVE_WINDOW_GET_LAST_QUEUE_DURATION:
         res = dispatchGetLastQueueDuration(args);
         break;
+    case NATIVE_WINDOW_SET_FRAME_RATE:
+        res = dispatchSetFrameRate(args);
+        break;
+    case NATIVE_WINDOW_SET_CANCEL_INTERCEPTOR:
+        res = dispatchAddCancelInterceptor(args);
+        break;
+    case NATIVE_WINDOW_SET_DEQUEUE_INTERCEPTOR:
+        res = dispatchAddDequeueInterceptor(args);
+        break;
+    case NATIVE_WINDOW_SET_PERFORM_INTERCEPTOR:
+        res = dispatchAddPerformInterceptor(args);
+        break;
+    case NATIVE_WINDOW_SET_QUEUE_INTERCEPTOR:
+        res = dispatchAddQueueInterceptor(args);
+        break;
+    case NATIVE_WINDOW_ALLOCATE_BUFFERS:
+        allocateBuffers();
+        res = NO_ERROR;
+        break;
+    case NATIVE_WINDOW_GET_LAST_QUEUED_BUFFER:
+        res = dispatchGetLastQueuedBuffer(args);
+        break;
     default:
         res = NAME_NOT_FOUND;
         break;
@@ -1319,6 +1410,75 @@ int Surface::dispatchGetLastQueueDuration(va_list args) {
     int64_t* lastQueueDuration = va_arg(args, int64_t*);
     *lastQueueDuration = mLastQueueDuration;
     return NO_ERROR;
+}
+
+int Surface::dispatchSetFrameRate(va_list args) {
+    float frameRate = static_cast<float>(va_arg(args, double));
+    int8_t compatibility = static_cast<int8_t>(va_arg(args, int));
+    return setFrameRate(frameRate, compatibility);
+}
+
+int Surface::dispatchAddCancelInterceptor(va_list args) {
+    ANativeWindow_cancelBufferInterceptor interceptor =
+            va_arg(args, ANativeWindow_cancelBufferInterceptor);
+    void* data = va_arg(args, void*);
+    std::lock_guard<std::shared_mutex> lock(mInterceptorMutex);
+    mCancelInterceptor = interceptor;
+    mCancelInterceptorData = data;
+    return NO_ERROR;
+}
+
+int Surface::dispatchAddDequeueInterceptor(va_list args) {
+    ANativeWindow_dequeueBufferInterceptor interceptor =
+            va_arg(args, ANativeWindow_dequeueBufferInterceptor);
+    void* data = va_arg(args, void*);
+    std::lock_guard<std::shared_mutex> lock(mInterceptorMutex);
+    mDequeueInterceptor = interceptor;
+    mDequeueInterceptorData = data;
+    return NO_ERROR;
+}
+
+int Surface::dispatchAddPerformInterceptor(va_list args) {
+    ANativeWindow_performInterceptor interceptor = va_arg(args, ANativeWindow_performInterceptor);
+    void* data = va_arg(args, void*);
+    std::lock_guard<std::shared_mutex> lock(mInterceptorMutex);
+    mPerformInterceptor = interceptor;
+    mPerformInterceptorData = data;
+    return NO_ERROR;
+}
+
+int Surface::dispatchAddQueueInterceptor(va_list args) {
+    ANativeWindow_queueBufferInterceptor interceptor =
+            va_arg(args, ANativeWindow_queueBufferInterceptor);
+    void* data = va_arg(args, void*);
+    std::lock_guard<std::shared_mutex> lock(mInterceptorMutex);
+    mQueueInterceptor = interceptor;
+    mQueueInterceptorData = data;
+    return NO_ERROR;
+}
+
+int Surface::dispatchGetLastQueuedBuffer(va_list args) {
+    AHardwareBuffer** buffer = va_arg(args, AHardwareBuffer**);
+    int* fence = va_arg(args, int*);
+    float* matrix = va_arg(args, float*);
+    sp<GraphicBuffer> graphicBuffer;
+    sp<Fence> spFence;
+
+    int result = mGraphicBufferProducer->getLastQueuedBuffer(&graphicBuffer, &spFence, matrix);
+
+    if (graphicBuffer != nullptr) {
+        *buffer = reinterpret_cast<AHardwareBuffer*>(graphicBuffer.get());
+        AHardwareBuffer_acquire(*buffer);
+    } else {
+        *buffer = nullptr;
+    }
+
+    if (spFence != nullptr) {
+        *fence = spFence->dup();
+    } else {
+        *fence = -1;
+    }
+    return result;
 }
 
 bool Surface::transformToDisplayInverse() {
@@ -2062,6 +2222,17 @@ void Surface::ProducerListenerProxy::onBuffersDiscarded(const std::vector<int32_
     }
 
     mSurfaceListener->onBuffersDiscarded(discardedBufs);
+}
+
+status_t Surface::setFrameRate(float frameRate, int8_t compatibility) {
+    ATRACE_CALL();
+    ALOGV("Surface::setFrameRate");
+
+    if (!ValidateFrameRate(frameRate, compatibility, "Surface::setFrameRate")) {
+        return BAD_VALUE;
+    }
+
+    return composerService()->setFrameRate(mGraphicBufferProducer, frameRate, compatibility);
 }
 
 }; // namespace android

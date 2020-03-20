@@ -19,9 +19,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-
 #include <log/log.h>
-
 #include <utils/Errors.h>
 
 #include "AsyncCallRecorder.h"
@@ -85,7 +83,8 @@ protected:
     void expectHotplugEventReceivedByConnection(PhysicalDisplayId expectedDisplayId,
                                                 bool expectedConnected);
     void expectConfigChangedEventReceivedByConnection(PhysicalDisplayId expectedDisplayId,
-                                                      int32_t expectedConfigId);
+                                                      int32_t expectedConfigId,
+                                                      nsecs_t expectedVsyncPeriod);
 
     AsyncCallRecorder<void (*)(bool)> mVSyncSetEnabledCallRecorder;
     AsyncCallRecorder<void (*)(VSyncSource::Callback*)> mVSyncSetCallbackCallRecorder;
@@ -209,13 +208,15 @@ void EventThreadTest::expectHotplugEventReceivedByConnection(PhysicalDisplayId e
 }
 
 void EventThreadTest::expectConfigChangedEventReceivedByConnection(
-        PhysicalDisplayId expectedDisplayId, int32_t expectedConfigId) {
+        PhysicalDisplayId expectedDisplayId, int32_t expectedConfigId,
+        nsecs_t expectedVsyncPeriod) {
     auto args = mConnectionEventCallRecorder.waitForCall();
     ASSERT_TRUE(args.has_value());
     const auto& event = std::get<0>(args.value());
     EXPECT_EQ(DisplayEventReceiver::DISPLAY_EVENT_CONFIG_CHANGED, event.header.type);
     EXPECT_EQ(expectedDisplayId, event.header.displayId);
     EXPECT_EQ(expectedConfigId, event.config.configId);
+    EXPECT_EQ(expectedVsyncPeriod, event.config.vsyncPeriod);
 }
 
 namespace {
@@ -398,6 +399,34 @@ TEST_F(EventThreadTest, connectionsRemovedIfEventDeliveryError) {
     expectVSyncSetEnabledCallReceived(false);
 }
 
+TEST_F(EventThreadTest, tracksEventConnections) {
+    EXPECT_EQ(1, mThread->getEventThreadConnectionCount());
+    ConnectionEventRecorder errorConnectionEventRecorder{NO_MEMORY};
+    sp<MockEventThreadConnection> errorConnection =
+            createConnection(errorConnectionEventRecorder,
+                             ISurfaceComposer::eConfigChangedSuppress);
+    mThread->setVsyncRate(1, errorConnection);
+    EXPECT_EQ(2, mThread->getEventThreadConnectionCount());
+    ConnectionEventRecorder secondConnectionEventRecorder{0};
+    sp<MockEventThreadConnection> secondConnection =
+            createConnection(secondConnectionEventRecorder,
+                             ISurfaceComposer::eConfigChangedSuppress);
+    mThread->setVsyncRate(1, secondConnection);
+    EXPECT_EQ(3, mThread->getEventThreadConnectionCount());
+
+    // EventThread should enable vsync callbacks.
+    expectVSyncSetEnabledCallReceived(true);
+
+    // The first event will be seen by the interceptor, and by the connection,
+    // which then returns an error.
+    mCallback->onVSyncEvent(123);
+    expectInterceptCallReceived(123);
+    expectVsyncEventReceivedByConnection("errorConnection", errorConnectionEventRecorder, 123, 1u);
+    expectVsyncEventReceivedByConnection("successConnection", secondConnectionEventRecorder, 123,
+                                         1u);
+    EXPECT_EQ(2, mThread->getEventThreadConnectionCount());
+}
+
 TEST_F(EventThreadTest, eventsDroppedIfNonfatalEventDeliveryError) {
     ConnectionEventRecorder errorConnectionEventRecorder{WOULD_BLOCK};
     sp<MockEventThreadConnection> errorConnection =
@@ -450,18 +479,18 @@ TEST_F(EventThreadTest, postHotplugExternalConnect) {
 }
 
 TEST_F(EventThreadTest, postConfigChangedPrimary) {
-    mThread->onConfigChanged(INTERNAL_DISPLAY_ID, HwcConfigIndexType(7));
-    expectConfigChangedEventReceivedByConnection(INTERNAL_DISPLAY_ID, 7);
+    mThread->onConfigChanged(INTERNAL_DISPLAY_ID, HwcConfigIndexType(7), 16666666);
+    expectConfigChangedEventReceivedByConnection(INTERNAL_DISPLAY_ID, 7, 16666666);
 }
 
 TEST_F(EventThreadTest, postConfigChangedExternal) {
-    mThread->onConfigChanged(EXTERNAL_DISPLAY_ID, HwcConfigIndexType(5));
-    expectConfigChangedEventReceivedByConnection(EXTERNAL_DISPLAY_ID, 5);
+    mThread->onConfigChanged(EXTERNAL_DISPLAY_ID, HwcConfigIndexType(5), 16666666);
+    expectConfigChangedEventReceivedByConnection(EXTERNAL_DISPLAY_ID, 5, 16666666);
 }
 
 TEST_F(EventThreadTest, postConfigChangedPrimary64bit) {
-    mThread->onConfigChanged(DISPLAY_ID_64BIT, HwcConfigIndexType(7));
-    expectConfigChangedEventReceivedByConnection(DISPLAY_ID_64BIT, 7);
+    mThread->onConfigChanged(DISPLAY_ID_64BIT, HwcConfigIndexType(7), 16666666);
+    expectConfigChangedEventReceivedByConnection(DISPLAY_ID_64BIT, 7, 16666666);
 }
 
 TEST_F(EventThreadTest, suppressConfigChanged) {
@@ -470,8 +499,8 @@ TEST_F(EventThreadTest, suppressConfigChanged) {
             createConnection(suppressConnectionEventRecorder,
                              ISurfaceComposer::eConfigChangedSuppress);
 
-    mThread->onConfigChanged(INTERNAL_DISPLAY_ID, HwcConfigIndexType(9));
-    expectConfigChangedEventReceivedByConnection(INTERNAL_DISPLAY_ID, 9);
+    mThread->onConfigChanged(INTERNAL_DISPLAY_ID, HwcConfigIndexType(9), 16666666);
+    expectConfigChangedEventReceivedByConnection(INTERNAL_DISPLAY_ID, 9, 16666666);
 
     auto args = suppressConnectionEventRecorder.waitForCall();
     ASSERT_FALSE(args.has_value());

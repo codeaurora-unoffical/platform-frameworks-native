@@ -229,7 +229,7 @@ public:
     // found on devices with wide color gamut (e.g. Display-P3) display.
     static bool hasWideColorDisplay;
 
-    static int primaryDisplayOrientation;
+    static ui::Rotation internalDisplayOrientation;
 
     // Indicate if device wants color management on its display.
     static bool useColorManagement;
@@ -247,6 +247,11 @@ public:
     // hardware composer will accept layers with the data space and pixel format.
     static ui::Dataspace wideColorGamutCompositionDataspace;
     static ui::PixelFormat wideColorGamutCompositionPixelFormat;
+
+    // Whether to use frame rate API when deciding about the refresh rate of the display. This
+    // variable is caches in SF, so that we can check it with each layer creation, and a void the
+    // overhead that is caused by reading from sysprop.
+    static bool useFrameRateApi;
 
     static char const* getServiceName() ANDROID_API {
         return "SurfaceFlinger";
@@ -323,6 +328,10 @@ public:
     // Inherit from ClientCache::ErasedRecipient
     void bufferErased(const client_cache_t& clientCacheId) override;
 
+    // If set, disables reusing client composition buffers. This can be set by
+    // debug.sf.disable_client_composition_cache
+    bool mDisableClientCompositionCache = false;
+
 private:
     friend class BufferLayer;
     friend class BufferQueueLayer;
@@ -342,7 +351,6 @@ private:
     // every half hour.
     enum { LOG_FRAME_STATS_PERIOD =  30*60*60 };
 
-    static const size_t MAX_LAYERS = 4096;
     static const int MAX_TRACING_MEMORY = 100 * 1024 * 1024; // 100MB
 
 protected:
@@ -380,19 +388,9 @@ private:
 
         renderengine::ShadowSettings globalShadowSettings;
 
+        void traverse(const LayerVector::Visitor& visitor) const;
         void traverseInZOrder(const LayerVector::Visitor& visitor) const;
         void traverseInReverseZOrder(const LayerVector::Visitor& visitor) const;
-    };
-
-    struct DesiredDisplayConfigSpecs {
-        int32_t defaultModeId;
-        float minRefreshRate;
-        float maxRefreshRate;
-
-        bool operator==(const DesiredDisplayConfigSpecs& other) const {
-            return defaultModeId == other.defaultModeId && minRefreshRate == other.minRefreshRate &&
-                    maxRefreshRate == other.maxRefreshRate;
-        }
     };
 
     /* ------------------------------------------------------------------------
@@ -426,10 +424,10 @@ private:
             ISurfaceComposer::ConfigChanged configChanged =
                     ISurfaceComposer::eConfigChangedSuppress) override;
     status_t captureScreen(const sp<IBinder>& displayToken, sp<GraphicBuffer>* outBuffer,
-            bool& outCapturedSecureLayers, const ui::Dataspace reqDataspace,
-            const ui::PixelFormat reqPixelFormat, Rect sourceCrop,
-            uint32_t reqWidth, uint32_t reqHeight,
-            bool useIdentityTransform, ISurfaceComposer::Rotation rotation, bool captureSecureLayers) override;
+                           bool& outCapturedSecureLayers, ui::Dataspace reqDataspace,
+                           ui::PixelFormat reqPixelFormat, const Rect& sourceCrop,
+                           uint32_t reqWidth, uint32_t reqHeight, bool useIdentityTransform,
+                           ui::Rotation rotation, bool captureSecureLayers) override;
     status_t captureScreen(uint64_t displayOrLayerStack, ui::Dataspace* outDataspace,
                            sp<GraphicBuffer>* outBuffer) override;
     status_t captureLayers(
@@ -440,17 +438,22 @@ private:
             float frameScale, bool childrenOnly) override;
 
     status_t getDisplayStats(const sp<IBinder>& displayToken, DisplayStatInfo* stats) override;
-    status_t getDisplayConfigs(const sp<IBinder>& displayToken,
-                               Vector<DisplayInfo>* configs) override;
+    status_t getDisplayState(const sp<IBinder>& displayToken, ui::DisplayState*) override;
+    status_t getDisplayInfo(const sp<IBinder>& displayToken, DisplayInfo*) override;
+    status_t getDisplayConfigs(const sp<IBinder>& displayToken, Vector<DisplayConfig>*) override;
     int getActiveConfig(const sp<IBinder>& displayToken) override;
-    status_t getDisplayColorModes(const sp<IBinder>& displayToken,
-                                  Vector<ui::ColorMode>* configs) override;
+    status_t getDisplayColorModes(const sp<IBinder>& displayToken, Vector<ui::ColorMode>*) override;
     status_t getDisplayNativePrimaries(const sp<IBinder>& displayToken,
-                                       ui::DisplayPrimaries &primaries);
+                                       ui::DisplayPrimaries&) override;
     ui::ColorMode getActiveColorMode(const sp<IBinder>& displayToken) override;
     status_t setActiveColorMode(const sp<IBinder>& displayToken, ui::ColorMode colorMode) override;
+    status_t getAutoLowLatencyModeSupport(const sp<IBinder>& displayToken,
+                                          bool* outSupported) const override;
+    void setAutoLowLatencyMode(const sp<IBinder>& displayToken, bool on) override;
+    status_t getGameContentTypeSupport(const sp<IBinder>& displayToken,
+                                       bool* outSupported) const override;
+    void setGameContentType(const sp<IBinder>& displayToken, bool on) override;
     void setPowerMode(const sp<IBinder>& displayToken, int mode) override;
-    status_t setActiveConfig(const sp<IBinder>& displayToken, int id) override;
     status_t clearAnimationFrameStats() override;
     status_t getAnimationFrameStats(FrameStats* outStats) const override;
     status_t getHdrCapabilities(const sp<IBinder>& displayToken,
@@ -478,14 +481,10 @@ private:
     status_t addRegionSamplingListener(const Rect& samplingArea, const sp<IBinder>& stopLayerHandle,
                                        const sp<IRegionSamplingListener>& listener) override;
     status_t removeRegionSamplingListener(const sp<IRegionSamplingListener>& listener) override;
-    status_t setAllowedDisplayConfigs(const sp<IBinder>& displayToken,
-                                      const std::vector<int32_t>& allowedConfigs) override;
-    status_t getAllowedDisplayConfigs(const sp<IBinder>& displayToken,
-                                      std::vector<int32_t>* outAllowedConfigs) override;
     status_t setDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken, int32_t displayModeId,
                                           float minRefreshRate, float maxRefreshRate) override;
     status_t getDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken,
-                                          int32_t* outDefaultModeId, float* outMinRefreshRate,
+                                          int32_t* outDefaultConfig, float* outMinRefreshRate,
                                           float* outMaxRefreshRate) override;
     status_t getDisplayBrightnessSupport(const sp<IBinder>& displayToken,
                                          bool* outSupport) const override;
@@ -493,6 +492,8 @@ private:
     status_t notifyPowerHint(int32_t hintId) override;
     status_t setGlobalShadowSettings(const half4& ambientColor, const half4& spotColor,
                                      float lightPosY, float lightPosZ, float lightRadius) override;
+    status_t setFrameRate(const sp<IGraphicBufferProducer>& surface, float frameRate,
+                          int8_t compatibility) override;
     /* ------------------------------------------------------------------------
      * DeathRecipient interface
      */
@@ -514,6 +515,7 @@ private:
     void onVsyncPeriodTimingChangedReceived(
             int32_t sequenceId, hwc2_display_t display,
             const hwc_vsync_period_change_timeline_t& updatedTimeline) override;
+    void onSeamlessPossible(int32_t sequenceId, hwc2_display_t display) override;
 
     /* ------------------------------------------------------------------------
      * ISchedulerCallback
@@ -521,6 +523,8 @@ private:
     void changeRefreshRate(const Scheduler::RefreshRate&, Scheduler::ConfigEvent) override;
     // force full composition on all displays without resetting the scheduler idle timer.
     void repaintEverythingForHWC() override;
+    // Called when kernel idle timer has expired. Used to update the refresh rate overlay.
+    void kernelTimerChanged(bool expired) override;
     /* ------------------------------------------------------------------------
      * Message handling
      */
@@ -546,6 +550,7 @@ private:
     void onInitializeDisplays() REQUIRES(mStateLock);
     // Sets the desired active config bit. It obtains the lock, and sets mDesiredActiveConfig.
     void setDesiredActiveConfig(const ActiveConfigInfo& info) REQUIRES(mStateLock);
+    status_t setActiveConfig(const sp<IBinder>& displayToken, int id);
     // Once HWC has returned the present fence, this sets the active config and a new refresh
     // rate in SF.
     void setActiveConfigInternal() REQUIRES(mStateLock);
@@ -559,10 +564,16 @@ private:
     // called on the main thread in response to setPowerMode()
     void setPowerModeInternal(const sp<DisplayDevice>& display, int mode) REQUIRES(mStateLock);
 
-    // called on the main thread in response to setAllowedDisplayConfigs()
-    void setAllowedDisplayConfigsInternal(const sp<DisplayDevice>& display,
-                                          const std::vector<int32_t>& allowedConfigs)
-            REQUIRES(mStateLock);
+    // Sets the desired display configs.
+    status_t setDesiredDisplayConfigSpecsInternal(const sp<DisplayDevice>& display,
+                                                  HwcConfigIndexType defaultConfig,
+                                                  float minRefreshRate, float maxRefreshRate)
+            EXCLUDES(mStateLock);
+
+    // called on the main thread in response to setAutoLowLatencyMode()
+    void setAutoLowLatencyModeInternal(const sp<IBinder>& displayToken, bool on);
+    // called on the main thread in response to setGameContentType()
+    void setGameContentTypeInternal(const sp<IBinder>& displayToken, bool on);
 
     // Returns whether the transaction actually modified any state
     bool handleMessageTransaction();
@@ -645,9 +656,9 @@ private:
                                     sp<IBinder>* outHandle, uint32_t* outTransformHint,
                                     sp<Layer>* outLayer);
 
-    status_t createColorLayer(const sp<Client>& client, std::string name, uint32_t w, uint32_t h,
-                              uint32_t flags, LayerMetadata metadata, sp<IBinder>* outHandle,
-                              sp<Layer>* outLayer);
+    status_t createEffectLayer(const sp<Client>& client, std::string name, uint32_t w, uint32_t h,
+                               uint32_t flags, LayerMetadata metadata, sp<IBinder>* outHandle,
+                               sp<Layer>* outLayer);
 
     status_t createContainerLayer(const sp<Client>& client, std::string name, uint32_t w,
                                   uint32_t h, uint32_t flags, LayerMetadata metadata,
@@ -750,6 +761,8 @@ private:
         return nullptr;
     }
 
+    std::optional<DeviceProductInfo> getDeviceProductInfoLocked(const DisplayDevice&) const;
+
     // mark a region of a layer stack dirty. this updates the dirty
     // region of all screens presenting this layer stack.
     void invalidateLayerStack(const sp<const Layer>& layer, const Region& dirty);
@@ -798,7 +811,8 @@ private:
      * Display management
      */
     sp<DisplayDevice> setupNewDisplayDeviceInternal(
-            const wp<IBinder>& displayToken, const std::optional<DisplayId>& displayId,
+            const wp<IBinder>& displayToken,
+            std::shared_ptr<compositionengine::Display> compositionDisplay,
             const DisplayDeviceState& state,
             const sp<compositionengine::DisplaySurface>& dispSurface,
             const sp<IGraphicBufferProducer>& producer);
@@ -906,6 +920,8 @@ private:
     LayersProto dumpDrawingStateProto(uint32_t traceFlags = SurfaceTracing::TRACE_ALL) const;
     void dumpOffscreenLayersProto(LayersProto& layersProto,
                                   uint32_t traceFlags = SurfaceTracing::TRACE_ALL) const;
+    // Dumps state from HW Composer
+    void dumpHwc(std::string& result) const;
     LayersProto dumpProtoFromMainThread(uint32_t traceFlags = SurfaceTracing::TRACE_ALL)
             EXCLUDES(mStateLock);
     void dumpOffscreenLayers(std::string& result) EXCLUDES(mStateLock);
@@ -959,7 +975,7 @@ private:
 
     // Can't be unordered_set because wp<> isn't hashable
     std::set<wp<IBinder>> mGraphicBufferProducerList;
-    size_t mMaxGraphicBufferProducerListSize = MAX_LAYERS;
+    size_t mMaxGraphicBufferProducerListSize = ISurfaceComposer::MAX_LAYERS;
 
     // protected by mStateLock (but we could use another lock)
     bool mLayersRemoved = false;
@@ -970,6 +986,7 @@ private:
     // constant members (no synchronization needed for access)
     const nsecs_t mBootTime = systemTime();
     bool mGpuToCpuSupported = false;
+    bool mIsUserBuild = true;
 
     // Can only accessed from the main thread, these members
     // don't need synchronization
@@ -989,6 +1006,10 @@ private:
     // Note that it is possible for a frame to be composed via both client and device
     // composition, for example in the case of overlays.
     bool mHadDeviceComposition = false;
+    // True if in the previous frame, the client composition was skipped by reusing the buffer
+    // used in a previous composition. This can happed if the client composition requests
+    // did not change.
+    bool mReusedClientComposition = false;
 
     enum class BootStage {
         BOOTLOADER,
@@ -1027,6 +1048,10 @@ private:
     const std::shared_ptr<TimeStats> mTimeStats;
     const std::unique_ptr<FrameTracer> mFrameTracer;
     bool mUseHwcVirtualDisplays = false;
+    // Disable blurs, for debugging
+    bool mEnableBlurs = false;
+    // If blurs are considered expensive and should require high GPU frequency.
+    bool mBlursAreExpensive = false;
     std::atomic<uint32_t> mFrameMissedCount = 0;
     std::atomic<uint32_t> mHwcFrameMissedCount = 0;
     std::atomic<uint32_t> mGpuFrameMissedCount = 0;
@@ -1130,7 +1155,7 @@ private:
     scheduler::ConnectionHandle mSfConnectionHandle;
 
     // Stores phase offsets configured per refresh rate.
-    const std::unique_ptr<scheduler::PhaseOffsets> mPhaseOffsets;
+    std::unique_ptr<scheduler::PhaseConfiguration> mPhaseConfiguration;
 
     // Optional to defer construction until scheduler connections are created.
     std::optional<scheduler::VSyncModulator> mVSyncModulator;
@@ -1140,10 +1165,14 @@ private:
 
     std::atomic<nsecs_t> mExpectedPresentTime = 0;
 
-    // All configs are allowed if the set is empty.
-    using DisplayConfigs = std::set<HwcConfigIndexType>;
-    DisplayConfigs mAllowedDisplayConfigs GUARDED_BY(mStateLock);
-    DesiredDisplayConfigSpecs mDesiredDisplayConfigSpecs GUARDED_BY(mStateLock);
+    /* ------------------------------------------------------------------------
+     * Generic Layer Metadata
+     */
+    const std::unordered_map<std::string, uint32_t>& getGenericLayerMetadataKeyMap() const;
+
+    /* ------------------------------------------------------------------------
+     * Misc
+     */
 
     std::mutex mActiveConfigLock;
     // This bit is set once we start setting the config. We read from this bit during the
@@ -1162,6 +1191,9 @@ private:
     sp<RegionSamplingThread> mRegionSamplingThread;
     ui::DisplayPrimaries mInternalDisplayPrimaries;
 
+    const float mInternalDisplayDensity;
+    const float mEmulatedDisplayDensity;
+
     sp<IInputFlinger> mInputFlinger;
     InputWindowCommands mPendingInputWindowCommands GUARDED_BY(mStateLock);
     // Should only be accessed by the main thread.
@@ -1178,7 +1210,7 @@ private:
 
     const sp<SetInputWindowsListener> mSetInputWindowsListener = new SetInputWindowsListener(this);
 
-    bool mPendingSyncInputWindows GUARDED_BY(mStateLock);
+    bool mPendingSyncInputWindows GUARDED_BY(mStateLock) = false;
     Hwc2::impl::PowerAdvisor mPowerAdvisor;
 
     // This should only be accessed on the main thread.
@@ -1198,6 +1230,16 @@ private:
     // Flags to capture the state of Vsync in HWC
     HWC2::Vsync mHWCVsyncState = HWC2::Vsync::Disable;
     HWC2::Vsync mHWCVsyncPendingState = HWC2::Vsync::Disable;
+
+    // Fields tracking the current jank event: when it started and how many
+    // janky frames there are.
+    nsecs_t mMissedFrameJankStart = 0;
+    int32_t mMissedFrameJankCount = 0;
+
+    // See updateInputWindowInfo() for details
+    std::atomic<bool> mInputDirty = true;
+    void dirtyInput() { mInputDirty = true; }
+    bool inputDirty() { return mInputDirty; }
 };
 
 } // namespace android

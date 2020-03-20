@@ -21,7 +21,6 @@ cc_test {
         "CommonTypes_test.cpp",
         "Credentials_test.cpp",
         "DereferenceSurfaceControl_test.cpp",
-        "DisplayActiveConfig_test.cpp",
         "DisplayConfigs_test.cpp",
         "InvalidHandles_test.cpp",
         "LayerCallback_test.cpp",
@@ -33,6 +32,7 @@ cc_test {
         "MirrorLayer_test.cpp",
         "MultiDisplayLayerBounds_test.cpp",
         "RelativeZ_test.cpp",
+        "SetFrameRate_test.cpp",
         "SetGeometry_test.cpp",
         "Stress_test.cpp",
         "SurfaceInterceptor_test.cpp",
@@ -43,6 +43,7 @@ cc_test {
         "libtrace_proto",
     ],
     shared_libs: [
+        "android.hardware.graphics.common-ndk_platform",
         "android.hardware.graphics.common@1.2",
         "android.hardware.graphics.composer@2.1",
         "libandroid",
@@ -53,19 +54,21 @@ cc_test {
         "libgui",
         "liblayers_proto",
         "liblog",
+        "libnativewindow",
         "libprotobuf-cpp-full",
-        "libtimestats_proto",
         "libui",
         "libutils",
-        "vintf-graphics-common-ndk_platform",
-    ]
+    ],
+    header_libs: [
+        "libnativewindow_headers",
+    ],
 }
 
 cc_defaults {
     name: "ipc_defaults",
     cflags: [
         "-Wall",
-	"-Werror",
+        "-Werror",
     ],
 }
 
@@ -79,11 +82,11 @@ cc_test {
     ],
     cppflags: [
         "-Wall",
-	"-Werror",
-	"-Wformat",
-	"-Wthread-safety",
-	"-Wunused",
-	"-Wunreachable-code",
+        "-Werror",
+        "-Wformat",
+        "-Wthread-safety",
+        "-Wunused",
+        "-Wunreachable-code",
     ],
     shared_libs: [
         "libandroid",
@@ -95,7 +98,6 @@ cc_test {
         "liblayers_proto",
         "liblog",
         "libprotobuf-cpp-full",
-        "libtimestats_proto",
         "libui",
         "libutils",
     ],

@@ -14,11 +14,16 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
 
 #include <gtest/gtest.h>
+#include <cutils/properties.h>
 #include <renderengine/RenderEngine.h>
 #include <sync/sync.h>
 #include <ui/PixelFormat.h>
@@ -40,6 +45,7 @@ struct RenderEngineTest : public ::testing::Test {
                     .setUseColorManagerment(false)
                     .setEnableProtectedContext(false)
                     .setPrecacheToneMapperShaderOnly(false)
+                    .setSupportsBackgroundBlur(true)
                     .setContextPriority(renderengine::RenderEngine::ContextPriority::MEDIUM)
         .build());
     }
@@ -243,7 +249,8 @@ struct RenderEngineTest : public ::testing::Test {
     }
 
     void invokeDraw(renderengine::DisplaySettings settings,
-                    std::vector<renderengine::LayerSettings> layers, sp<GraphicBuffer> buffer) {
+                    std::vector<const renderengine::LayerSettings*> layers,
+                    sp<GraphicBuffer> buffer) {
         base::unique_fd fence;
         status_t status = sRE->drawLayers(settings, layers, buffer->getNativeBuffer(), true,
                                           base::unique_fd(), &fence);
@@ -263,7 +270,7 @@ struct RenderEngineTest : public ::testing::Test {
 
     void drawEmptyLayers() {
         renderengine::DisplaySettings settings;
-        std::vector<renderengine::LayerSettings> layers;
+        std::vector<const renderengine::LayerSettings*> layers;
         // Meaningless buffer since we don't do any drawing
         sp<GraphicBuffer> buffer = new GraphicBuffer();
         invokeDraw(settings, layers, buffer);
@@ -322,6 +329,9 @@ struct RenderEngineTest : public ::testing::Test {
 
     template <typename SourceVariant>
     void fillBufferWithRoundedCorners();
+
+    template <typename SourceVariant>
+    void fillBufferAndBlurBackground();
 
     template <typename SourceVariant>
     void overlayCorners();
@@ -431,14 +441,14 @@ void RenderEngineTest::fillBuffer(half r, half g, half b, half a) {
     settings.physicalDisplay = fullscreenRect();
     settings.clip = fullscreenRect();
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     renderengine::LayerSettings layer;
     layer.geometry.boundaries = fullscreenRect().toFloatRect();
     SourceVariant::fillColor(layer, r, g, b, this);
     layer.alpha = a;
 
-    layers.push_back(layer);
+    layers.push_back(&layer);
 
     invokeDraw(settings, layers, mBuffer);
 }
@@ -473,14 +483,14 @@ void RenderEngineTest::fillRedOffsetBuffer() {
     settings.physicalDisplay = offsetRect();
     settings.clip = offsetRectAtZero();
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     renderengine::LayerSettings layer;
     layer.geometry.boundaries = offsetRectAtZero().toFloatRect();
     SourceVariant::fillColor(layer, 1.0f, 0.0f, 0.0f, this);
     layer.alpha = 1.0f;
 
-    layers.push_back(layer);
+    layers.push_back(&layer);
     invokeDraw(settings, layers, mBuffer);
 }
 
@@ -506,7 +516,7 @@ void RenderEngineTest::fillBufferCheckers(mat4 transform) {
     settings.clip = Rect(2, 2);
     settings.globalTransform = transform;
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     renderengine::LayerSettings layerOne;
     Rect rectOne(0, 0, 1, 1);
@@ -526,9 +536,9 @@ void RenderEngineTest::fillBufferCheckers(mat4 transform) {
     SourceVariant::fillColor(layerThree, 0.0f, 0.0f, 1.0f, this);
     layerThree.alpha = 1.0f;
 
-    layers.push_back(layerOne);
-    layers.push_back(layerTwo);
-    layers.push_back(layerThree);
+    layers.push_back(&layerOne);
+    layers.push_back(&layerTwo);
+    layers.push_back(&layerThree);
 
     invokeDraw(settings, layers, mBuffer);
 }
@@ -607,7 +617,7 @@ void RenderEngineTest::fillBufferWithLayerTransform() {
     // Here logical space is 2x2
     settings.clip = Rect(2, 2);
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     renderengine::LayerSettings layer;
     layer.geometry.boundaries = Rect(1, 1).toFloatRect();
@@ -617,7 +627,7 @@ void RenderEngineTest::fillBufferWithLayerTransform() {
     layer.source.solidColor = half3(1.0f, 0.0f, 0.0f);
     layer.alpha = 1.0f;
 
-    layers.push_back(layer);
+    layers.push_back(&layer);
 
     invokeDraw(settings, layers, mBuffer);
 }
@@ -638,7 +648,7 @@ void RenderEngineTest::fillBufferWithColorTransform() {
     settings.physicalDisplay = fullscreenRect();
     settings.clip = Rect(1, 1);
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     renderengine::LayerSettings layer;
     layer.geometry.boundaries = Rect(1, 1).toFloatRect();
@@ -654,7 +664,7 @@ void RenderEngineTest::fillBufferWithColorTransform() {
     layer.alpha = 1.0f;
     layer.geometry.boundaries = Rect(1, 1).toFloatRect();
 
-    layers.push_back(layer);
+    layers.push_back(&layer);
 
     invokeDraw(settings, layers, mBuffer);
 }
@@ -671,7 +681,7 @@ void RenderEngineTest::fillRedBufferWithRoundedCorners() {
     settings.physicalDisplay = fullscreenRect();
     settings.clip = fullscreenRect();
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     renderengine::LayerSettings layer;
     layer.geometry.boundaries = fullscreenRect().toFloatRect();
@@ -680,7 +690,7 @@ void RenderEngineTest::fillRedBufferWithRoundedCorners() {
     SourceVariant::fillColor(layer, 1.0f, 0.0f, 0.0f, this);
     layer.alpha = 1.0f;
 
-    layers.push_back(layer);
+    layers.push_back(&layer);
 
     invokeDraw(settings, layers, mBuffer);
 }
@@ -702,12 +712,57 @@ void RenderEngineTest::fillBufferWithRoundedCorners() {
 }
 
 template <typename SourceVariant>
+void RenderEngineTest::fillBufferAndBlurBackground() {
+        char value[PROPERTY_VALUE_MAX];
+    property_get("ro.surface_flinger.supports_background_blur", value, "0");
+    if (!atoi(value)) {
+        // This device doesn't support blurs, no-op.
+        return;
+    }
+
+    auto blurRadius = 50;
+    auto center = DEFAULT_DISPLAY_WIDTH / 2;
+
+    renderengine::DisplaySettings settings;
+    settings.physicalDisplay = fullscreenRect();
+    settings.clip = fullscreenRect();
+
+    std::vector<const renderengine::LayerSettings*> layers;
+
+    renderengine::LayerSettings backgroundLayer;
+    backgroundLayer.geometry.boundaries = fullscreenRect().toFloatRect();
+    SourceVariant::fillColor(backgroundLayer, 0.0f, 1.0f, 0.0f, this);
+    backgroundLayer.alpha = 1.0f;
+    layers.push_back(&backgroundLayer);
+
+    renderengine::LayerSettings leftLayer;
+    leftLayer.geometry.boundaries =
+            Rect(DEFAULT_DISPLAY_WIDTH / 2, DEFAULT_DISPLAY_HEIGHT).toFloatRect();
+    SourceVariant::fillColor(leftLayer, 1.0f, 0.0f, 0.0f, this);
+    leftLayer.alpha = 1.0f;
+    layers.push_back(&leftLayer);
+
+    renderengine::LayerSettings blurLayer;
+    blurLayer.geometry.boundaries = fullscreenRect().toFloatRect();
+    blurLayer.backgroundBlurRadius = blurRadius;
+    blurLayer.alpha = 0;
+    layers.push_back(&blurLayer);
+
+    invokeDraw(settings, layers, mBuffer);
+
+    expectBufferColor(Rect(center - 1, center - 5, center, center + 5), 150, 150, 0, 255,
+                      50 /* tolerance */);
+    expectBufferColor(Rect(center, center - 5, center + 1, center + 5), 150, 150, 0, 255,
+                      50 /* tolerance */);
+}
+
+template <typename SourceVariant>
 void RenderEngineTest::overlayCorners() {
     renderengine::DisplaySettings settings;
     settings.physicalDisplay = fullscreenRect();
     settings.clip = fullscreenRect();
 
-    std::vector<renderengine::LayerSettings> layersFirst;
+    std::vector<const renderengine::LayerSettings*> layersFirst;
 
     renderengine::LayerSettings layerOne;
     layerOne.geometry.boundaries =
@@ -715,14 +770,14 @@ void RenderEngineTest::overlayCorners() {
     SourceVariant::fillColor(layerOne, 1.0f, 0.0f, 0.0f, this);
     layerOne.alpha = 0.2;
 
-    layersFirst.push_back(layerOne);
+    layersFirst.push_back(&layerOne);
     invokeDraw(settings, layersFirst, mBuffer);
     expectBufferColor(Rect(DEFAULT_DISPLAY_WIDTH / 3, DEFAULT_DISPLAY_HEIGHT / 3), 51, 0, 0, 51);
     expectBufferColor(Rect(DEFAULT_DISPLAY_WIDTH / 3 + 1, DEFAULT_DISPLAY_HEIGHT / 3 + 1,
                            DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT),
                       0, 0, 0, 0);
 
-    std::vector<renderengine::LayerSettings> layersSecond;
+    std::vector<const renderengine::LayerSettings*> layersSecond;
     renderengine::LayerSettings layerTwo;
     layerTwo.geometry.boundaries =
             FloatRect(DEFAULT_DISPLAY_WIDTH / 3.0, DEFAULT_DISPLAY_HEIGHT / 3.0,
@@ -730,7 +785,7 @@ void RenderEngineTest::overlayCorners() {
     SourceVariant::fillColor(layerTwo, 0.0f, 1.0f, 0.0f, this);
     layerTwo.alpha = 1.0f;
 
-    layersSecond.push_back(layerTwo);
+    layersSecond.push_back(&layerTwo);
     invokeDraw(settings, layersSecond, mBuffer);
 
     expectBufferColor(Rect(DEFAULT_DISPLAY_WIDTH / 3, DEFAULT_DISPLAY_HEIGHT / 3), 0, 0, 0, 0);
@@ -744,7 +799,7 @@ void RenderEngineTest::fillRedBufferTextureTransform() {
     settings.physicalDisplay = fullscreenRect();
     settings.clip = Rect(1, 1);
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     renderengine::LayerSettings layer;
     // Here will allocate a checker board texture, but transform texture
@@ -779,7 +834,7 @@ void RenderEngineTest::fillRedBufferTextureTransform() {
     layer.alpha = 1.0f;
     layer.geometry.boundaries = Rect(1, 1).toFloatRect();
 
-    layers.push_back(layer);
+    layers.push_back(&layer);
 
     invokeDraw(settings, layers, mBuffer);
 }
@@ -795,7 +850,7 @@ void RenderEngineTest::fillRedBufferWithPremultiplyAlpha() {
     // Here logical space is 1x1
     settings.clip = Rect(1, 1);
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     renderengine::LayerSettings layer;
     sp<GraphicBuffer> buf = allocateSourceBuffer(1, 1);
@@ -818,7 +873,7 @@ void RenderEngineTest::fillRedBufferWithPremultiplyAlpha() {
     layer.alpha = 0.5f;
     layer.geometry.boundaries = Rect(1, 1).toFloatRect();
 
-    layers.push_back(layer);
+    layers.push_back(&layer);
 
     invokeDraw(settings, layers, mBuffer);
 }
@@ -834,7 +889,7 @@ void RenderEngineTest::fillRedBufferWithoutPremultiplyAlpha() {
     // Here logical space is 1x1
     settings.clip = Rect(1, 1);
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     renderengine::LayerSettings layer;
     sp<GraphicBuffer> buf = allocateSourceBuffer(1, 1);
@@ -857,7 +912,7 @@ void RenderEngineTest::fillRedBufferWithoutPremultiplyAlpha() {
     layer.alpha = 0.5f;
     layer.geometry.boundaries = Rect(1, 1).toFloatRect();
 
-    layers.push_back(layer);
+    layers.push_back(&layer);
 
     invokeDraw(settings, layers, mBuffer);
 }
@@ -874,10 +929,10 @@ void RenderEngineTest::clearLeftRegion() {
     settings.clip = Rect(4, 4);
     settings.globalTransform = mat4::scale(vec4(2, 4, 0, 1));
     settings.clearRegion = Region(Rect(1, 1));
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
     // dummy layer, without bounds should not render anything
     renderengine::LayerSettings layer;
-    layers.push_back(layer);
+    layers.push_back(&layer);
     invokeDraw(settings, layers, mBuffer);
 }
 
@@ -898,7 +953,7 @@ void RenderEngineTest::drawShadow(const renderengine::LayerSettings& castingLaye
     settings.physicalDisplay = fullscreenRect();
     settings.clip = fullscreenRect();
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     // add background layer
     renderengine::LayerSettings bgLayer;
@@ -906,20 +961,20 @@ void RenderEngineTest::drawShadow(const renderengine::LayerSettings& castingLaye
     ColorSourceVariant::fillColor(bgLayer, backgroundColor.r / 255.0f, backgroundColor.g / 255.0f,
                                   backgroundColor.b / 255.0f, this);
     bgLayer.alpha = backgroundColor.a / 255.0f;
-    layers.push_back(bgLayer);
+    layers.push_back(&bgLayer);
 
     // add shadow layer
     renderengine::LayerSettings shadowLayer;
     shadowLayer.geometry.boundaries = castingLayer.geometry.boundaries;
     shadowLayer.alpha = castingLayer.alpha;
     shadowLayer.shadow = shadow;
-    layers.push_back(shadowLayer);
+    layers.push_back(&shadowLayer);
 
     // add layer casting the shadow
     renderengine::LayerSettings layer = castingLayer;
     SourceVariant::fillColor(layer, casterColor.r / 255.0f, casterColor.g / 255.0f,
                              casterColor.b / 255.0f, this);
-    layers.push_back(layer);
+    layers.push_back(&layer);
 
     invokeDraw(settings, layers, mBuffer);
 }
@@ -930,11 +985,11 @@ TEST_F(RenderEngineTest, drawLayers_noLayersToDraw) {
 
 TEST_F(RenderEngineTest, drawLayers_nullOutputBuffer) {
     renderengine::DisplaySettings settings;
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
     renderengine::LayerSettings layer;
     layer.geometry.boundaries = fullscreenRect().toFloatRect();
     BufferSourceVariant<ForceOpaqueBufferVariant>::fillColor(layer, 1.0f, 0.0f, 0.0f, this);
-    layers.push_back(layer);
+    layers.push_back(&layer);
     base::unique_fd fence;
     status_t status = sRE->drawLayers(settings, layers, nullptr, true, base::unique_fd(), &fence);
 
@@ -946,12 +1001,12 @@ TEST_F(RenderEngineTest, drawLayers_nullOutputFence) {
     settings.physicalDisplay = fullscreenRect();
     settings.clip = fullscreenRect();
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
     renderengine::LayerSettings layer;
     layer.geometry.boundaries = fullscreenRect().toFloatRect();
     BufferSourceVariant<ForceOpaqueBufferVariant>::fillColor(layer, 1.0f, 0.0f, 0.0f, this);
     layer.alpha = 1.0;
-    layers.push_back(layer);
+    layers.push_back(&layer);
 
     status_t status = sRE->drawLayers(settings, layers, mBuffer->getNativeBuffer(), true,
                                       base::unique_fd(), nullptr);
@@ -965,12 +1020,12 @@ TEST_F(RenderEngineTest, drawLayers_doesNotCacheFramebuffer) {
     settings.physicalDisplay = fullscreenRect();
     settings.clip = fullscreenRect();
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
     renderengine::LayerSettings layer;
     layer.geometry.boundaries = fullscreenRect().toFloatRect();
     BufferSourceVariant<ForceOpaqueBufferVariant>::fillColor(layer, 1.0f, 0.0f, 0.0f, this);
     layer.alpha = 1.0;
-    layers.push_back(layer);
+    layers.push_back(&layer);
 
     status_t status = sRE->drawLayers(settings, layers, mBuffer->getNativeBuffer(), false,
                                       base::unique_fd(), nullptr);
@@ -1028,6 +1083,10 @@ TEST_F(RenderEngineTest, drawLayers_fillBufferRoundedCorners_colorSource) {
     fillBufferWithRoundedCorners<ColorSourceVariant>();
 }
 
+TEST_F(RenderEngineTest, drawLayers_fillBufferAndBlurBackground_colorSource) {
+    fillBufferAndBlurBackground<ColorSourceVariant>();
+}
+
 TEST_F(RenderEngineTest, drawLayers_overlayCorners_colorSource) {
     overlayCorners<ColorSourceVariant>();
 }
@@ -1078,6 +1137,10 @@ TEST_F(RenderEngineTest, drawLayers_fillBufferColorTransform_opaqueBufferSource)
 
 TEST_F(RenderEngineTest, drawLayers_fillBufferRoundedCorners_opaqueBufferSource) {
     fillBufferWithRoundedCorners<BufferSourceVariant<ForceOpaqueBufferVariant>>();
+}
+
+TEST_F(RenderEngineTest, drawLayers_fillBufferAndBlurBackground_opaqueBufferSource) {
+    fillBufferAndBlurBackground<BufferSourceVariant<ForceOpaqueBufferVariant>>();
 }
 
 TEST_F(RenderEngineTest, drawLayers_overlayCorners_opaqueBufferSource) {
@@ -1132,6 +1195,10 @@ TEST_F(RenderEngineTest, drawLayers_fillBufferRoundedCorners_bufferSource) {
     fillBufferWithRoundedCorners<BufferSourceVariant<RelaxOpaqueBufferVariant>>();
 }
 
+TEST_F(RenderEngineTest, drawLayers_fillBufferAndBlurBackground_bufferSource) {
+    fillBufferAndBlurBackground<BufferSourceVariant<RelaxOpaqueBufferVariant>>();
+}
+
 TEST_F(RenderEngineTest, drawLayers_overlayCorners_bufferSource) {
     overlayCorners<BufferSourceVariant<RelaxOpaqueBufferVariant>>();
 }
@@ -1157,13 +1224,13 @@ TEST_F(RenderEngineTest, drawLayers_fillsBufferAndCachesImages) {
     settings.physicalDisplay = fullscreenRect();
     settings.clip = fullscreenRect();
 
-    std::vector<renderengine::LayerSettings> layers;
+    std::vector<const renderengine::LayerSettings*> layers;
 
     renderengine::LayerSettings layer;
     layer.geometry.boundaries = fullscreenRect().toFloatRect();
     BufferSourceVariant<ForceOpaqueBufferVariant>::fillColor(layer, 1.0f, 0.0f, 0.0f, this);
 
-    layers.push_back(layer);
+    layers.push_back(&layer);
     invokeDraw(settings, layers, mBuffer);
     uint64_t bufferId = layer.source.buffer.buffer->getId();
     EXPECT_TRUE(sRE->isImageCachedForTesting(bufferId));
@@ -1339,3 +1406,6 @@ TEST_F(RenderEngineTest, drawLayers_fillShadow_translucentCasterWithAlpha) {
 }
 
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

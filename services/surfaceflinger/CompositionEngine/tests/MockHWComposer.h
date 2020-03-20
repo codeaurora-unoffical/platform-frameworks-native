@@ -19,7 +19,14 @@
 #include <compositionengine/Output.h>
 #include <gmock/gmock.h>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include "DisplayHardware/HWComposer.h"
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
 
 namespace android {
 namespace mock {
@@ -29,7 +36,7 @@ public:
     HWComposer();
     ~HWComposer() override;
 
-    MOCK_METHOD2(registerCallback, void(HWC2::ComposerCallback*, int32_t));
+    MOCK_METHOD2(setConfiguration, void(HWC2::ComposerCallback*, int32_t));
     MOCK_CONST_METHOD3(getDisplayIdentificationData,
                        bool(hwc2_display_t, uint8_t*, DisplayIdentificationData*));
     MOCK_CONST_METHOD1(hasCapability, bool(HWC2::Capability));
@@ -81,11 +88,17 @@ public:
     MOCK_CONST_METHOD1(getColorModes, std::vector<ui::ColorMode>(DisplayId));
     MOCK_METHOD3(setActiveColorMode, status_t(DisplayId, ui::ColorMode, ui::RenderIntent));
     MOCK_CONST_METHOD0(isUsingVrComposer, bool());
+    MOCK_CONST_METHOD1(getDisplayConnectionType, DisplayConnectionType(DisplayId));
     MOCK_CONST_METHOD1(isVsyncPeriodSwitchSupported, bool(DisplayId));
     MOCK_CONST_METHOD1(getDisplayVsyncPeriod, nsecs_t(DisplayId));
     MOCK_METHOD4(setActiveConfigWithConstraints,
                  status_t(DisplayId, size_t, const HWC2::VsyncPeriodChangeConstraints&,
                           HWC2::VsyncPeriodChangeTimeline*));
+    MOCK_METHOD2(setAutoLowLatencyMode, status_t(DisplayId, bool));
+    MOCK_METHOD2(getSupportedContentTypes, status_t(DisplayId, std::vector<HWC2::ContentType>*));
+    MOCK_METHOD2(setContentType, status_t(DisplayId, HWC2::ContentType));
+    MOCK_CONST_METHOD0(getSupportedLayerGenericMetadata,
+                       const std::unordered_map<std::string, bool>&());
 
     MOCK_CONST_METHOD1(dump, void(std::string&));
     MOCK_CONST_METHOD0(getComposer, android::Hwc2::Composer*());

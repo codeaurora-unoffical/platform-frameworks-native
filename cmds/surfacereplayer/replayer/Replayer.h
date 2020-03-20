@@ -94,6 +94,8 @@ class Replayer {
             layer_id id, const CropChange& cc);
     void setCornerRadius(SurfaceComposerClient::Transaction& t,
             layer_id id, const CornerRadiusChange& cc);
+    void setBackgroundBlurRadius(SurfaceComposerClient::Transaction& t,
+            layer_id id, const BackgroundBlurRadiusChange& cc);
     void setMatrix(SurfaceComposerClient::Transaction& t,
             layer_id id, const MatrixChange& mc);
     void setOverrideScalingMode(SurfaceComposerClient::Transaction& t,
@@ -118,6 +120,8 @@ class Replayer {
             layer_id id, const DetachChildrenChange& c);
     void setReparentChildrenChange(SurfaceComposerClient::Transaction& t,
             layer_id id, const ReparentChildrenChange& c);
+    void setShadowRadiusChange(SurfaceComposerClient::Transaction& t,
+            layer_id id, const ShadowRadiusChange& c);
 
     void setDisplaySurface(SurfaceComposerClient::Transaction& t,
             display_id id, const DispSurfaceChange& dsc);
