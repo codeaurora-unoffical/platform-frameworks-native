@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 //#define LOG_NDEBUG 0
 #undef LOG_TAG
 #define LOG_TAG "Layer"
@@ -22,9 +26,9 @@
 #include "Layer.h"
 
 #include <android-base/stringprintf.h>
+#include <android/native_window.h>
 #include <binder/IPCThreadState.h>
 #include <compositionengine/Display.h>
-#include <compositionengine/Layer.h>
 #include <compositionengine/LayerFECompositionState.h>
 #include <compositionengine/OutputLayer.h>
 #include <compositionengine/impl/OutputLayerCompositionState.h>
@@ -53,10 +57,10 @@
 #include <sstream>
 
 #include "BufferLayer.h"
-#include "ColorLayer.h"
 #include "Colorizer.h"
 #include "DisplayDevice.h"
 #include "DisplayHardware/HWComposer.h"
+#include "EffectLayer.h"
 #include "FrameTracer/FrameTracer.h"
 #include "LayerProtoHelper.h"
 #include "LayerRejecter.h"
@@ -77,7 +81,6 @@ Layer::Layer(const LayerCreationArgs& args)
         mName(args.name),
         mClientRef(args.client),
         mWindowType(args.metadata.getInt32(METADATA_WINDOW_TYPE, 0)) {
-
     uint32_t layerFlags = 0;
     if (args.flags & ISurfaceComposerClient::eHidden) layerFlags |= layer_state_t::eLayerHidden;
     if (args.flags & ISurfaceComposerClient::eOpaque) layerFlags |= layer_state_t::eLayerOpaque;
@@ -97,6 +100,7 @@ Layer::Layer(const LayerCreationArgs& args)
     mCurrentState.active.w = UINT32_MAX;
     mCurrentState.active.h = UINT32_MAX;
     mCurrentState.active.transform.set(0, 0);
+    mCurrentState.frameNumber = 0;
     mCurrentState.transform = 0;
     mCurrentState.transformToDisplayInverse = false;
     mCurrentState.crop.makeInvalid();
@@ -105,9 +109,11 @@ Layer::Layer(const LayerCreationArgs& args)
     mCurrentState.hdrMetadata.validTypes = 0;
     mCurrentState.surfaceDamageRegion = Region::INVALID_REGION;
     mCurrentState.cornerRadius = 0.0f;
+    mCurrentState.backgroundBlurRadius = 0;
     mCurrentState.api = -1;
     mCurrentState.hasColorTransform = false;
     mCurrentState.colorSpaceAgnostic = false;
+    mCurrentState.frameRateSelectionPriority = PRIORITY_UNSET;
     mCurrentState.metadata = args.metadata;
     mCurrentState.shadowRadius = 0.f;
 
@@ -137,7 +143,7 @@ Layer::~Layer() {
     mFlinger->onLayerDestroyed(this);
 }
 
-LayerCreationArgs::LayerCreationArgs(SurfaceFlinger* flinger, const sp<Client>& client,
+LayerCreationArgs::LayerCreationArgs(SurfaceFlinger* flinger, const sp<Client> client,
                                      std::string name, uint32_t w, uint32_t h, uint32_t flags,
                                      LayerMetadata metadata)
       : flinger(flinger),
@@ -159,7 +165,7 @@ LayerCreationArgs::LayerCreationArgs(SurfaceFlinger* flinger, const sp<Client>& 
 /*
  * onLayerDisplayed is only meaningful for BufferLayer, but, is called through
  * Layer.  So, the implementation is done in BufferLayer.  When called on a
- * ColorLayer object, it's essentially a NOP.
+ * EffectLayer object, it's essentially a NOP.
  */
 void Layer::onLayerDisplayed(const sp<Fence>& /*releaseFence*/) {}
 
@@ -408,7 +414,7 @@ void Layer::setupRoundedCornersCropCoordinates(Rect win,
     win.bottom -= roundedCornersCrop.top;
 }
 
-void Layer::latchBasicGeometry(compositionengine::LayerFECompositionState& compositionState) const {
+void Layer::prepareBasicGeometryCompositionState() {
     const auto& drawingState{getDrawingState()};
     const uint32_t layerStack = getLayerStack();
     const auto alpha = static_cast<float>(getAlpha());
@@ -421,29 +427,28 @@ void Layer::latchBasicGeometry(compositionengine::LayerFECompositionState& compo
                                         : Hwc2::IComposerClient::BlendMode::COVERAGE;
     }
 
-    // TODO(b/121291683): Instead of filling in a passed-in compositionState
-    // structure, switch to Layer owning the structure and have
-    // CompositionEngine be able to get a reference to it.
-
-    compositionState.layerStackId =
+    auto* compositionState = editCompositionState();
+    compositionState->layerStackId =
             (layerStack != ~0u) ? std::make_optional(layerStack) : std::nullopt;
-    compositionState.internalOnly = getPrimaryDisplayOnly();
-    compositionState.isVisible = isVisible();
-    compositionState.isOpaque = opaque && !usesRoundedCorners && alpha == 1.f;
+    compositionState->internalOnly = getPrimaryDisplayOnly();
+    compositionState->isVisible = isVisible();
+    compositionState->isOpaque = opaque && !usesRoundedCorners && alpha == 1.f;
+    compositionState->shadowRadius = mEffectiveShadowRadius;
 
-    compositionState.contentDirty = contentDirty;
+    compositionState->contentDirty = contentDirty;
     contentDirty = false;
 
-    compositionState.geomLayerBounds = mBounds;
-    compositionState.geomLayerTransform = getTransform();
-    compositionState.geomInverseLayerTransform = compositionState.geomLayerTransform.inverse();
-    compositionState.transparentRegionHint = getActiveTransparentRegion(drawingState);
+    compositionState->geomLayerBounds = mBounds;
+    compositionState->geomLayerTransform = getTransform();
+    compositionState->geomInverseLayerTransform = compositionState->geomLayerTransform.inverse();
+    compositionState->transparentRegionHint = getActiveTransparentRegion(drawingState);
 
-    compositionState.blendMode = static_cast<Hwc2::IComposerClient::BlendMode>(blendMode);
-    compositionState.alpha = alpha;
+    compositionState->blendMode = static_cast<Hwc2::IComposerClient::BlendMode>(blendMode);
+    compositionState->alpha = alpha;
+    compositionState->backgroundBlurRadius = drawingState.backgroundBlurRadius;
 }
 
-void Layer::latchGeometry(compositionengine::LayerFECompositionState& compositionState) const {
+void Layer::prepareGeometryCompositionState() {
     const auto& drawingState{getDrawingState()};
 
     int type = drawingState.metadata.getInt32(METADATA_WINDOW_TYPE, 0);
@@ -459,45 +464,67 @@ void Layer::latchGeometry(compositionengine::LayerFECompositionState& compositio
         }
     }
 
-    compositionState.geomBufferSize = getBufferSize(drawingState);
-    compositionState.geomContentCrop = getBufferCrop();
-    compositionState.geomCrop = getCrop(drawingState);
-    compositionState.geomBufferTransform = getBufferTransform();
-    compositionState.geomBufferUsesDisplayInverseTransform = getTransformToDisplayInverse();
-    compositionState.geomUsesSourceCrop = usesSourceCrop();
-    compositionState.isSecure = isSecure();
+    auto* compositionState = editCompositionState();
 
-    compositionState.type = type;
-    compositionState.appId = appId;
-}
+    compositionState->geomBufferSize = getBufferSize(drawingState);
+    compositionState->geomContentCrop = getBufferCrop();
+    compositionState->geomCrop = getCrop(drawingState);
+    compositionState->geomBufferTransform = getBufferTransform();
+    compositionState->geomBufferUsesDisplayInverseTransform = getTransformToDisplayInverse();
+    compositionState->geomUsesSourceCrop = usesSourceCrop();
+    compositionState->isSecure = isSecure();
 
-void Layer::latchPerFrameState(compositionengine::LayerFECompositionState& compositionState) const {
-    const auto& drawingState{getDrawingState()};
-    compositionState.forceClientComposition = false;
+    compositionState->type = type;
+    compositionState->appId = appId;
 
-    compositionState.isColorspaceAgnostic = isColorSpaceAgnostic();
-    compositionState.dataspace = getDataSpace();
-    compositionState.colorTransform = getColorTransform();
-    compositionState.colorTransformIsIdentity = !hasColorTransform();
-    compositionState.surfaceDamage = surfaceDamageRegion;
-    compositionState.hasProtectedContent = isProtected();
+    compositionState->metadata.clear();
+    const auto& supportedMetadata = mFlinger->getHwComposer().getSupportedLayerGenericMetadata();
+    for (const auto& [key, mandatory] : supportedMetadata) {
+        const auto& genericLayerMetadataCompatibilityMap =
+                mFlinger->getGenericLayerMetadataKeyMap();
+        auto compatIter = genericLayerMetadataCompatibilityMap.find(key);
+        if (compatIter == std::end(genericLayerMetadataCompatibilityMap)) {
+            continue;
+        }
+        const uint32_t id = compatIter->second;
 
-    const bool usesRoundedCorners = getRoundedCornerState().radius != 0.f;
-    const bool drawsShadows = mEffectiveShadowRadius != 0.f;
+        auto it = drawingState.metadata.mMap.find(id);
+        if (it == std::end(drawingState.metadata.mMap)) {
+            continue;
+        }
 
-    compositionState.isOpaque =
-            isOpaque(drawingState) && !usesRoundedCorners && getAlpha() == 1.0_hf;
-
-    // Force client composition for special cases known only to the front-end.
-    if (isHdrY410() || usesRoundedCorners || drawsShadows) {
-        compositionState.forceClientComposition = true;
+        compositionState->metadata
+                .emplace(key, compositionengine::GenericLayerMetadataEntry{mandatory, it->second});
     }
 }
 
-void Layer::latchCursorCompositionState(
-        compositionengine::LayerFECompositionState& compositionState) const {
-    // This gives us only the "orientation" component of the transform
+void Layer::preparePerFrameCompositionState() {
+    const auto& drawingState{getDrawingState()};
+    auto* compositionState = editCompositionState();
+
+    compositionState->forceClientComposition = false;
+
+    compositionState->isColorspaceAgnostic = isColorSpaceAgnostic();
+    compositionState->dataspace = getDataSpace();
+    compositionState->colorTransform = getColorTransform();
+    compositionState->colorTransformIsIdentity = !hasColorTransform();
+    compositionState->surfaceDamage = surfaceDamageRegion;
+    compositionState->hasProtectedContent = isProtected();
+
+    const bool usesRoundedCorners = getRoundedCornerState().radius != 0.f;
+
+    compositionState->isOpaque =
+            isOpaque(drawingState) && !usesRoundedCorners && getAlpha() == 1.0_hf;
+
+    // Force client composition for special cases known only to the front-end.
+    if (isHdrY410() || usesRoundedCorners || drawShadows()) {
+        compositionState->forceClientComposition = true;
+    }
+}
+
+void Layer::prepareCursorCompositionState() {
     const State& drawingState{getDrawingState()};
+    auto* compositionState = editCompositionState();
 
     // Apply the layer's transform, followed by the display's global transform
     // Here we're guaranteed that the layer's transform preserves rects
@@ -506,30 +533,50 @@ void Layer::latchCursorCompositionState(
     Rect bounds = reduce(win, getActiveTransparentRegion(drawingState));
     Rect frame(getTransform().transform(bounds));
 
-    compositionState.cursorFrame = frame;
+    compositionState->cursorFrame = frame;
+}
+
+sp<compositionengine::LayerFE> Layer::asLayerFE() const {
+    return const_cast<compositionengine::LayerFE*>(
+            static_cast<const compositionengine::LayerFE*>(this));
+}
+
+sp<compositionengine::LayerFE> Layer::getCompositionEngineLayerFE() const {
+    return nullptr;
+}
+
+compositionengine::LayerFECompositionState* Layer::editCompositionState() {
+    return nullptr;
+}
+
+const compositionengine::LayerFECompositionState* Layer::getCompositionState() const {
+    return nullptr;
 }
 
 bool Layer::onPreComposition(nsecs_t) {
     return false;
 }
 
-void Layer::latchCompositionState(compositionengine::LayerFECompositionState& compositionState,
-                                  compositionengine::LayerFE::StateSubset subset) const {
+void Layer::prepareCompositionState(compositionengine::LayerFE::StateSubset subset) {
     using StateSubset = compositionengine::LayerFE::StateSubset;
 
     switch (subset) {
         case StateSubset::BasicGeometry:
-            latchBasicGeometry(compositionState);
+            prepareBasicGeometryCompositionState();
             break;
 
         case StateSubset::GeometryAndContent:
-            latchBasicGeometry(compositionState);
-            latchGeometry(compositionState);
-            latchPerFrameState(compositionState);
+            prepareBasicGeometryCompositionState();
+            prepareGeometryCompositionState();
+            preparePerFrameCompositionState();
             break;
 
         case StateSubset::Content:
-            latchPerFrameState(compositionState);
+            preparePerFrameCompositionState();
+            break;
+
+        case StateSubset::Cursor:
+            prepareCursorCompositionState();
             break;
     }
 }
@@ -542,15 +589,16 @@ const char* Layer::getDebugName() const {
 // drawing...
 // ---------------------------------------------------------------------------
 
-std::optional<renderengine::LayerSettings> Layer::prepareClientComposition(
+std::optional<compositionengine::LayerFE::LayerSettings> Layer::prepareClientComposition(
         compositionengine::LayerFE::ClientCompositionTargetSettings& targetSettings) {
-    if (!getCompositionLayer()) {
+    if (!getCompositionState()) {
         return {};
     }
 
     FloatRect bounds = getBounds();
     half alpha = getAlpha();
-    renderengine::LayerSettings layerSettings;
+
+    compositionengine::LayerFE::LayerSettings layerSettings;
     layerSettings.geometry.boundaries = bounds;
     if (targetSettings.useIdentityTransform) {
         layerSettings.geometry.positionTransform = mat4();
@@ -568,11 +616,12 @@ std::optional<renderengine::LayerSettings> Layer::prepareClientComposition(
 
     layerSettings.alpha = alpha;
     layerSettings.sourceDataspace = getDataSpace();
+    layerSettings.backgroundBlurRadius = getBackgroundBlurRadius();
     return layerSettings;
 }
 
-std::optional<renderengine::LayerSettings> Layer::prepareShadowClientComposition(
-        const renderengine::LayerSettings& casterLayerSettings, const Rect& displayViewport,
+std::optional<compositionengine::LayerFE::LayerSettings> Layer::prepareShadowClientComposition(
+        const LayerFE::LayerSettings& casterLayerSettings, const Rect& displayViewport,
         ui::Dataspace outputDataspace) {
     renderengine::ShadowSettings shadow = getShadowSettings(displayViewport);
     if (shadow.length <= 0.f) {
@@ -583,8 +632,10 @@ std::optional<renderengine::LayerSettings> Layer::prepareShadowClientComposition
     const bool casterIsOpaque = ((casterLayerSettings.source.buffer.buffer != nullptr) &&
                                  casterLayerSettings.source.buffer.isOpaque);
 
-    renderengine::LayerSettings shadowLayer = casterLayerSettings;
+    compositionengine::LayerFE::LayerSettings shadowLayer = casterLayerSettings;
+
     shadowLayer.shadow = shadow;
+    shadowLayer.geometry.boundaries = mBounds; // ignore transparent region
 
     // If the casting layer is translucent, we need to fill in the shadow underneath the layer.
     // Otherwise the generated shadow will only be shown around the casting layer.
@@ -593,13 +644,16 @@ std::optional<renderengine::LayerSettings> Layer::prepareShadowClientComposition
     shadowLayer.shadow.spotColor *= casterAlpha;
     shadowLayer.sourceDataspace = outputDataspace;
     shadowLayer.source.buffer.buffer = nullptr;
+    shadowLayer.source.buffer.fence = nullptr;
+    shadowLayer.frameNumber = 0;
+    shadowLayer.bufferId = 0;
 
     if (shadowLayer.shadow.ambientColor.a <= 0.f && shadowLayer.shadow.spotColor.a <= 0.f) {
         return {};
     }
 
     float casterCornerRadius = shadowLayer.geometry.roundedCornersRadius;
-    const FloatRect& cornerRadiusCropRect = casterLayerSettings.geometry.roundedCornersCrop;
+    const FloatRect& cornerRadiusCropRect = shadowLayer.geometry.roundedCornersCrop;
     const FloatRect& casterRect = shadowLayer.geometry.boundaries;
 
     // crop used to set the corner radius may be larger than the content rect. Adjust the corner
@@ -618,12 +672,61 @@ std::optional<renderengine::LayerSettings> Layer::prepareShadowClientComposition
     return shadowLayer;
 }
 
+void Layer::prepareClearClientComposition(LayerFE::LayerSettings& layerSettings,
+                                          bool blackout) const {
+    layerSettings.source.buffer.buffer = nullptr;
+    layerSettings.source.solidColor = half3(0.0, 0.0, 0.0);
+    layerSettings.disableBlending = true;
+    layerSettings.bufferId = 0;
+    layerSettings.frameNumber = 0;
+
+    // If layer is blacked out, force alpha to 1 so that we draw a black color layer.
+    layerSettings.alpha = blackout ? 1.0f : 0.0f;
+}
+
+std::vector<compositionengine::LayerFE::LayerSettings> Layer::prepareClientCompositionList(
+        compositionengine::LayerFE::ClientCompositionTargetSettings& targetSettings) {
+    std::optional<compositionengine::LayerFE::LayerSettings> layerSettings =
+            prepareClientComposition(targetSettings);
+    // Nothing to render.
+    if (!layerSettings) {
+        return {};
+    }
+
+    // HWC requests to clear this layer.
+    if (targetSettings.clearContent) {
+        prepareClearClientComposition(*layerSettings, false /* blackout */);
+        return {*layerSettings};
+    }
+
+    std::optional<compositionengine::LayerFE::LayerSettings> shadowSettings =
+            prepareShadowClientComposition(*layerSettings, targetSettings.viewport,
+                                           targetSettings.dataspace);
+    // There are no shadows to render.
+    if (!shadowSettings) {
+        return {*layerSettings};
+    }
+
+    // If the layer casts a shadow but the content casting the shadow is occluded, skip
+    // composing the non-shadow content and only draw the shadows.
+    if (targetSettings.realContentIsVisible) {
+        return {*shadowSettings, *layerSettings};
+    }
+
+    return {*shadowSettings};
+}
+
 Hwc2::IComposerClient::Composition Layer::getCompositionType(
         const sp<const DisplayDevice>& display) const {
     const auto outputLayer = findOutputLayerForDisplay(display);
-    LOG_FATAL_IF(!outputLayer);
-    return outputLayer->getState().hwc ? (*outputLayer->getState().hwc).hwcCompositionType
-                                       : Hwc2::IComposerClient::Composition::CLIENT;
+    if (outputLayer == nullptr) {
+        return Hwc2::IComposerClient::Composition::INVALID;
+    }
+    if (outputLayer->getState().hwc) {
+        return (*outputLayer->getState().hwc).hwcCompositionType;
+    } else {
+        return Hwc2::IComposerClient::Composition::CLIENT;
+    }
 }
 
 bool Layer::getClearClientTarget(const sp<const DisplayDevice>& display) const {
@@ -846,7 +949,7 @@ uint32_t Layer::doTransaction(uint32_t flags) {
         // inevitably waiting on a buffer to return. We recreate this semantic for BufferQueue
         // even though it is a little consistent. detachChildren is shortly slated for removal
         // by the hierarchy mirroring work so we don't need to worry about it too much.
-        mDrawingState.callbackHandles = mCurrentState.callbackHandles;
+        forceSendCallbacks();
         mCurrentState.callbackHandles = {};
         return flags;
     }
@@ -890,6 +993,9 @@ uint32_t Layer::doTransaction(uint32_t flags) {
     commitTransaction(c);
     mPendingStatesSnapshot = mPendingStates;
     mCurrentState.callbackHandles = {};
+
+    maybeDirtyInput();
+
     return flags;
 }
 
@@ -1057,9 +1163,9 @@ bool Layer::setBackgroundColor(const half3& color, float alpha, ui::Dataspace da
 
     if (!mCurrentState.bgColorLayer && alpha != 0) {
         // create background color layer if one does not yet exist
-        uint32_t flags = ISurfaceComposerClient::eFXSurfaceColor;
+        uint32_t flags = ISurfaceComposerClient::eFXSurfaceEffect;
         std::string name = mName + "BackgroundColorLayer";
-        mCurrentState.bgColorLayer = mFlinger->getFactory().createColorLayer(
+        mCurrentState.bgColorLayer = mFlinger->getFactory().createEffectLayer(
                 LayerCreationArgs(mFlinger.get(), nullptr, std::move(name), 0, 0, flags,
                                   LayerMetadata()));
 
@@ -1095,6 +1201,16 @@ bool Layer::setCornerRadius(float cornerRadius) {
     return true;
 }
 
+bool Layer::setBackgroundBlurRadius(int backgroundBlurRadius) {
+    if (mCurrentState.backgroundBlurRadius == backgroundBlurRadius) return false;
+
+    mCurrentState.sequence++;
+    mCurrentState.backgroundBlurRadius = backgroundBlurRadius;
+    mCurrentState.modified = true;
+    setTransactionFlags(eTransactionNeeded);
+    return true;
+}
+
 bool Layer::setMatrix(const layer_state_t::matrix22_t& matrix,
         bool allowNonRectPreservingTransforms) {
     ui::Transform t;
@@ -1118,6 +1234,7 @@ bool Layer::setTransparentRegionHint(const Region& transparent) {
     setTransactionFlags(eTransactionNeeded);
     return true;
 }
+
 bool Layer::setFlags(uint8_t flags, uint8_t mask) {
     const uint32_t newFlags = (mCurrentState.flags & ~mask) | (flags & mask);
     if (mCurrentState.flags == newFlags) return false;
@@ -1174,6 +1291,29 @@ bool Layer::setColorSpaceAgnostic(const bool agnostic) {
     return true;
 }
 
+bool Layer::setFrameRateSelectionPriority(int32_t priority) {
+    if (mCurrentState.frameRateSelectionPriority == priority) return false;
+    mCurrentState.frameRateSelectionPriority = priority;
+    mCurrentState.sequence++;
+    mCurrentState.modified = true;
+    setTransactionFlags(eTransactionNeeded);
+    return true;
+}
+
+int32_t Layer::getFrameRateSelectionPriority() const {
+    // Check if layer has priority set.
+    if (mDrawingState.frameRateSelectionPriority != PRIORITY_UNSET) {
+        return mDrawingState.frameRateSelectionPriority;
+    }
+    // If not, search whether its parents have it set.
+    sp<Layer> parent = getParent();
+    if (parent != nullptr) {
+        return parent->getFrameRateSelectionPriority();
+    }
+
+    return Layer::PRIORITY_UNSET;
+}
+
 uint32_t Layer::getLayerStack() const {
     auto p = mDrawingParent.promote();
     if (p == nullptr) {
@@ -1192,6 +1332,25 @@ bool Layer::setShadowRadius(float shadowRadius) {
     mCurrentState.modified = true;
     setTransactionFlags(eTransactionNeeded);
     return true;
+}
+
+bool Layer::setFrameRate(FrameRate frameRate) {
+    if (!mFlinger->useFrameRateApi) {
+        return false;
+    }
+    if (mCurrentState.frameRate == frameRate) {
+        return false;
+    }
+
+    mCurrentState.sequence++;
+    mCurrentState.frameRate = frameRate;
+    mCurrentState.modified = true;
+    setTransactionFlags(eTransactionNeeded);
+    return true;
+}
+
+Layer::FrameRate Layer::getFrameRate() const {
+    return getDrawingState().frameRate;
 }
 
 void Layer::deferTransactionUntil_legacy(const sp<Layer>& barrierLayer, uint64_t frameNumber) {
@@ -1352,7 +1511,7 @@ void Layer::miniDump(std::string& result, const sp<DisplayDevice>& displayDevice
     StringAppendF(&result, " %s\n", name.c_str());
 
     const State& layerState(getDrawingState());
-    const auto& compositionState = outputLayer->getState();
+    const auto& outputLayerState = outputLayer->getState();
 
     if (layerState.zOrderRelativeOf != nullptr || mDrawingParent != nullptr) {
         StringAppendF(&result, "  rel %6d | ", layerState.z);
@@ -1361,13 +1520,10 @@ void Layer::miniDump(std::string& result, const sp<DisplayDevice>& displayDevice
     }
     StringAppendF(&result, "  %10d | ", mWindowType);
     StringAppendF(&result, "%10s | ", toString(getCompositionType(displayDevice)).c_str());
-    StringAppendF(&result, "%10s | ",
-                  toString(getCompositionLayer() ? compositionState.bufferTransform
-                                                 : static_cast<Hwc2::Transform>(0))
-                          .c_str());
-    const Rect& frame = compositionState.displayFrame;
+    StringAppendF(&result, "%10s | ", toString(outputLayerState.bufferTransform).c_str());
+    const Rect& frame = outputLayerState.displayFrame;
     StringAppendF(&result, "%4d %4d %4d %4d | ", frame.left, frame.top, frame.right, frame.bottom);
-    const FloatRect& crop = compositionState.sourceCrop;
+    const FloatRect& crop = outputLayerState.sourceCrop;
     StringAppendF(&result, "%6.1f %6.1f %6.1f %6.1f\n", crop.left, crop.top, crop.right,
                   crop.bottom);
 
@@ -1734,6 +1890,15 @@ void Layer::traverseInReverseZOrder(LayerVector::StateSet stateSet,
     }
 }
 
+void Layer::traverse(LayerVector::StateSet state, const LayerVector::Visitor& visitor) {
+    visitor(this);
+    const LayerVector& children =
+            state == LayerVector::StateSet::Drawing ? mDrawingChildren : mCurrentChildren;
+    for (const sp<Layer>& child : children) {
+        child->traverse(state, visitor);
+    }
+}
+
 LayerVector Layer::makeChildrenTraversalList(LayerVector::StateSet stateSet,
                                              const std::vector<Layer*>& layersInTree) {
     LOG_ALWAYS_FATAL_IF(stateSet == LayerVector::StateSet::Invalid,
@@ -1825,6 +1990,10 @@ half4 Layer::getColor() const {
     return half4(color.r, color.g, color.b, getAlpha());
 }
 
+int32_t Layer::getBackgroundBlurRadius() const {
+    return getDrawingState().backgroundBlurRadius;
+}
+
 Layer::RoundedCornerState Layer::getRoundedCornerState() const {
     const auto& p = mDrawingParent.promote();
     if (p != nullptr) {
@@ -1891,6 +2060,25 @@ void Layer::setInputInfo(const InputWindowInfo& info) {
     setTransactionFlags(eTransactionNeeded);
 }
 
+LayerProto* Layer::writeToProto(LayersProto& layersProto, uint32_t traceFlags,
+                                const sp<const DisplayDevice>& device) const {
+    LayerProto* layerProto = layersProto.add_layers();
+    writeToProtoDrawingState(layerProto, traceFlags);
+    writeToProtoCommonState(layerProto, LayerVector::StateSet::Drawing, traceFlags);
+
+    // Only populate for the primary display.
+    if (device) {
+        const Hwc2::IComposerClient::Composition compositionType = getCompositionType(device);
+        layerProto->set_hwc_composition_type(static_cast<HwcCompositionType>(compositionType));
+    }
+
+    for (const sp<Layer>& layer : mDrawingChildren) {
+        layer->writeToProto(layersProto, traceFlags, device);
+    }
+
+    return layerProto;
+}
+
 void Layer::writeToProtoDrawingState(LayerProto* layerInfo, uint32_t traceFlags) const {
     ui::Transform transform = getTransform();
 
@@ -1928,6 +2116,11 @@ void Layer::writeToProtoDrawingState(LayerProto* layerInfo, uint32_t traceFlags)
                                        [&]() { return layerInfo->mutable_visible_region(); });
         LayerProtoHelper::writeToProto(surfaceDamageRegion,
                                        [&]() { return layerInfo->mutable_damage_region(); });
+
+        if (hasColorTransform()) {
+            LayerProtoHelper::writeToProto(getColorTransform(),
+                                           layerInfo->mutable_color_transform());
+        }
     }
 
     if (traceFlags & SurfaceTracing::TRACE_EXTRA) {
@@ -1935,6 +2128,9 @@ void Layer::writeToProtoDrawingState(LayerProto* layerInfo, uint32_t traceFlags)
                                        [&]() { return layerInfo->mutable_source_bounds(); });
         LayerProtoHelper::writeToProto(mScreenBounds,
                                        [&]() { return layerInfo->mutable_screen_bounds(); });
+        LayerProtoHelper::writeToProto(getRoundedCornerState().cropRect,
+                                       [&]() { return layerInfo->mutable_corner_radius_crop(); });
+        layerInfo->set_shadow_radius(mEffectiveShadowRadius);
     }
 }
 
@@ -2004,6 +2200,8 @@ void Layer::writeToProtoCommonState(LayerProto* layerInfo, LayerVector::StateSet
         } else {
             layerInfo->set_z_order_relative_of(-1);
         }
+
+        layerInfo->set_is_relative_of(state.isRelativeOf);
     }
 
     if (traceFlags & SurfaceTracing::TRACE_INPUT) {
@@ -2025,6 +2223,7 @@ bool Layer::isRemovedFromCurrentState() const  {
 
 InputWindowInfo Layer::fillInputInfo() {
     InputWindowInfo info = mDrawingState.inputInfo;
+    info.id = sequence;
 
     if (info.displayId == ADISPLAY_ID_NONE) {
         info.displayId = getLayerStack();
@@ -2081,15 +2280,31 @@ InputWindowInfo Layer::fillInputInfo() {
         info.touchableRegion = info.touchableRegion.intersect(Rect{cropLayer->mScreenBounds});
     }
 
+    // If the layer is a clone, we need to crop the input region to cloned root to prevent
+    // touches from going outside the cloned area.
+    if (isClone()) {
+        sp<Layer> clonedRoot = getClonedRoot();
+        if (clonedRoot != nullptr) {
+            Rect rect(clonedRoot->mScreenBounds);
+            info.touchableRegion = info.touchableRegion.intersect(rect);
+        }
+    }
+
     return info;
+}
+
+sp<Layer> Layer::getClonedRoot() {
+    if (mClonedChild != nullptr) {
+        return this;
+    }
+    if (mDrawingParent == nullptr || mDrawingParent.promote() == nullptr) {
+        return nullptr;
+    }
+    return mDrawingParent.promote()->getClonedRoot();
 }
 
 bool Layer::hasInput() const {
     return mDrawingState.inputInfo.token != nullptr;
-}
-
-std::shared_ptr<compositionengine::Layer> Layer::getCompositionLayer() const {
-    return nullptr;
 }
 
 bool Layer::canReceiveInput() const {
@@ -2098,7 +2313,7 @@ bool Layer::canReceiveInput() const {
 
 compositionengine::OutputLayer* Layer::findOutputLayerForDisplay(
         const sp<const DisplayDevice>& display) const {
-    return display->getCompositionDisplay()->getOutputLayerForLayer(getCompositionLayer().get());
+    return display->getCompositionDisplay()->getOutputLayerForLayer(getCompositionEngineLayerFE());
 }
 
 Region Layer::debugGetVisibleRegionOnDefaultDisplay() const {
@@ -2119,10 +2334,6 @@ void Layer::setInitialValuesForClone(const sp<Layer>& clonedFrom) {
     // copy drawing state from cloned layer
     mDrawingState = clonedFrom->mDrawingState;
     mClonedFrom = clonedFrom;
-
-    // TODO: (b/140756730) Ignore input for now since InputDispatcher doesn't support multiple
-    // InputWindows per client token yet.
-    mDrawingState.inputInfo.token = nullptr;
 }
 
 void Layer::updateMirrorInfo() {
@@ -2157,9 +2368,6 @@ void Layer::updateClonedDrawingState(std::map<sp<Layer>, sp<Layer>>& clonedLayer
     if (isClonedFromAlive()) {
         sp<Layer> clonedFrom = getClonedFrom();
         mDrawingState = clonedFrom->mDrawingState;
-        // TODO: (b/140756730) Ignore input for now since InputDispatcher doesn't support multiple
-        // InputWindows per client token yet.
-        mDrawingState.inputInfo.token = nullptr;
         clonedLayersMap.emplace(clonedFrom, this);
     }
 
@@ -2198,7 +2406,24 @@ void Layer::updateClonedChildren(const sp<Layer>& mirrorRoot,
     }
 }
 
-void Layer::updateClonedRelatives(std::map<sp<Layer>, sp<Layer>> clonedLayersMap) {
+void Layer::updateClonedInputInfo(const std::map<sp<Layer>, sp<Layer>>& clonedLayersMap) {
+    auto cropLayer = mDrawingState.touchableRegionCrop.promote();
+    if (cropLayer != nullptr) {
+        if (clonedLayersMap.count(cropLayer) == 0) {
+            // Real layer had a crop layer but it's not in the cloned hierarchy. Just set to
+            // self as crop layer to avoid going outside bounds.
+            mDrawingState.touchableRegionCrop = this;
+        } else {
+            const sp<Layer>& clonedCropLayer = clonedLayersMap.at(cropLayer);
+            mDrawingState.touchableRegionCrop = clonedCropLayer;
+        }
+    }
+    // Cloned layers shouldn't handle watch outside since their z order is not determined by
+    // WM or the client.
+    mDrawingState.inputInfo.layoutParamsFlags &= ~InputWindowInfo::FLAG_WATCH_OUTSIDE_TOUCH;
+}
+
+void Layer::updateClonedRelatives(const std::map<sp<Layer>, sp<Layer>>& clonedLayersMap) {
     mDrawingState.zOrderRelativeOf = nullptr;
     mDrawingState.zOrderRelatives.clear();
 
@@ -2206,11 +2431,11 @@ void Layer::updateClonedRelatives(std::map<sp<Layer>, sp<Layer>> clonedLayersMap
         return;
     }
 
-    sp<Layer> clonedFrom = getClonedFrom();
+    const sp<Layer>& clonedFrom = getClonedFrom();
     for (wp<Layer>& relativeWeak : clonedFrom->mDrawingState.zOrderRelatives) {
-        sp<Layer> relative = relativeWeak.promote();
-        auto clonedRelative = clonedLayersMap[relative];
-        if (clonedRelative != nullptr) {
+        const sp<Layer>& relative = relativeWeak.promote();
+        if (clonedLayersMap.count(relative) > 0) {
+            auto& clonedRelative = clonedLayersMap.at(relative);
             mDrawingState.zOrderRelatives.add(clonedRelative);
         }
     }
@@ -2220,11 +2445,13 @@ void Layer::updateClonedRelatives(std::map<sp<Layer>, sp<Layer>> clonedLayersMap
     // In that case, we treat the layer as if the relativeOf has been removed. This way, it will
     // still traverse the children, but the layer with the missing relativeOf will not be shown
     // on screen.
-    sp<Layer> relativeOf = clonedFrom->mDrawingState.zOrderRelativeOf.promote();
-    sp<Layer> clonedRelativeOf = clonedLayersMap[relativeOf];
-    if (clonedRelativeOf != nullptr) {
+    const sp<Layer>& relativeOf = clonedFrom->mDrawingState.zOrderRelativeOf.promote();
+    if (clonedLayersMap.count(relativeOf) > 0) {
+        const sp<Layer>& clonedRelativeOf = clonedLayersMap.at(relativeOf);
         mDrawingState.zOrderRelativeOf = clonedRelativeOf;
     }
+
+    updateClonedInputInfo(clonedLayersMap);
 
     for (sp<Layer>& child : mDrawingChildren) {
         child->updateClonedRelatives(clonedLayersMap);
@@ -2234,6 +2461,44 @@ void Layer::updateClonedRelatives(std::map<sp<Layer>, sp<Layer>> clonedLayersMap
 void Layer::addChildToDrawing(const sp<Layer>& layer) {
     mDrawingChildren.add(layer);
     layer->mDrawingParent = this;
+}
+
+Layer::FrameRateCompatibility Layer::FrameRate::convertCompatibility(int8_t compatibility) {
+    switch (compatibility) {
+        case ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT:
+            return FrameRateCompatibility::Default;
+        case ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE:
+            return FrameRateCompatibility::ExactOrMultiple;
+        default:
+            LOG_ALWAYS_FATAL("Invalid frame rate compatibility value %d", compatibility);
+            return FrameRateCompatibility::Default;
+    }
+}
+
+bool Layer::maybeDirtyInput() {
+    // No sense redirtying input.
+    if (mFlinger->inputDirty()) return true;
+
+    if (hasInput()) {
+        mFlinger->dirtyInput();
+        return true;
+    }
+
+    // If a child or relative dirties the input, no sense continuing to traverse
+    // so we return early and halt the recursion. We traverse ourselves instead
+    // of using traverse() so we can implement this early halt.
+    for (const sp<Layer>& child : mDrawingChildren) {
+        if (child->maybeDirtyInput()) {
+            return true;
+        }
+    }
+    for (const wp<Layer>& weakRelative : mDrawingState.zOrderRelatives) {
+        sp<Layer> relative = weakRelative.promote();
+        if (relative && relative->maybeDirtyInput()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2247,3 +2512,6 @@ void Layer::addChildToDrawing(const sp<Layer>& layer) {
 #if defined(__gl2_h_)
 #error "don't include gl2/gl2.h in this file"
 #endif
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

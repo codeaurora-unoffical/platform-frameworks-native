@@ -16,6 +16,7 @@
 #include <aidl/android/hardware/graphics/common/BlendMode.h>
 #include <aidl/android/hardware/graphics/common/Dataspace.h>
 
+#include <android/data_space.h>
 #include <android/hardware/graphics/common/1.2/types.h>
 #include <android/hardware/graphics/composer/2.1/IComposerClient.h>
 
@@ -33,6 +34,51 @@ static_assert(static_cast<uint32_t>(AidlBlendMode::PREMULTIPLIED) ==
               static_cast<uint32_t>(HidlBlendMode::PREMULTIPLIED));
 static_assert(static_cast<uint32_t>(AidlBlendMode::COVERAGE) ==
               static_cast<uint32_t>(HidlBlendMode::COVERAGE));
+
+static_assert(static_cast<uint32_t>(ADATASPACE_UNKNOWN) ==
+              static_cast<uint32_t>(AidlDataspace::UNKNOWN));
+static_assert(static_cast<uint32_t>(ADATASPACE_SCRGB_LINEAR) ==
+              static_cast<uint32_t>(AidlDataspace::SCRGB_LINEAR));
+static_assert(static_cast<uint32_t>(ADATASPACE_SRGB) == static_cast<uint32_t>(AidlDataspace::SRGB));
+static_assert(static_cast<uint32_t>(ADATASPACE_SCRGB) ==
+              static_cast<uint32_t>(AidlDataspace::SCRGB));
+static_assert(static_cast<uint32_t>(ADATASPACE_DISPLAY_P3) ==
+              static_cast<uint32_t>(AidlDataspace::DISPLAY_P3));
+static_assert(static_cast<uint32_t>(ADATASPACE_BT2020_PQ) ==
+              static_cast<uint32_t>(AidlDataspace::BT2020_PQ));
+static_assert(static_cast<uint32_t>(ADATASPACE_ADOBE_RGB) ==
+              static_cast<uint32_t>(AidlDataspace::ADOBE_RGB));
+static_assert(static_cast<uint32_t>(ADATASPACE_BT2020) ==
+              static_cast<uint32_t>(AidlDataspace::BT2020));
+static_assert(static_cast<uint32_t>(ADATASPACE_BT709) ==
+              static_cast<uint32_t>(AidlDataspace::BT709));
+static_assert(static_cast<uint32_t>(ADATASPACE_DCI_P3) ==
+              static_cast<uint32_t>(AidlDataspace::DCI_P3));
+static_assert(static_cast<uint32_t>(ADATASPACE_SRGB_LINEAR) ==
+              static_cast<uint32_t>(AidlDataspace::SRGB_LINEAR));
+
+static_assert(static_cast<uint32_t>(ADATASPACE_UNKNOWN) ==
+              static_cast<uint32_t>(HidlDataspace::UNKNOWN));
+static_assert(static_cast<uint32_t>(ADATASPACE_SCRGB_LINEAR) ==
+              static_cast<uint32_t>(HidlDataspace::V0_SCRGB_LINEAR));
+static_assert(static_cast<uint32_t>(ADATASPACE_SRGB) ==
+              static_cast<uint32_t>(HidlDataspace::V0_SRGB));
+static_assert(static_cast<uint32_t>(ADATASPACE_SCRGB) ==
+              static_cast<uint32_t>(HidlDataspace::V0_SCRGB));
+static_assert(static_cast<uint32_t>(ADATASPACE_DISPLAY_P3) ==
+              static_cast<uint32_t>(HidlDataspace::DISPLAY_P3));
+static_assert(static_cast<uint32_t>(ADATASPACE_BT2020_PQ) ==
+              static_cast<uint32_t>(HidlDataspace::BT2020_PQ));
+static_assert(static_cast<uint32_t>(ADATASPACE_ADOBE_RGB) ==
+              static_cast<uint32_t>(HidlDataspace::ADOBE_RGB));
+static_assert(static_cast<uint32_t>(ADATASPACE_BT2020) ==
+              static_cast<uint32_t>(HidlDataspace::BT2020));
+static_assert(static_cast<uint32_t>(ADATASPACE_BT709) ==
+              static_cast<uint32_t>(HidlDataspace::V0_BT709));
+static_assert(static_cast<uint32_t>(ADATASPACE_DCI_P3) ==
+              static_cast<uint32_t>(HidlDataspace::DCI_P3));
+static_assert(static_cast<uint32_t>(ADATASPACE_SRGB_LINEAR) ==
+              static_cast<uint32_t>(HidlDataspace::V0_SRGB_LINEAR));
 
 static_assert(static_cast<uint32_t>(AidlDataspace::UNKNOWN) ==
               static_cast<uint32_t>(HidlDataspace::UNKNOWN));
@@ -100,21 +146,21 @@ static_assert(static_cast<uint32_t>(AidlDataspace::RANGE_LIMITED) ==
               static_cast<uint32_t>(HidlDataspace::RANGE_LIMITED));
 static_assert(static_cast<uint32_t>(AidlDataspace::RANGE_EXTENDED) ==
               static_cast<uint32_t>(HidlDataspace::RANGE_EXTENDED));
-static_assert(static_cast<uint32_t>(AidlDataspace::V0_SRGB_LINEAR) ==
+static_assert(static_cast<uint32_t>(AidlDataspace::SRGB_LINEAR) ==
               static_cast<uint32_t>(HidlDataspace::V0_SRGB_LINEAR));
-static_assert(static_cast<uint32_t>(AidlDataspace::V0_SCRGB_LINEAR) ==
+static_assert(static_cast<uint32_t>(AidlDataspace::SCRGB_LINEAR) ==
               static_cast<uint32_t>(HidlDataspace::V0_SCRGB_LINEAR));
-static_assert(static_cast<uint32_t>(AidlDataspace::V0_SRGB) ==
+static_assert(static_cast<uint32_t>(AidlDataspace::SRGB) ==
               static_cast<uint32_t>(HidlDataspace::V0_SRGB));
-static_assert(static_cast<uint32_t>(AidlDataspace::V0_SCRGB) ==
+static_assert(static_cast<uint32_t>(AidlDataspace::SCRGB) ==
               static_cast<uint32_t>(HidlDataspace::V0_SCRGB));
-static_assert(static_cast<uint32_t>(AidlDataspace::V0_JFIF) ==
+static_assert(static_cast<uint32_t>(AidlDataspace::JFIF) ==
               static_cast<uint32_t>(HidlDataspace::V0_JFIF));
-static_assert(static_cast<uint32_t>(AidlDataspace::V0_BT601_625) ==
+static_assert(static_cast<uint32_t>(AidlDataspace::BT601_625) ==
               static_cast<uint32_t>(HidlDataspace::V0_BT601_625));
-static_assert(static_cast<uint32_t>(AidlDataspace::V0_BT601_525) ==
+static_assert(static_cast<uint32_t>(AidlDataspace::BT601_525) ==
               static_cast<uint32_t>(HidlDataspace::V0_BT601_525));
-static_assert(static_cast<uint32_t>(AidlDataspace::V0_BT709) ==
+static_assert(static_cast<uint32_t>(AidlDataspace::BT709) ==
               static_cast<uint32_t>(HidlDataspace::V0_BT709));
 static_assert(static_cast<uint32_t>(AidlDataspace::DCI_P3_LINEAR) ==
               static_cast<uint32_t>(HidlDataspace::DCI_P3_LINEAR));
@@ -152,19 +198,3 @@ static_assert(static_cast<uint32_t>(AidlDataspace::JPEG_APP_SEGMENTS) ==
               static_cast<uint32_t>(HidlDataspace::JPEG_APP_SEGMENTS));
 static_assert(static_cast<uint32_t>(AidlDataspace::HEIF) ==
               static_cast<uint32_t>(HidlDataspace::HEIF));
-
-// Below are the dataspaces that have been deprecated for sometime. They are required to behave
-// the same as their V0_* counterparts. We redefined them in AIDL to be the same as the
-// their V0_* counterparts.
-static_assert(static_cast<uint32_t>(AidlDataspace::SRGB_LINEAR) ==
-              static_cast<uint32_t>(AidlDataspace::V0_SRGB_LINEAR));
-static_assert(static_cast<uint32_t>(AidlDataspace::SRGB) ==
-              static_cast<uint32_t>(AidlDataspace::V0_SRGB));
-static_assert(static_cast<uint32_t>(AidlDataspace::JFIF) ==
-              static_cast<uint32_t>(AidlDataspace::V0_JFIF));
-static_assert(static_cast<uint32_t>(AidlDataspace::BT601_625) ==
-              static_cast<uint32_t>(AidlDataspace::V0_BT601_625));
-static_assert(static_cast<uint32_t>(AidlDataspace::BT601_525) ==
-              static_cast<uint32_t>(AidlDataspace::V0_BT601_525));
-static_assert(static_cast<uint32_t>(AidlDataspace::BT709) ==
-              static_cast<uint32_t>(AidlDataspace::V0_BT709));

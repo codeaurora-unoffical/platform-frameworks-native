@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #undef LOG_TAG
 #define LOG_TAG "LibSurfaceFlingerUnittests"
 #define LOG_NDEBUG 0
@@ -32,7 +36,7 @@ using namespace std::literals;
 namespace android::scheduler {
 
 MATCHER_P2(IsCloseTo, value, tolerance, "is within tolerance") {
-    return arg <= value + tolerance && value >= value - tolerance;
+    return arg <= value + tolerance && arg >= value - tolerance;
 }
 
 std::vector<nsecs_t> generateVsyncTimestamps(size_t count, nsecs_t period, nsecs_t bias) {
@@ -351,4 +355,42 @@ TEST_F(VSyncPredictorTest, doesNotPredictBeforeTimePointWithHigherIntercept) {
     EXPECT_THAT(prediction, Ge(timePoint));
 }
 
+TEST_F(VSyncPredictorTest, resetsWhenInstructed) {
+    auto const idealPeriod = 10000;
+    auto const realPeriod = 10500;
+    tracker.setPeriod(idealPeriod);
+    for (auto i = 0; i < kMinimumSamplesForPrediction; i++) {
+        tracker.addVsyncTimestamp(i * realPeriod);
+    }
+
+    EXPECT_THAT(std::get<0>(tracker.getVSyncPredictionModel()),
+                IsCloseTo(realPeriod, mMaxRoundingError));
+    tracker.resetModel();
+    EXPECT_THAT(std::get<0>(tracker.getVSyncPredictionModel()),
+                IsCloseTo(idealPeriod, mMaxRoundingError));
+}
+
+TEST_F(VSyncPredictorTest, slopeAlwaysValid) {
+    constexpr auto kNumVsyncs = 100;
+    auto invalidPeriod = mPeriod;
+    auto now = 0;
+    for (int i = 0; i < kNumVsyncs; i++) {
+        tracker.addVsyncTimestamp(now);
+        now += invalidPeriod;
+        invalidPeriod *= 0.9f;
+
+        auto [slope, intercept] = tracker.getVSyncPredictionModel();
+        EXPECT_THAT(slope, IsCloseTo(mPeriod, mPeriod * kOutlierTolerancePercent / 100.f));
+
+        // When VsyncPredictor returns the period it means that it doesn't know how to predict and
+        // it needs to get more samples
+        if (slope == mPeriod && intercept == 0) {
+            EXPECT_TRUE(tracker.needsMoreSamples(now));
+        }
+    }
+}
+
 } // namespace android::scheduler
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

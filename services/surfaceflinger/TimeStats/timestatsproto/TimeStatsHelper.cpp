@@ -83,6 +83,8 @@ std::string TimeStatsHelper::TimeStatsLayer::toString() const {
     StringAppendF(&result, "packageName = %s\n", packageName.c_str());
     StringAppendF(&result, "totalFrames = %d\n", totalFrames);
     StringAppendF(&result, "droppedFrames = %d\n", droppedFrames);
+    StringAppendF(&result, "lateAcquireFrames = %d\n", lateAcquireFrames);
+    StringAppendF(&result, "badDesiredPresentFrames = %d\n", badDesiredPresentFrames);
     const auto iter = deltas.find("present2present");
     if (iter != deltas.end()) {
         StringAppendF(&result, "averageFPS = %.3f\n", 1000.0 / iter->second.averageTime());
@@ -102,6 +104,7 @@ std::string TimeStatsHelper::TimeStatsGlobal::toString(std::optional<uint32_t> m
     StringAppendF(&result, "totalFrames = %d\n", totalFrames);
     StringAppendF(&result, "missedFrames = %d\n", missedFrames);
     StringAppendF(&result, "clientCompositionFrames = %d\n", clientCompositionFrames);
+    StringAppendF(&result, "clientCompositionReusedFrames = %d\n", clientCompositionReusedFrames);
     StringAppendF(&result, "displayOnTime = %" PRId64 " ms\n", displayOnTime);
     StringAppendF(&result, "displayConfigStats is as below:\n");
     for (const auto& [fps, duration] : refreshRateStats) {
@@ -111,8 +114,14 @@ std::string TimeStatsHelper::TimeStatsGlobal::toString(std::optional<uint32_t> m
     StringAppendF(&result, "totalP2PTime = %" PRId64 " ms\n", presentToPresent.totalTime());
     StringAppendF(&result, "presentToPresent histogram is as below:\n");
     result.append(presentToPresent.toString());
+    const float averageFrameDuration = frameDuration.averageTime();
+    StringAppendF(&result, "averageFrameDuration = %.3f ms\n",
+                  std::isnan(averageFrameDuration) ? 0.0f : averageFrameDuration);
     StringAppendF(&result, "frameDuration histogram is as below:\n");
     result.append(frameDuration.toString());
+    const float averageRenderEngineTiming = renderEngineTiming.averageTime();
+    StringAppendF(&result, "averageRenderEngineTiming = %.3f ms\n",
+                  std::isnan(averageRenderEngineTiming) ? 0.0f : averageRenderEngineTiming);
     StringAppendF(&result, "renderEngineTiming histogram is as below:\n");
     result.append(renderEngineTiming.toString());
     const auto dumpStats = generateDumpStats(maxLayers);

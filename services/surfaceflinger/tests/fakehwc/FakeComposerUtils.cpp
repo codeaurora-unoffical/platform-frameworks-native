@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #define LOG_NDEBUG 0
 #undef LOG_TAG
 #define LOG_TAG "FakeHwcUtil"
@@ -179,7 +183,11 @@ void FakeHwcEnvironment::TearDown() {
     // Wait for mock call signaling teardown?
     property_set("debug.sf.nobootanimation", "0");
     property_set("debug.sf.hwc_service_name", "default");
+    system("setenforce 1");
     ALOGI("Test env tear down - done");
 }
 
 } // namespace sftest
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

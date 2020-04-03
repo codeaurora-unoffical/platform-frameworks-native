@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_GUI_SURFACE_COMPOSER_CLIENT_H
-#define ANDROID_GUI_SURFACE_COMPOSER_CLIENT_H
+#pragma once
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -35,6 +34,7 @@
 #include <ui/FrameStats.h>
 #include <ui/GraphicTypes.h>
 #include <ui/PixelFormat.h>
+#include <ui/Rotation.h>
 
 #include <gui/CpuConsumer.h>
 #include <gui/ISurfaceComposer.h>
@@ -45,29 +45,31 @@
 
 namespace android {
 
-// ---------------------------------------------------------------------------
-
-struct DisplayInfo;
 class HdrCapabilities;
 class ISurfaceComposerClient;
 class IGraphicBufferProducer;
 class IRegionSamplingListener;
 class Region;
 
-// ---------------------------------------------------------------------------
-
 struct SurfaceControlStats {
-    SurfaceControlStats(const sp<SurfaceControl>& sc, nsecs_t time,
-                        const sp<Fence>& prevReleaseFence, uint32_t hint)
+    SurfaceControlStats(const sp<SurfaceControl>& sc, nsecs_t latchTime, nsecs_t acquireTime,
+                        const sp<Fence>& presentFence, const sp<Fence>& prevReleaseFence,
+                        uint32_t hint, FrameEventHistoryStats eventStats)
           : surfaceControl(sc),
-            acquireTime(time),
+            latchTime(latchTime),
+            acquireTime(acquireTime),
+            presentFence(presentFence),
             previousReleaseFence(prevReleaseFence),
-            transformHint(hint) {}
+            transformHint(hint),
+            frameEventStats(eventStats) {}
 
     sp<SurfaceControl> surfaceControl;
+    nsecs_t latchTime = -1;
     nsecs_t acquireTime = -1;
+    sp<Fence> presentFence;
     sp<Fence> previousReleaseFence;
     uint32_t transformHint = 0;
+    FrameEventHistoryStats frameEventStats;
 };
 
 using TransactionCompletedCallbackTakesContext =
@@ -101,39 +103,26 @@ public:
     status_t linkToComposerDeath(const sp<IBinder::DeathRecipient>& recipient,
             void* cookie = nullptr, uint32_t flags = 0);
 
-    // Get a list of supported configurations for a given display
-    static status_t getDisplayConfigs(const sp<IBinder>& display,
-            Vector<DisplayInfo>* configs);
+    // Get transactional state of given display.
+    static status_t getDisplayState(const sp<IBinder>& display, ui::DisplayState*);
 
-    // Get the DisplayInfo for the currently-active configuration
-    static status_t getDisplayInfo(const sp<IBinder>& display,
-            DisplayInfo* info);
+    // Get immutable information about given physical display.
+    static status_t getDisplayInfo(const sp<IBinder>& display, DisplayInfo*);
 
-    // Get the index of the current active configuration (relative to the list
-    // returned by getDisplayInfo)
+    // Get configurations supported by given physical display.
+    static status_t getDisplayConfigs(const sp<IBinder>& display, Vector<DisplayConfig>*);
+
+    // Get the ID of the active DisplayConfig, as getDisplayConfigs index.
     static int getActiveConfig(const sp<IBinder>& display);
 
-    // Set a new active configuration using an index relative to the list
-    // returned by getDisplayInfo
-    static status_t setActiveConfig(const sp<IBinder>& display, int id);
-
-    // Sets the allowed display configurations to be used.
-    // The allowedConfigs in a vector of indexes corresponding to the configurations
-    // returned from getDisplayConfigs().
-    static status_t setAllowedDisplayConfigs(const sp<IBinder>& displayToken,
-                                             const std::vector<int32_t>& allowedConfigs);
-
-    // Returns the allowed display configurations currently set.
-    // The allowedConfigs in a vector of indexes corresponding to the configurations
-    // returned from getDisplayConfigs().
-    static status_t getAllowedDisplayConfigs(const sp<IBinder>& displayToken,
-                                             std::vector<int32_t>* outAllowedConfigs);
+    // Shorthand for getDisplayConfigs element at getActiveConfig index.
+    static status_t getActiveDisplayConfig(const sp<IBinder>& display, DisplayConfig*);
 
     // Sets the refresh rate boundaries for display configuration.
     // For all other parameters, default configuration is used. The index for the default is
     // corresponting to the configs returned from getDisplayConfigs().
     static status_t setDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken,
-                                                 int32_t defaultModeId, float minRefreshRate,
+                                                 int32_t defaultConfig, float minRefreshRate,
                                                  float maxRefreshRate);
     // Gets the refresh rate boundaries for display configuration.
     // For all other parameters, default configuration is used. The index for the default is
@@ -141,7 +130,7 @@ public:
     // The reason is passed in for telemetry tracking, and it corresponds to the list of all
     // the policy rules that were used.
     static status_t getDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken,
-                                                 int32_t* outDefaultModeId,
+                                                 int32_t* outDefaultConfig,
                                                  float* outMinRefreshRate,
                                                  float* outMaxRefreshRate);
 
@@ -159,6 +148,21 @@ public:
     // Sets the active color mode for the given display
     static status_t setActiveColorMode(const sp<IBinder>& display,
             ui::ColorMode colorMode);
+
+    // Reports whether the connected display supports Auto Low Latency Mode
+    static bool getAutoLowLatencyModeSupport(const sp<IBinder>& display);
+
+    // Switches on/off Auto Low Latency Mode on the connected display. This should only be
+    // called if the connected display supports Auto Low Latency Mode as reported by
+    // #getAutoLowLatencyModeSupport
+    static void setAutoLowLatencyMode(const sp<IBinder>& display, bool on);
+
+    // Reports whether the connected display supports Game content type
+    static bool getGameContentTypeSupport(const sp<IBinder>& display);
+
+    // Turns Game mode on/off on the connected display. This should only be called
+    // if the display supports Game content type, as reported by #getGameContentTypeSupport
+    static void setGameContentType(const sp<IBinder>& display, bool on);
 
     /* Triggers screen on/off or low power mode and waits for it to complete */
     static void setDisplayPowerMode(const sp<IBinder>& display, int mode);
@@ -178,12 +182,6 @@ public:
      * Requires the ACCESS_SURFACE_FLINGER permission.
      */
     static bool getProtectedContentSupport();
-
-    /**
-     * Called from SurfaceControl d'tor to 'destroy' the surface (or rather, reparent it
-     * to null), but without needing an sp<SurfaceControl> to avoid infinite ressurection.
-     */
-    static void doDropReferenceTransaction(const sp<IBinder>& handle);
 
     /**
      * Uncaches a buffer in ISurfaceComposer. It must be uncached via a transaction so that it is
@@ -431,6 +429,8 @@ public:
                 float dsdx, float dtdx, float dtdy, float dsdy);
         Transaction& setCrop_legacy(const sp<SurfaceControl>& sc, const Rect& crop);
         Transaction& setCornerRadius(const sp<SurfaceControl>& sc, float cornerRadius);
+        Transaction& setBackgroundBlurRadius(const sp<SurfaceControl>& sc,
+                                             int backgroundBlurRadius);
         Transaction& setLayerStack(const sp<SurfaceControl>& sc, uint32_t layerStack);
         Transaction& setMetadata(const sp<SurfaceControl>& sc, uint32_t key, const Parcel& p);
         // Defers applying any changes made in this transaction until the Layer
@@ -479,8 +479,14 @@ public:
         Transaction& setDesiredPresentTime(nsecs_t desiredPresentTime);
         Transaction& setColorSpaceAgnostic(const sp<SurfaceControl>& sc, const bool agnostic);
 
+        // Sets information about the priority of the frame.
+        Transaction& setFrameRateSelectionPriority(const sp<SurfaceControl>& sc, int32_t priority);
+
         Transaction& addTransactionCompletedCallback(
                 TransactionCompletedCallbackTakesContext callback, void* callbackContext);
+
+        // ONLY FOR BLAST ADAPTER
+        Transaction& notifyProducerDisconnect(const sp<SurfaceControl>& sc);
 
         // Detaches all child surfaces (and their children recursively)
         // from their SurfaceControl.
@@ -501,7 +507,6 @@ public:
 
 #ifndef NO_INPUT
         Transaction& setInputWindowInfo(const sp<SurfaceControl>& sc, const InputWindowInfo& info);
-        Transaction& transferTouchFocus(const sp<IBinder>& fromToken, const sp<IBinder>& toToken);
         Transaction& syncInputWindows();
 #endif
 
@@ -512,6 +517,9 @@ public:
         Transaction& setGeometry(const sp<SurfaceControl>& sc,
                 const Rect& source, const Rect& dst, int transform);
         Transaction& setShadowRadius(const sp<SurfaceControl>& sc, float cornerRadius);
+
+        Transaction& setFrameRate(const sp<SurfaceControl>& sc, float frameRate,
+                                  int8_t compatibility);
 
         status_t setDisplaySurface(const sp<IBinder>& token,
                 const sp<IGraphicBufferProducer>& bufferProducer);
@@ -528,10 +536,8 @@ public:
          * mapped to. displayRect is specified post-orientation, that is
          * it uses the orientation seen by the end-user.
          */
-        void setDisplayProjection(const sp<IBinder>& token,
-                uint32_t orientation,
-                const Rect& layerStackRect,
-                const Rect& displayRect);
+        void setDisplayProjection(const sp<IBinder>& token, ui::Rotation orientation,
+                                  const Rect& layerStackRect, const Rect& displayRect);
         void setDisplaySize(const sp<IBinder>& token, uint32_t width, uint32_t height);
         void setAnimationTransaction();
         void setEarlyWakeup();
@@ -545,10 +551,8 @@ public:
     static status_t getHdrCapabilities(const sp<IBinder>& display,
             HdrCapabilities* outCapabilities);
 
-    static void setDisplayProjection(const sp<IBinder>& token,
-            uint32_t orientation,
-            const Rect& layerStackRect,
-            const Rect& displayRect);
+    static void setDisplayProjection(const sp<IBinder>& token, ui::Rotation orientation,
+                                     const Rect& layerStackRect, const Rect& displayRect);
 
     inline sp<ISurfaceComposerClient> getClient() { return mClient; }
 
@@ -580,23 +584,23 @@ class ScreenshotClient {
 public:
     // if cropping isn't required, callers may pass in a default Rect, e.g.:
     //   capture(display, producer, Rect(), reqWidth, ...);
-    static status_t capture(const sp<IBinder>& display, const ui::Dataspace reqDataSpace,
-                            const ui::PixelFormat reqPixelFormat, Rect sourceCrop,
+    static status_t capture(const sp<IBinder>& display, ui::Dataspace reqDataSpace,
+                            ui::PixelFormat reqPixelFormat, const Rect& sourceCrop,
                             uint32_t reqWidth, uint32_t reqHeight, bool useIdentityTransform,
-                            uint32_t rotation, bool captureSecureLayers,
+                            ui::Rotation rotation, bool captureSecureLayers,
                             sp<GraphicBuffer>* outBuffer, bool& outCapturedSecureLayers);
-    static status_t capture(const sp<IBinder>& display, const ui::Dataspace reqDataSpace,
-                            const ui::PixelFormat reqPixelFormat, Rect sourceCrop,
+    static status_t capture(const sp<IBinder>& display, ui::Dataspace reqDataSpace,
+                            ui::PixelFormat reqPixelFormat, const Rect& sourceCrop,
                             uint32_t reqWidth, uint32_t reqHeight, bool useIdentityTransform,
-                            uint32_t rotation, sp<GraphicBuffer>* outBuffer);
+                            ui::Rotation rotation, sp<GraphicBuffer>* outBuffer);
     static status_t capture(uint64_t displayOrLayerStack, ui::Dataspace* outDataspace,
                             sp<GraphicBuffer>* outBuffer);
-    static status_t captureLayers(const sp<IBinder>& layerHandle, const ui::Dataspace reqDataSpace,
-                                  const ui::PixelFormat reqPixelFormat, Rect sourceCrop,
+    static status_t captureLayers(const sp<IBinder>& layerHandle, ui::Dataspace reqDataSpace,
+                                  ui::PixelFormat reqPixelFormat, const Rect& sourceCrop,
                                   float frameScale, sp<GraphicBuffer>* outBuffer);
     static status_t captureChildLayers(
-            const sp<IBinder>& layerHandle, const ui::Dataspace reqDataSpace,
-            const ui::PixelFormat reqPixelFormat, Rect sourceCrop,
+            const sp<IBinder>& layerHandle, ui::Dataspace reqDataSpace,
+            ui::PixelFormat reqPixelFormat, const Rect& sourceCrop,
             const std::unordered_set<sp<IBinder>, ISurfaceComposer::SpHash<IBinder>>&
                     excludeHandles,
             float frameScale, sp<GraphicBuffer>* outBuffer);
@@ -641,8 +645,4 @@ public:
     void onTransactionCompleted(ListenerStats stats) override;
 };
 
-// ---------------------------------------------------------------------------
-
-}; // namespace android
-
-#endif // ANDROID_GUI_SURFACE_COMPOSER_CLIENT_H
+} // namespace android

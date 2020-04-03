@@ -17,6 +17,9 @@
 #pragma once
 
 #include <hardware/hwcomposer_defs.h>
+#include <stats_event.h>
+#include <stats_pull_atom_callback.h>
+#include <statslog.h>
 #include <timestatsproto/TimeStatsHelper.h>
 #include <timestatsproto/TimeStatsProtoHeader.h>
 #include <ui/FenceTime.h>
@@ -37,6 +40,10 @@ class TimeStats {
 public:
     virtual ~TimeStats() = default;
 
+    // Called once boot has been finished to perform additional capabilities,
+    // e.g. registration to statsd.
+    virtual void onBootFinished() = 0;
+
     virtual void parseArgs(bool asProto, const Vector<String16>& args, std::string& result) = 0;
     virtual bool isEnabled() = 0;
     virtual std::string miniDump() = 0;
@@ -44,6 +51,10 @@ public:
     virtual void incrementTotalFrames() = 0;
     virtual void incrementMissedFrames() = 0;
     virtual void incrementClientCompositionFrames() = 0;
+    virtual void incrementClientCompositionReusedFrames() = 0;
+    // Records the most up-to-date count of display event connections.
+    // The stored count will be the maximum ever recoded.
+    virtual void recordDisplayEventConnectionCount(int32_t count) = 0;
 
     // Records the start and end times for a frame.
     // The start time is the same as the beginning of a SurfaceFlinger
@@ -62,6 +73,18 @@ public:
     virtual void setPostTime(int32_t layerId, uint64_t frameNumber, const std::string& layerName,
                              nsecs_t postTime) = 0;
     virtual void setLatchTime(int32_t layerId, uint64_t frameNumber, nsecs_t latchTime) = 0;
+    // Reasons why latching a particular buffer may be skipped
+    enum class LatchSkipReason {
+        // If the acquire fence did not fire on some devices we skip latching
+        // the buffer until the fence fires.
+        LateAcquire,
+    };
+    // Increments the counter of skipped latch buffers.
+    virtual void incrementLatchSkipped(int32_t layerId, LatchSkipReason reason) = 0;
+    // Increments the counter of bad desired present times for this layer.
+    // Bad desired present times are "implausible" and cause SurfaceFlinger to
+    // latch a buffer immediately to avoid stalling.
+    virtual void incrementBadDesiredPresent(int32_t layerId) = 0;
     virtual void setDesiredTime(int32_t layerId, uint64_t frameNumber, nsecs_t desiredTime) = 0;
     virtual void setAcquireTime(int32_t layerId, uint64_t frameNumber, nsecs_t acquireTime) = 0;
     virtual void setAcquireFence(int32_t layerId, uint64_t frameNumber,
@@ -108,6 +131,8 @@ class TimeStats : public android::TimeStats {
         // fences to signal, but rather waiting to receive those fences/timestamps.
         int32_t waitData = -1;
         uint32_t droppedFrames = 0;
+        uint32_t lateAcquireFrames = 0;
+        uint32_t badDesiredPresentFrames = 0;
         TimeRecord prevTimeRecord;
         std::deque<TimeRecord> timeRecords;
     };
@@ -131,6 +156,57 @@ class TimeStats : public android::TimeStats {
 public:
     TimeStats();
 
+    // Delegate to the statsd service and associated APIs.
+    // Production code may use this class directly, whereas unit test may define
+    // a subclass for ease of testing.
+    class StatsEventDelegate {
+    public:
+        virtual ~StatsEventDelegate() = default;
+        virtual AStatsEvent* addStatsEventToPullData(AStatsEventList* data) {
+            return AStatsEventList_addStatsEvent(data);
+        }
+        virtual void registerStatsPullAtomCallback(int32_t atom_tag,
+                                                   AStatsManager_PullAtomCallback callback,
+                                                   AStatsManager_PullAtomMetadata* metadata,
+                                                   void* cookie) {
+            return AStatsManager_registerPullAtomCallback(atom_tag, callback, metadata, cookie);
+        }
+
+        virtual void unregisterStatsPullAtomCallback(int32_t atom_tag) {
+            return AStatsManager_unregisterPullAtomCallback(atom_tag);
+        }
+
+        virtual void statsEventSetAtomId(AStatsEvent* event, uint32_t atom_id) {
+            return AStatsEvent_setAtomId(event, atom_id);
+        }
+
+        virtual void statsEventWriteInt32(AStatsEvent* event, int32_t field) {
+            return AStatsEvent_writeInt32(event, field);
+        }
+
+        virtual void statsEventWriteInt64(AStatsEvent* event, int64_t field) {
+            return AStatsEvent_writeInt64(event, field);
+        }
+
+        virtual void statsEventWriteString8(AStatsEvent* event, const char* field) {
+            return AStatsEvent_writeString(event, field);
+        }
+
+        virtual void statsEventWriteByteArray(AStatsEvent* event, const uint8_t* buf,
+                                              size_t numBytes) {
+            return AStatsEvent_writeByteArray(event, buf, numBytes);
+        }
+
+        virtual void statsEventBuild(AStatsEvent* event) { return AStatsEvent_build(event); }
+    };
+    // For testing only for injecting custom dependencies.
+    TimeStats(std::unique_ptr<StatsEventDelegate> statsDelegate,
+              std::optional<size_t> maxPulledLayers,
+              std::optional<size_t> maxPulledHistogramBuckets);
+
+    ~TimeStats() override;
+
+    void onBootFinished() override;
     void parseArgs(bool asProto, const Vector<String16>& args, std::string& result) override;
     bool isEnabled() override;
     std::string miniDump() override;
@@ -138,6 +214,8 @@ public:
     void incrementTotalFrames() override;
     void incrementMissedFrames() override;
     void incrementClientCompositionFrames() override;
+    void incrementClientCompositionReusedFrames() override;
+    void recordDisplayEventConnectionCount(int32_t count) override;
 
     void recordFrameDuration(nsecs_t startTime, nsecs_t endTime) override;
     void recordRenderEngineDuration(nsecs_t startTime, nsecs_t endTime) override;
@@ -147,6 +225,8 @@ public:
     void setPostTime(int32_t layerId, uint64_t frameNumber, const std::string& layerName,
                      nsecs_t postTime) override;
     void setLatchTime(int32_t layerId, uint64_t frameNumber, nsecs_t latchTime) override;
+    void incrementLatchSkipped(int32_t layerId, LatchSkipReason reason) override;
+    void incrementBadDesiredPresent(int32_t layerId) override;
     void setDesiredTime(int32_t layerId, uint64_t frameNumber, nsecs_t desiredTime) override;
     void setAcquireTime(int32_t layerId, uint64_t frameNumber, nsecs_t acquireTime) override;
     void setAcquireFence(int32_t layerId, uint64_t frameNumber,
@@ -167,6 +247,11 @@ public:
     static const size_t MAX_NUM_TIME_RECORDS = 64;
 
 private:
+    static AStatsManager_PullAtomCallbackReturn pullAtomCallback(int32_t atom_tag,
+                                                                 AStatsEventList* data,
+                                                                 void* cookie);
+    AStatsManager_PullAtomCallbackReturn populateGlobalAtom(AStatsEventList* data);
+    AStatsManager_PullAtomCallbackReturn populateLayerAtom(AStatsEventList* data);
     bool recordReadyLocked(int32_t layerId, TimeRecord* timeRecord);
     void flushAvailableRecordsToStatsLocked(int32_t layerId);
     void flushPowerTimeLocked();
@@ -174,7 +259,9 @@ private:
 
     void enable();
     void disable();
-    void clear();
+    void clearAll();
+    void clearGlobalLocked();
+    void clearLayersLocked();
     void dump(bool asProto, std::optional<uint32_t> maxLayers, std::string& result);
 
     std::atomic<bool> mEnabled = false;
@@ -187,6 +274,9 @@ private:
 
     static const size_t MAX_NUM_LAYER_RECORDS = 200;
     static const size_t MAX_NUM_LAYER_STATS = 200;
+    std::unique_ptr<StatsEventDelegate> mStatsDelegate = std::make_unique<StatsEventDelegate>();
+    size_t mMaxPulledLayers = 8;
+    size_t mMaxPulledHistogramBuckets = 6;
 };
 
 } // namespace impl

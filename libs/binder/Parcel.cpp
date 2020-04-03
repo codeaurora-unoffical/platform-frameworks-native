@@ -422,8 +422,10 @@ status_t Parcel::appendFrom(const Parcel *parcel, size_t offset, size_t len)
         const sp<ProcessState> proc(ProcessState::self());
         // grow objects
         if (mObjectsCapacity < mObjectsSize + numObjects) {
+            if ((size_t) numObjects > SIZE_MAX - mObjectsSize) return NO_MEMORY; // overflow
+            if (mObjectsSize + numObjects > SIZE_MAX / 3) return NO_MEMORY; // overflow
             size_t newSize = ((mObjectsSize + numObjects)*3)/2;
-            if (newSize*sizeof(binder_size_t) < mObjectsSize) return NO_MEMORY;   // overflow
+            if (newSize > SIZE_MAX / sizeof(binder_size_t)) return NO_MEMORY; // overflow
             binder_size_t *objects =
                 (binder_size_t*)realloc(mObjects, newSize*sizeof(binder_size_t));
             if (objects == (binder_size_t*)nullptr) {
@@ -505,7 +507,7 @@ void Parcel::updateWorkSourceRequestHeaderPosition() const {
     }
 }
 
-#if defined(__ANDROID_APEX_COM_ANDROID_VNDK_CURRENT__) || (defined(__ANDROID_VNDK__) && !defined(__ANDROID_APEX__))
+#if defined(__ANDROID_VNDK__) && !defined(__ANDROID_APEX__)
 constexpr int32_t kHeader = B_PACK_CHARS('V', 'N', 'D', 'R');
 #else
 constexpr int32_t kHeader = B_PACK_CHARS('S', 'Y', 'S', 'T');
@@ -558,6 +560,13 @@ bool Parcel::checkInterface(IBinder* binder) const
 bool Parcel::enforceInterface(const String16& interface,
                               IPCThreadState* threadState) const
 {
+    return enforceInterface(interface.string(), interface.size(), threadState);
+}
+
+bool Parcel::enforceInterface(const char16_t* interface,
+                              size_t len,
+                              IPCThreadState* threadState) const
+{
     // StrictModePolicy.
     int32_t strictPolicy = readInt32();
     if (threadState == nullptr) {
@@ -584,12 +593,15 @@ bool Parcel::enforceInterface(const String16& interface,
         return false;
     }
     // Interface descriptor.
-    const String16 str(readString16());
-    if (str == interface) {
+    size_t parcel_interface_len;
+    const char16_t* parcel_interface = readString16Inplace(&parcel_interface_len);
+    if (len == parcel_interface_len &&
+            (!len || !memcmp(parcel_interface, interface, len * sizeof (char16_t)))) {
         return true;
     } else {
         ALOGW("**** enforceInterface() expected '%s' but read '%s'",
-                String8(interface).string(), String8(str).string());
+              String8(interface, len).string(),
+              String8(parcel_interface, parcel_interface_len).string());
         return false;
     }
 }
@@ -1276,8 +1288,10 @@ restart_write:
         if (err != NO_ERROR) return err;
     }
     if (!enoughObjects) {
+        if (mObjectsSize > SIZE_MAX - 2) return NO_MEMORY; // overflow
+        if ((mObjectsSize + 2) > SIZE_MAX / 3) return NO_MEMORY; // overflow
         size_t newSize = ((mObjectsSize+2)*3)/2;
-        if (newSize*sizeof(binder_size_t) < mObjectsSize) return NO_MEMORY;   // overflow
+        if (newSize > SIZE_MAX / sizeof(binder_size_t)) return NO_MEMORY; // overflow
         binder_size_t* objects = (binder_size_t*)realloc(mObjects, newSize*sizeof(binder_size_t));
         if (objects == nullptr) return NO_MEMORY;
         mObjects = objects;
@@ -2405,6 +2419,8 @@ status_t Parcel::growData(size_t len)
         return BAD_VALUE;
     }
 
+    if (len > SIZE_MAX - mDataSize) return NO_MEMORY; // overflow
+    if (mDataSize + len > SIZE_MAX / 3) return NO_MEMORY; // overflow
     size_t newSize = ((mDataSize+len)*3)/2;
     return (newSize <= mDataSize)
             ? (status_t) NO_MEMORY

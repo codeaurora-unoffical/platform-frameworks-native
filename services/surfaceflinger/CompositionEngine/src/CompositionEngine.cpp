@@ -16,14 +16,22 @@
 
 #include <compositionengine/CompositionRefreshArgs.h>
 #include <compositionengine/LayerFE.h>
+#include <compositionengine/LayerFECompositionState.h>
 #include <compositionengine/OutputLayer.h>
 #include <compositionengine/impl/CompositionEngine.h>
 #include <compositionengine/impl/Display.h>
-#include <compositionengine/impl/Layer.h>
+
 #include <renderengine/RenderEngine.h>
 #include <utils/Trace.h>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include "DisplayHardware/HWComposer.h"
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
 
 namespace android::compositionengine {
 
@@ -43,9 +51,9 @@ std::shared_ptr<compositionengine::Display> CompositionEngine::createDisplay(
     return compositionengine::impl::createDisplay(*this, args);
 }
 
-std::shared_ptr<compositionengine::Layer> CompositionEngine::createLayer(
-        const LayerCreationArgs& args) {
-    return compositionengine::impl::createLayer(args);
+std::unique_ptr<compositionengine::LayerFECompositionState>
+CompositionEngine::createLayerFECompositionState() {
+    return std::make_unique<compositionengine::LayerFECompositionState>();
 }
 
 HWComposer& CompositionEngine::getHwComposer() const {
@@ -112,8 +120,7 @@ void CompositionEngine::updateCursorAsync(CompositionRefreshArgs& args) {
         for (auto* layer : output->getOutputLayersOrderedByZ()) {
             if (layer->isHardwareCursor()) {
                 // Latch the cursor composition state from each front-end layer.
-                layer->getLayerFE().latchCursorCompositionState(layer->getLayer().editFEState());
-
+                layer->getLayerFE().prepareCompositionState(LayerFE::StateSubset::Cursor);
                 layer->writeCursorPositionToHWC();
             }
         }
@@ -129,8 +136,7 @@ void CompositionEngine::preComposition(CompositionRefreshArgs& args) {
     mRefreshStartTime = systemTime(SYSTEM_TIME_MONOTONIC);
 
     for (auto& layer : args.layers) {
-        sp<compositionengine::LayerFE> layerFE = layer->getLayerFE();
-        if (layerFE && layerFE->onPreComposition(mRefreshStartTime)) {
+        if (layer->onPreComposition(mRefreshStartTime)) {
             needsAnotherUpdate = true;
         }
     }

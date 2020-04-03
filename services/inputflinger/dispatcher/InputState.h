@@ -24,11 +24,13 @@
 
 namespace android::inputdispatcher {
 
+static constexpr int32_t INVALID_POINTER_INDEX = -1;
+
 /* Tracks dispatched key and motion event state so that cancellation events can be
  * synthesized when events are dropped. */
 class InputState {
 public:
-    InputState();
+    explicit InputState(const IdGenerator& idGenerator);
     ~InputState();
 
     // Returns true if there is no state to be canceled.
@@ -52,11 +54,14 @@ public:
     std::vector<EventEntry*> synthesizeCancelationEvents(nsecs_t currentTime,
                                                          const CancelationOptions& options);
 
+    // Synthesizes down events for the current state.
+    std::vector<EventEntry*> synthesizePointerDownEvents(nsecs_t currentTime);
+
     // Clears the current state.
     void clear();
 
-    // Copies pointer-related parts of the input state to another instance.
-    void copyPointerStateTo(InputState& other) const;
+    // Merges pointer-related parts of the input state into another instance.
+    void mergePointerStateTo(InputState& other);
 
     // Gets the fallback key associated with a keycode.
     // Returns -1 if none.
@@ -97,11 +102,16 @@ private:
         uint32_t pointerCount;
         PointerProperties pointerProperties[MAX_POINTERS];
         PointerCoords pointerCoords[MAX_POINTERS];
+        // Track for which pointers the target doesn't know about.
+        int32_t firstNewPointerIdx = INVALID_POINTER_INDEX;
         bool hovering;
         uint32_t policyFlags;
 
         void setPointers(const MotionEntry& entry);
+        void mergePointerStateTo(MotionMemento& other) const;
     };
+
+    const IdGenerator& mIdGenerator; // InputDispatcher owns it so we won't have dangling reference.
 
     std::vector<KeyMemento> mKeyMementos;
     std::vector<MotionMemento> mMotionMementos;

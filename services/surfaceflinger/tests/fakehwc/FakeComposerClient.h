@@ -246,6 +246,21 @@ public:
             Display display, Config config,
             const V2_4::IComposerClient::VsyncPeriodChangeConstraints& vsyncPeriodChangeConstraints,
             VsyncPeriodChangeTimeline* outTimeline) override;
+    V2_4::Error setAutoLowLatencyMode(Display display, bool on) override;
+    V2_4::Error getSupportedContentTypes(
+            Display display,
+            std::vector<IComposerClient::ContentType>* outSupportedContentTypes) override;
+    V2_4::Error setContentType(Display display, IComposerClient::ContentType type) override;
+    V2_4::Error validateDisplay_2_4(
+            Display display, std::vector<Layer>* outChangedLayers,
+            std::vector<IComposerClient::Composition>* outCompositionTypes,
+            uint32_t* outDisplayRequestMask, std::vector<Layer>* outRequestedLayers,
+            std::vector<uint32_t>* outRequestMasks,
+            IComposerClient::ClientTargetProperty* outClientTargetProperty) override;
+    V2_4::Error setLayerGenericMetadata(Display display, Layer layer, const std::string& key,
+                                        bool mandatory, const std::vector<uint8_t>& value) override;
+    V2_4::Error getLayerGenericMetadataKeys(
+            std::vector<IComposerClient::LayerGenericMetadataKey>* outKeys) override;
 
     void setClient(ComposerClient* client);
 

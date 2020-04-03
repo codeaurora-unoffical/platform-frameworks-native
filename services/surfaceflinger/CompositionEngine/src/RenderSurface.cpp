@@ -25,6 +25,7 @@
 #include <compositionengine/impl/DumpHelpers.h>
 #include <compositionengine/impl/OutputCompositionState.h>
 #include <compositionengine/impl/RenderSurface.h>
+
 #include <log/log.h>
 #include <renderengine/RenderEngine.h>
 #include <sync/sync.h>
@@ -33,7 +34,14 @@
 #include <ui/Rect.h>
 #include <utils/Trace.h>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include "DisplayHardware/HWComposer.h"
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
 
 namespace android::compositionengine {
 
@@ -87,7 +95,8 @@ const sp<Fence>& RenderSurface::getClientTargetAcquireFence() const {
 }
 
 void RenderSurface::setDisplaySize(const ui::Size& size) {
-    mDisplaySurface->resizeBuffers(size.width, size.height);
+    mDisplaySurface->resizeBuffers(static_cast<uint32_t>(size.width),
+                                   static_cast<uint32_t>(size.height));
     mSize = size;
 }
 

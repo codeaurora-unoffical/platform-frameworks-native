@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_GUI_ISURFACE_COMPOSER_H
-#define ANDROID_GUI_ISURFACE_COMPOSER_H
+#pragma once
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -34,6 +33,7 @@
 #include <ui/GraphicTypes.h>
 #include <ui/PhysicalDisplayId.h>
 #include <ui/PixelFormat.h>
+#include <ui/Rotation.h>
 
 #include <utils/Errors.h>
 #include <utils/RefBase.h>
@@ -45,13 +45,13 @@
 #include <vector>
 
 namespace android {
-// ----------------------------------------------------------------------------
 
 struct client_cache_t;
 struct ComposerState;
-struct DisplayState;
+struct DisplayConfig;
 struct DisplayInfo;
 struct DisplayStatInfo;
+struct DisplayState;
 struct InputWindowCommands;
 class LayerDebugInfo;
 class HdrCapabilities;
@@ -62,6 +62,12 @@ class IRegionSamplingListener;
 class Rect;
 enum class FrameEvent;
 
+namespace ui {
+
+struct DisplayState;
+
+} // namespace ui
+
 /*
  * This class defines the Binder IPC interface for accessing various
  * SurfaceFlinger features.
@@ -69,6 +75,8 @@ enum class FrameEvent;
 class ISurfaceComposer: public IInterface {
 public:
     DECLARE_META_INTERFACE(SurfaceComposer)
+
+    static constexpr size_t MAX_LAYERS = 4096;
 
     // flags for setTransactionState()
     enum {
@@ -79,13 +87,6 @@ public:
         // thus, SurfaceFlinger should wake-up earlier to avoid missing frame deadlines. In this
         // case SurfaceFlinger will wake up at (sf vsync offset - debug.sf.early_phase_offset_ns)
         eEarlyWakeup = 0x04
-    };
-
-    enum Rotation {
-        eRotateNone = 0,
-        eRotate90   = 1,
-        eRotate180  = 2,
-        eRotate270  = 3
     };
 
     enum VsyncSource {
@@ -167,10 +168,6 @@ public:
      */
     virtual void setPowerMode(const sp<IBinder>& display, int mode) = 0;
 
-    /* returns information for each configuration of the given display
-     * intended to be used to get information about built-in displays */
-    virtual status_t getDisplayConfigs(const sp<IBinder>& display,
-            Vector<DisplayInfo>* configs) = 0;
 
     /* returns display statistics for a given display
      * intended to be used by the media framework to properly schedule
@@ -178,13 +175,26 @@ public:
     virtual status_t getDisplayStats(const sp<IBinder>& display,
             DisplayStatInfo* stats) = 0;
 
-    /* indicates which of the configurations returned by getDisplayInfo is
-     * currently active */
-    virtual int getActiveConfig(const sp<IBinder>& display) = 0;
+    /**
+     * Get transactional state of given display.
+     */
+    virtual status_t getDisplayState(const sp<IBinder>& display, ui::DisplayState*) = 0;
 
-    /* specifies which configuration (of those returned by getDisplayInfo)
-     * should be used */
-    virtual status_t setActiveConfig(const sp<IBinder>& display, int id) = 0;
+    /**
+     * Get immutable information about given physical display.
+     */
+    virtual status_t getDisplayInfo(const sp<IBinder>& display, DisplayInfo*) = 0;
+
+    /**
+     * Get configurations supported by given physical display.
+     */
+    virtual status_t getDisplayConfigs(const sp<IBinder>& display, Vector<DisplayConfig>*) = 0;
+
+    /**
+     * Get the index into configurations returned by getDisplayConfigs,
+     * corresponding to the active configuration.
+     */
+    virtual int getActiveConfig(const sp<IBinder>& display) = 0;
 
     virtual status_t getDisplayColorModes(const sp<IBinder>& display,
             Vector<ui::ColorMode>* outColorModes) = 0;
@@ -193,6 +203,37 @@ public:
     virtual ui::ColorMode getActiveColorMode(const sp<IBinder>& display) = 0;
     virtual status_t setActiveColorMode(const sp<IBinder>& display,
             ui::ColorMode colorMode) = 0;
+
+    /**
+     * Returns true if the connected display reports support for HDMI 2.1 Auto
+     * Low Latency Mode.
+     * For more information, see the HDMI 2.1 specification.
+     */
+    virtual status_t getAutoLowLatencyModeSupport(const sp<IBinder>& display,
+                                                  bool* outSupport) const = 0;
+
+    /**
+     * Switches Auto Low Latency Mode on/off on the connected display, if it is
+     * available. This should only be called if #getAutoLowLatencyMode returns
+     * true.
+     * For more information, see the HDMI 2.1 specification.
+     */
+    virtual void setAutoLowLatencyMode(const sp<IBinder>& display, bool on) = 0;
+
+    /**
+     * Returns true if the connected display reports support for Game Content Type.
+     * For more information, see the HDMI 1.4 specification.
+     */
+    virtual status_t getGameContentTypeSupport(const sp<IBinder>& display,
+                                               bool* outSupport) const = 0;
+
+    /**
+     * This will start sending infoframes to the connected display with
+     * ContentType=Game (if on=true). This will switch the disply to Game mode.
+     * This should only be called if #getGameContentTypeSupport returns true.
+     * For more information, see the HDMI 1.4 specification.
+     */
+    virtual void setGameContentType(const sp<IBinder>& display, bool on) = 0;
 
     /**
      * Capture the specified screen. This requires READ_FRAME_BUFFER
@@ -218,10 +259,10 @@ public:
      * it) around its center.
      */
     virtual status_t captureScreen(const sp<IBinder>& display, sp<GraphicBuffer>* outBuffer,
-                                   bool& outCapturedSecureLayers, const ui::Dataspace reqDataspace,
-                                   const ui::PixelFormat reqPixelFormat, Rect sourceCrop,
+                                   bool& outCapturedSecureLayers, ui::Dataspace reqDataspace,
+                                   ui::PixelFormat reqPixelFormat, const Rect& sourceCrop,
                                    uint32_t reqWidth, uint32_t reqHeight, bool useIdentityTransform,
-                                   Rotation rotation = eRotateNone,
+                                   ui::Rotation rotation = ui::ROTATION_0,
                                    bool captureSecureLayers = false) = 0;
     /**
      * Capture the specified screen. This requires READ_FRAME_BUFFER
@@ -245,8 +286,9 @@ public:
      * it) around its center.
      */
     virtual status_t captureScreen(const sp<IBinder>& display, sp<GraphicBuffer>* outBuffer,
-                                   Rect sourceCrop, uint32_t reqWidth, uint32_t reqHeight,
-                                   bool useIdentityTransform, Rotation rotation = eRotateNone) {
+                                   const Rect& sourceCrop, uint32_t reqWidth, uint32_t reqHeight,
+                                   bool useIdentityTransform,
+                                   ui::Rotation rotation = ui::ROTATION_0) {
         bool outIgnored;
         return captureScreen(display, outBuffer, outIgnored, ui::Dataspace::V0_SRGB,
                              ui::PixelFormat::RGBA_8888, sourceCrop, reqWidth, reqHeight,
@@ -270,8 +312,7 @@ public:
      */
     virtual status_t captureLayers(
             const sp<IBinder>& layerHandleBinder, sp<GraphicBuffer>* outBuffer,
-            const ui::Dataspace reqDataspace, const ui::PixelFormat reqPixelFormat,
-            const Rect& sourceCrop,
+            ui::Dataspace reqDataspace, ui::PixelFormat reqPixelFormat, const Rect& sourceCrop,
             const std::unordered_set<sp<IBinder>, SpHash<IBinder>>& excludeHandles,
             float frameScale = 1.0, bool childrenOnly = false) = 0;
 
@@ -386,31 +427,16 @@ public:
     virtual status_t removeRegionSamplingListener(const sp<IRegionSamplingListener>& listener) = 0;
 
     /*
-     * Sets the allowed display configurations to be used.
-     * The allowedConfigs in a vector of indexes corresponding to the configurations
-     * returned from getDisplayConfigs().
-     */
-    virtual status_t setAllowedDisplayConfigs(const sp<IBinder>& displayToken,
-                                              const std::vector<int32_t>& allowedConfigs) = 0;
-
-    /*
-     * Returns the allowed display configurations currently set.
-     * The allowedConfigs in a vector of indexes corresponding to the configurations
-     * returned from getDisplayConfigs().
-     */
-    virtual status_t getAllowedDisplayConfigs(const sp<IBinder>& displayToken,
-                                              std::vector<int32_t>* outAllowedConfigs) = 0;
-    /*
      * Sets the refresh rate boundaries for display configuration.
      * For all other parameters, default configuration is used. The index for the default is
      * corresponding to the configs returned from getDisplayConfigs().
      */
     virtual status_t setDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken,
-                                                  int32_t defaultModeId, float minRefreshRate,
+                                                  int32_t defaultConfig, float minRefreshRate,
                                                   float maxRefreshRate) = 0;
 
     virtual status_t getDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken,
-                                                  int32_t* outDefaultModeId,
+                                                  int32_t* outDefaultConfig,
                                                   float* outMinRefreshRate,
                                                   float* outMaxRefreshRate) = 0;
     /*
@@ -476,6 +502,12 @@ public:
     virtual status_t setGlobalShadowSettings(const half4& ambientColor, const half4& spotColor,
                                              float lightPosY, float lightPosZ,
                                              float lightRadius) = 0;
+
+    /*
+     * Sets the intended frame rate for a surface. See ANativeWindow_setFrameRate() for more info.
+     */
+    virtual status_t setFrameRate(const sp<IGraphicBufferProducer>& surface, float frameRate,
+                                  int8_t compatibility) = 0;
 };
 
 // ----------------------------------------------------------------------------
@@ -487,7 +519,7 @@ public:
         // Java by ActivityManagerService.
         BOOT_FINISHED = IBinder::FIRST_CALL_TRANSACTION,
         CREATE_CONNECTION,
-        CREATE_GRAPHIC_BUFFER_ALLOC_UNUSED, // unused, fails permissions check
+        GET_DISPLAY_INFO,
         CREATE_DISPLAY_EVENT_CONNECTION,
         CREATE_DISPLAY,
         DESTROY_DISPLAY,
@@ -497,8 +529,7 @@ public:
         GET_SUPPORTED_FRAME_TIMESTAMPS,
         GET_DISPLAY_CONFIGS,
         GET_ACTIVE_CONFIG,
-        SET_ACTIVE_CONFIG,
-        CONNECT_DISPLAY_UNUSED, // unused, fails permissions check
+        GET_DISPLAY_STATE,
         CAPTURE_SCREEN,
         CAPTURE_LAYERS,
         CLEAR_ANIMATION_FRAME_STATS,
@@ -523,8 +554,6 @@ public:
         GET_PHYSICAL_DISPLAY_IDS,
         ADD_REGION_SAMPLING_LISTENER,
         REMOVE_REGION_SAMPLING_LISTENER,
-        SET_ALLOWED_DISPLAY_CONFIGS,
-        GET_ALLOWED_DISPLAY_CONFIGS,
         SET_DESIRED_DISPLAY_CONFIG_SPECS,
         GET_DESIRED_DISPLAY_CONFIG_SPECS,
         GET_DISPLAY_BRIGHTNESS_SUPPORT,
@@ -532,6 +561,11 @@ public:
         CAPTURE_SCREEN_BY_ID,
         NOTIFY_POWER_HINT,
         SET_GLOBAL_SHADOW_SETTINGS,
+        GET_AUTO_LOW_LATENCY_MODE_SUPPORT,
+        SET_AUTO_LOW_LATENCY_MODE,
+        GET_GAME_CONTENT_TYPE_SUPPORT,
+        SET_GAME_CONTENT_TYPE,
+        SET_FRAME_RATE,
         // Always append new enum to the end.
     };
 
@@ -539,8 +573,4 @@ public:
             Parcel* reply, uint32_t flags = 0);
 };
 
-// ----------------------------------------------------------------------------
-
-}; // namespace android
-
-#endif // ANDROID_GUI_ISURFACE_COMPOSER_H
+} // namespace android

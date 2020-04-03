@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 // #define LOG_NDEBUG 0
 
 #undef LOG_TAG
@@ -42,8 +46,6 @@ using android::HdrMetadata;
 using android::Rect;
 using android::Region;
 using android::sp;
-using android::hardware::Return;
-using android::hardware::Void;
 
 namespace HWC2 {
 
@@ -60,174 +62,7 @@ inline bool hasMetadataKey(const std::set<Hwc2::PerFrameMetadataKey>& keys,
     return keys.find(key) != keys.end();
 }
 
-class ComposerCallbackBridge : public Hwc2::IComposerCallback {
-public:
-    ComposerCallbackBridge(ComposerCallback* callback, int32_t sequenceId)
-            : mCallback(callback), mSequenceId(sequenceId) {}
-
-    Return<void> onHotplug(Hwc2::Display display,
-                           IComposerCallback::Connection conn) override
-    {
-        HWC2::Connection connection = static_cast<HWC2::Connection>(conn);
-        mCallback->onHotplugReceived(mSequenceId, display, connection);
-        return Void();
-    }
-
-    Return<void> onRefresh(Hwc2::Display display) override
-    {
-        mCallback->onRefreshReceived(mSequenceId, display);
-        return Void();
-    }
-
-    Return<void> onVsync(Hwc2::Display display, int64_t timestamp) override
-    {
-        mCallback->onVsyncReceived(mSequenceId, display, timestamp, std::nullopt);
-        return Void();
-    }
-
-    Return<void> onVsync_2_4(Hwc2::Display display, int64_t timestamp,
-                             Hwc2::VsyncPeriodNanos vsyncPeriodNanos) override {
-        // TODO(b/140201379): use vsyncPeriodNanos in the new DispSync
-        mCallback->onVsyncReceived(mSequenceId, display, timestamp,
-                                   std::make_optional(vsyncPeriodNanos));
-        return Void();
-    }
-
-    Return<void> onVsyncPeriodTimingChanged(
-            Hwc2::Display display,
-            const Hwc2::VsyncPeriodChangeTimeline& updatedTimeline) override {
-        hwc_vsync_period_change_timeline_t timeline;
-        timeline.newVsyncAppliedTimeNanos = updatedTimeline.newVsyncAppliedTimeNanos;
-        timeline.refreshRequired = updatedTimeline.refreshRequired;
-        timeline.refreshTimeNanos = updatedTimeline.refreshTimeNanos;
-        mCallback->onVsyncPeriodTimingChangedReceived(mSequenceId, display, timeline);
-        return Void();
-    }
-
-private:
-    ComposerCallback* mCallback;
-    int32_t mSequenceId;
-};
-
 } // namespace anonymous
-
-
-// Device methods
-
-Device::Device(std::unique_ptr<android::Hwc2::Composer> composer) : mComposer(std::move(composer)) {
-    loadCapabilities();
-}
-
-void Device::registerCallback(ComposerCallback* callback, int32_t sequenceId) {
-    if (mRegisteredCallback) {
-        ALOGW("Callback already registered. Ignored extra registration "
-                "attempt.");
-        return;
-    }
-    mRegisteredCallback = true;
-    sp<ComposerCallbackBridge> callbackBridge(
-            new ComposerCallbackBridge(callback, sequenceId));
-    mComposer->registerCallback(callbackBridge);
-}
-
-// Required by HWC2 device
-
-std::string Device::dump() const
-{
-    return mComposer->dumpDebugInfo();
-}
-
-uint32_t Device::getMaxVirtualDisplayCount() const
-{
-    return mComposer->getMaxVirtualDisplayCount();
-}
-
-Error Device::getDisplayIdentificationData(hwc2_display_t hwcDisplayId, uint8_t* outPort,
-                                           std::vector<uint8_t>* outData) const {
-    auto intError = mComposer->getDisplayIdentificationData(hwcDisplayId, outPort, outData);
-    return static_cast<Error>(intError);
-}
-
-Error Device::createVirtualDisplay(uint32_t width, uint32_t height,
-        PixelFormat* format, Display** outDisplay)
-{
-    ALOGI("Creating virtual display");
-
-    hwc2_display_t displayId = 0;
-    auto intError = mComposer->createVirtualDisplay(width, height,
-            format, &displayId);
-    auto error = static_cast<Error>(intError);
-    if (error != Error::None) {
-        return error;
-    }
-
-    auto display = std::make_unique<impl::Display>(*mComposer.get(), mCapabilities, displayId,
-                                                   DisplayType::Virtual);
-    display->setConnected(true);
-    *outDisplay = display.get();
-    mDisplays.emplace(displayId, std::move(display));
-    ALOGI("Created virtual display");
-    return Error::None;
-}
-
-void Device::destroyDisplay(hwc2_display_t displayId)
-{
-    ALOGI("Destroying display %" PRIu64, displayId);
-    mDisplays.erase(displayId);
-}
-
-void Device::onHotplug(hwc2_display_t displayId, Connection connection) {
-    if (connection == Connection::Connected) {
-        // If we get a hotplug connected event for a display we already have,
-        // destroy the display and recreate it. This will force us to requery
-        // the display params and recreate all layers on that display.
-        auto oldDisplay = getDisplayById(displayId);
-        if (oldDisplay != nullptr && oldDisplay->isConnected()) {
-            ALOGI("Hotplug connecting an already connected display."
-                    " Clearing old display state.");
-        }
-        mDisplays.erase(displayId);
-
-        auto newDisplay = std::make_unique<impl::Display>(*mComposer.get(), mCapabilities,
-                                                          displayId, DisplayType::Physical);
-        newDisplay->setConnected(true);
-        mDisplays.emplace(displayId, std::move(newDisplay));
-    } else if (connection == Connection::Disconnected) {
-        // The display will later be destroyed by a call to
-        // destroyDisplay(). For now we just mark it disconnected.
-        auto display = getDisplayById(displayId);
-        if (display) {
-            display->setConnected(false);
-        } else {
-            ALOGW("Attempted to disconnect unknown display %" PRIu64,
-                  displayId);
-        }
-    }
-}
-
-// Other Device methods
-
-Display* Device::getDisplayById(hwc2_display_t id) {
-    auto iter = mDisplays.find(id);
-    return iter == mDisplays.end() ? nullptr : iter->second.get();
-}
-
-// Device initialization methods
-
-void Device::loadCapabilities()
-{
-    static_assert(sizeof(Capability) == sizeof(int32_t),
-            "Capability size has changed");
-    auto capabilities = mComposer->getCapabilities();
-    for (auto capability : capabilities) {
-        mCapabilities.emplace(static_cast<Capability>(capability));
-    }
-}
-
-Error Device::flushCommands()
-{
-    return static_cast<Error>(mComposer->executeCommands());
-}
 
 // Display methods
 Display::~Display() = default;
@@ -260,13 +95,13 @@ float Display::Config::Builder::getDefaultDensity() {
 }
 
 namespace impl {
+
 Display::Display(android::Hwc2::Composer& composer,
                  const std::unordered_set<Capability>& capabilities, hwc2_display_t id,
                  DisplayType type)
       : mComposer(composer),
         mCapabilities(capabilities),
         mId(id),
-        mIsConnected(false),
         mType(type) {
     ALOGV("Created display %" PRIu64, id);
 }
@@ -274,20 +109,27 @@ Display::Display(android::Hwc2::Composer& composer,
 Display::~Display() {
     mLayers.clear();
 
-    if (mType == DisplayType::Virtual) {
-        ALOGV("Destroying virtual display");
-        auto intError = mComposer.destroyVirtualDisplay(mId);
-        auto error = static_cast<Error>(intError);
-        ALOGE_IF(error != Error::None, "destroyVirtualDisplay(%" PRIu64
-                ") failed: %s (%d)", mId, to_string(error).c_str(), intError);
-    } else if (mType == DisplayType::Physical) {
-        auto error = setVsyncEnabled(HWC2::Vsync::Disable);
-        if (error != Error::None) {
-            ALOGE("~Display: Failed to disable vsync for display %" PRIu64
-                    ": %s (%d)", mId, to_string(error).c_str(),
-                    static_cast<int32_t>(error));
-        }
+    Error error = Error::None;
+    const char* msg;
+    switch (mType) {
+        case DisplayType::Physical:
+            error = setVsyncEnabled(HWC2::Vsync::Disable);
+            msg = "disable VSYNC for";
+            break;
+
+        case DisplayType::Virtual:
+            error = static_cast<Error>(mComposer.destroyVirtualDisplay(mId));
+            msg = "destroy virtual";
+            break;
+
+        case DisplayType::Invalid: // Used in unit tests.
+            break;
     }
+
+    ALOGE_IF(error != Error::None, "%s: Failed to %s display %" PRIu64 ": %s (%d)", __FUNCTION__,
+             msg, mId, to_string(error).c_str(), static_cast<int32_t>(error));
+
+    ALOGV("Destroyed display %" PRIu64, mId);
 }
 
 // Required by HWC2 display
@@ -537,9 +379,19 @@ Error Display::getRequests(HWC2::DisplayRequest* outDisplayRequests,
     return Error::None;
 }
 
-Error Display::getType(DisplayType* outType) const
-{
-    *outType = mType;
+Error Display::getConnectionType(android::DisplayConnectionType* outType) const {
+    if (mType != DisplayType::Physical) return Error::BadDisplay;
+
+    using ConnectionType = Hwc2::IComposerClient::DisplayConnectionType;
+    ConnectionType connectionType;
+    const auto error = static_cast<Error>(mComposer.getDisplayConnectionType(mId, &connectionType));
+    if (error != Error::None) {
+        return error;
+    }
+
+    *outType = connectionType == ConnectionType::INTERNAL
+            ? android::DisplayConnectionType::Internal
+            : android::DisplayConnectionType::External;
     return Error::None;
 }
 
@@ -799,6 +651,26 @@ Error Display::setDisplayBrightness(float brightness) const {
     return static_cast<Error>(intError);
 }
 
+Error Display::setAutoLowLatencyMode(bool on) const {
+    auto intError = mComposer.setAutoLowLatencyMode(mId, on);
+    return static_cast<Error>(intError);
+}
+
+Error Display::getSupportedContentTypes(std::vector<ContentType>* outSupportedContentTypes) const {
+    std::vector<Hwc2::IComposerClient::ContentType> tmpSupportedContentTypes;
+    auto intError = mComposer.getSupportedContentTypes(mId, &tmpSupportedContentTypes);
+    for (Hwc2::IComposerClient::ContentType contentType : tmpSupportedContentTypes) {
+        outSupportedContentTypes->push_back(static_cast<ContentType>(contentType));
+    }
+    return static_cast<Error>(intError);
+}
+
+Error Display::setContentType(ContentType contentType) const {
+    using Hwc2_ContentType = Hwc2::IComposerClient::ContentType;
+    auto intError = mComposer.setContentType(mId, static_cast<Hwc2_ContentType>(contentType));
+    return static_cast<Error>(intError);
+}
+
 // For use by Device
 
 void Display::setConnected(bool connected) {
@@ -879,12 +751,11 @@ namespace impl {
 
 Layer::Layer(android::Hwc2::Composer& composer, const std::unordered_set<Capability>& capabilities,
              hwc2_display_t displayId, hwc2_layer_t layerId)
-  : mComposer(composer),
-    mCapabilities(capabilities),
-    mDisplayId(displayId),
-    mId(layerId),
-    mColorMatrix(android::mat4())
-{
+      : mComposer(composer),
+        mCapabilities(capabilities),
+        mDisplayId(displayId),
+        mId(layerId),
+        mColorMatrix(android::mat4()) {
     ALOGV("Created layer %" PRIu64 " on display %" PRIu64, layerId, displayId);
 }
 
@@ -1124,5 +995,15 @@ Error Layer::setColorTransform(const android::mat4& matrix) {
     return error;
 }
 
+// Composer HAL 2.4
+Error Layer::setLayerGenericMetadata(const std::string& name, bool mandatory,
+                                     const std::vector<uint8_t>& value) {
+    auto intError = mComposer.setLayerGenericMetadata(mDisplayId, mId, name, mandatory, value);
+    return static_cast<Error>(intError);
+}
+
 } // namespace impl
 } // namespace HWC2
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #undef LOG_TAG
 #define LOG_TAG "HwcComposer"
 
@@ -1281,6 +1285,75 @@ V2_4::Error Composer::setActiveConfigWithConstraints(
     return error;
 }
 
+V2_4::Error Composer::setAutoLowLatencyMode(Display display, bool on) {
+    using Error = V2_4::Error;
+    if (!mClient_2_4) {
+        return Error::UNSUPPORTED;
+    }
+
+    return mClient_2_4->setAutoLowLatencyMode(display, on);
+}
+
+V2_4::Error Composer::getSupportedContentTypes(
+        Display displayId, std::vector<IComposerClient::ContentType>* outSupportedContentTypes) {
+    using Error = V2_4::Error;
+    if (!mClient_2_4) {
+        return Error::UNSUPPORTED;
+    }
+
+    Error error = kDefaultError_2_4;
+    mClient_2_4->getSupportedContentTypes(displayId,
+                                          [&](const auto& tmpError,
+                                              const auto& tmpSupportedContentTypes) {
+                                              error = tmpError;
+                                              if (error != Error::NONE) {
+                                                  return;
+                                              }
+
+                                              *outSupportedContentTypes = tmpSupportedContentTypes;
+                                          });
+    return error;
+}
+
+V2_4::Error Composer::setContentType(Display display, IComposerClient::ContentType contentType) {
+    using Error = V2_4::Error;
+    if (!mClient_2_4) {
+        return Error::UNSUPPORTED;
+    }
+
+    return mClient_2_4->setContentType(display, contentType);
+}
+
+V2_4::Error Composer::setLayerGenericMetadata(Display display, Layer layer, const std::string& key,
+                                              bool mandatory, const std::vector<uint8_t>& value) {
+    using Error = V2_4::Error;
+    if (!mClient_2_4) {
+        return Error::UNSUPPORTED;
+    }
+    mWriter.selectDisplay(display);
+    mWriter.selectLayer(layer);
+    mWriter.setLayerGenericMetadata(key, mandatory, value);
+    return Error::NONE;
+}
+
+V2_4::Error Composer::getLayerGenericMetadataKeys(
+        std::vector<IComposerClient::LayerGenericMetadataKey>* outKeys) {
+    using Error = V2_4::Error;
+    if (!mClient_2_4) {
+        return Error::UNSUPPORTED;
+    }
+    Error error = kDefaultError_2_4;
+    mClient_2_4->getLayerGenericMetadataKeys([&](const auto& tmpError, const auto& tmpKeys) {
+        error = tmpError;
+        if (error != Error::NONE) {
+            return;
+        }
+
+        *outKeys = tmpKeys;
+    });
+    return error;
+}
+
 CommandReader::~CommandReader()
 {
     resetData();
@@ -1294,8 +1367,7 @@ Error CommandReader::parse()
     uint16_t length = 0;
 
     while (!isEmpty()) {
-        auto command_2_1 = reinterpret_cast<V2_1::IComposerClient::Command*>(&command);
-        if (!beginCommand(command_2_1, &length)) {
+        if (!beginCommand(&command, &length)) {
             break;
         }
 
@@ -1321,6 +1393,9 @@ Error CommandReader::parse()
             break;
         case IComposerClient::Command ::SET_PRESENT_OR_VALIDATE_DISPLAY_RESULT:
             parsed = parseSetPresentOrValidateDisplayResult(length);
+            break;
+        case IComposerClient::Command::SET_CLIENT_TARGET_PROPERTY:
+            parsed = parseSetClientTargetProperty(length);
             break;
         default:
             parsed = false;
@@ -1459,6 +1534,15 @@ bool CommandReader::parseSetPresentOrValidateDisplayResult(uint16_t length)
     return true;
 }
 
+bool CommandReader::parseSetClientTargetProperty(uint16_t length) {
+    if (length != CommandWriterBase::kSetClientTargetPropertyLength || !mCurrentReturnData) {
+        return false;
+    }
+    mCurrentReturnData->clientTargetProperty.pixelFormat = static_cast<PixelFormat>(readSigned());
+    mCurrentReturnData->clientTargetProperty.dataspace = static_cast<Dataspace>(readSigned());
+    return true;
+}
+
 void CommandReader::resetData()
 {
     mErrors.clear();
@@ -1583,3 +1667,6 @@ void CommandReader::takePresentOrValidateStage(Display display, uint32_t* state)
 } // namespace Hwc2
 
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

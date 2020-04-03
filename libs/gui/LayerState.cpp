@@ -24,6 +24,8 @@
 #include <gui/IGraphicBufferProducer.h>
 #include <gui/LayerState.h>
 
+#include <cmath>
+
 namespace android {
 
 status_t layer_state_t::write(Parcel& output) const
@@ -86,6 +88,7 @@ status_t layer_state_t::write(Parcel& output) const
     memcpy(output.writeInplace(16 * sizeof(float)),
            colorTransform.asArray(), 16 * sizeof(float));
     output.writeFloat(cornerRadius);
+    output.writeUint32(backgroundBlurRadius);
     output.writeStrongBinder(cachedBuffer.token.promote());
     output.writeUint64(cachedBuffer.id);
     output.writeParcelable(metadata);
@@ -110,6 +113,9 @@ status_t layer_state_t::write(Parcel& output) const
         }
     }
     output.writeFloat(shadowRadius);
+    output.writeInt32(frameRateSelectionPriority);
+    output.writeFloat(frameRate);
+    output.writeByte(frameRateCompatibility);
     return NO_ERROR;
 }
 
@@ -171,6 +177,7 @@ status_t layer_state_t::read(const Parcel& input)
 
     colorTransform = mat4(static_cast<const float*>(input.readInplace(16 * sizeof(float))));
     cornerRadius = input.readFloat();
+    backgroundBlurRadius = input.readUint32();
     cachedBuffer.token = input.readStrongBinder();
     cachedBuffer.id = input.readUint64();
     input.readParcelable(&metadata);
@@ -188,6 +195,9 @@ status_t layer_state_t::read(const Parcel& input)
         listeners.emplace_back(listener, callbackIds);
     }
     shadowRadius = input.readFloat();
+    frameRateSelectionPriority = input.readInt32();
+    frameRate = input.readFloat();
+    frameRateCompatibility = input.readByte();
     return NO_ERROR;
 }
 
@@ -203,7 +213,6 @@ status_t ComposerState::read(const Parcel& input) {
 DisplayState::DisplayState() :
     what(0),
     layerStack(0),
-    orientation(eOrientationDefault),
     viewport(Rect::EMPTY_RECT),
     frame(Rect::EMPTY_RECT),
     width(0),
@@ -215,7 +224,7 @@ status_t DisplayState::write(Parcel& output) const {
     output.writeStrongBinder(IInterface::asBinder(surface));
     output.writeUint32(what);
     output.writeUint32(layerStack);
-    output.writeUint32(orientation);
+    output.writeUint32(toRotationInt(orientation));
     output.write(viewport);
     output.write(frame);
     output.writeUint32(width);
@@ -228,7 +237,7 @@ status_t DisplayState::read(const Parcel& input) {
     surface = interface_cast<IGraphicBufferProducer>(input.readStrongBinder());
     what = input.readUint32();
     layerStack = input.readUint32();
-    orientation = input.readUint32();
+    orientation = ui::toRotation(input.readUint32());
     input.read(viewport);
     input.read(frame);
     width = input.readUint32();
@@ -303,6 +312,10 @@ void layer_state_t::merge(const layer_state_t& other) {
     if (other.what & eCornerRadiusChanged) {
         what |= eCornerRadiusChanged;
         cornerRadius = other.cornerRadius;
+    }
+    if (other.what & eBackgroundBlurRadiusChanged) {
+        what |= eBackgroundBlurRadiusChanged;
+        backgroundBlurRadius = other.backgroundBlurRadius;
     }
     if (other.what & eDeferTransaction_legacy) {
         what |= eDeferTransaction_legacy;
@@ -407,12 +420,19 @@ void layer_state_t::merge(const layer_state_t& other) {
         what |= eMetadataChanged;
         metadata.merge(other.metadata);
     }
-
     if (other.what & eShadowRadiusChanged) {
         what |= eShadowRadiusChanged;
         shadowRadius = other.shadowRadius;
     }
-
+    if (other.what & eFrameRateSelectionPriority) {
+        what |= eFrameRateSelectionPriority;
+        frameRateSelectionPriority = other.frameRateSelectionPriority;
+    }
+    if (other.what & eFrameRateChanged) {
+        what |= eFrameRateChanged;
+        frameRate = other.frameRate;
+        frameRateCompatibility = other.frameRateCompatibility;
+    }
     if ((other.what & what) != other.what) {
         ALOGE("Unmerged SurfaceComposer Transaction properties. LayerState::merge needs updating? "
               "other.what=0x%" PRIu64 " what=0x%" PRIu64,
@@ -423,40 +443,36 @@ void layer_state_t::merge(const layer_state_t& other) {
 // ------------------------------- InputWindowCommands ----------------------------------------
 
 void InputWindowCommands::merge(const InputWindowCommands& other) {
-    transferTouchFocusCommands
-            .insert(transferTouchFocusCommands.end(),
-                    std::make_move_iterator(other.transferTouchFocusCommands.begin()),
-                    std::make_move_iterator(other.transferTouchFocusCommands.end()));
-
     syncInputWindows |= other.syncInputWindows;
 }
 
 void InputWindowCommands::clear() {
-    transferTouchFocusCommands.clear();
     syncInputWindows = false;
 }
 
 void InputWindowCommands::write(Parcel& output) const {
-    output.writeUint32(static_cast<uint32_t>(transferTouchFocusCommands.size()));
-    for (const auto& transferTouchFocusCommand : transferTouchFocusCommands) {
-        output.writeStrongBinder(transferTouchFocusCommand.fromToken);
-        output.writeStrongBinder(transferTouchFocusCommand.toToken);
-    }
-
     output.writeBool(syncInputWindows);
 }
 
 void InputWindowCommands::read(const Parcel& input) {
-    size_t count = input.readUint32();
-    transferTouchFocusCommands.clear();
-    for (size_t i = 0; i < count; i++) {
-        TransferTouchFocusCommand transferTouchFocusCommand;
-        transferTouchFocusCommand.fromToken = input.readStrongBinder();
-        transferTouchFocusCommand.toToken = input.readStrongBinder();
-        transferTouchFocusCommands.emplace_back(transferTouchFocusCommand);
+    syncInputWindows = input.readBool();
+}
+
+bool ValidateFrameRate(float frameRate, int8_t compatibility, const char* inFunctionName) {
+    const char* functionName = inFunctionName != nullptr ? inFunctionName : "call";
+    int floatClassification = std::fpclassify(frameRate);
+    if (frameRate < 0 || floatClassification == FP_INFINITE || floatClassification == FP_NAN) {
+        ALOGE("%s failed - invalid frame rate %f", functionName, frameRate);
+        return false;
     }
 
-    syncInputWindows = input.readBool();
+    if (compatibility != ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT &&
+        compatibility != ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) {
+        ALOGE("%s failed - invalid compatibility value %d", functionName, compatibility);
+        return false;
+    }
+
+    return true;
 }
 
 }; // namespace android

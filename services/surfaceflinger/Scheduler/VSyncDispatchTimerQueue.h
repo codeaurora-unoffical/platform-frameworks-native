@@ -17,6 +17,7 @@
 #pragma once
 
 #include <android-base/thread_annotations.h>
+#include <array>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,7 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "SchedulerUtils.h"
 #include "VSyncDispatch.h"
 
 namespace android::scheduler {
@@ -36,7 +38,8 @@ public:
     // Valid transition: disarmed -> armed ( when scheduled )
     // Valid transition: armed -> running -> disarmed ( when timer is called)
     // Valid transition: armed -> disarmed ( when cancelled )
-    VSyncDispatchTimerQueueEntry(std::string const& name, std::function<void(nsecs_t)> const& fn);
+    VSyncDispatchTimerQueueEntry(std::string const& name, VSyncDispatch::Callback const& fn,
+                                 nsecs_t minVsyncDistance);
     std::string_view name() const;
 
     // Start: functions that are not threadsafe.
@@ -53,6 +56,8 @@ public:
     // It will not update the wakeupTime.
     std::optional<nsecs_t> wakeupTime() const;
 
+    std::optional<nsecs_t> targetVsync() const;
+
     // This moves state from armed->disarmed.
     void disarm();
 
@@ -61,17 +66,18 @@ public:
     nsecs_t executing();
     // End: functions that are not threadsafe.
 
-    // Invoke the callback with the timestamp, moving the state from running->disarmed.
-    void callback(nsecs_t timestamp);
+    // Invoke the callback with the two given timestamps, moving the state from running->disarmed.
+    void callback(nsecs_t vsyncTimestamp, nsecs_t wakeupTimestamp);
     // Block calling thread while the callback is executing.
     void ensureNotRunning();
 
 private:
     std::string const mName;
-    std::function<void(nsecs_t)> const mCallback;
+    VSyncDispatch::Callback const mCallback;
 
     nsecs_t mWorkDuration;
     nsecs_t mEarliestVsync;
+    nsecs_t const mMinVsyncDistance;
 
     struct ArmingInfo {
         nsecs_t mActualWakeupTime;
@@ -91,12 +97,18 @@ private:
  */
 class VSyncDispatchTimerQueue : public VSyncDispatch {
 public:
+    // Constructs a VSyncDispatchTimerQueue.
+    // \param[in] tk                    A timekeeper.
+    // \param[in] tracker               A tracker.
+    // \param[in] timerSlack            The threshold at which different similarly timed callbacks
+    //                                  should be grouped into one wakeup.
+    // \param[in] minVsyncDistance      The minimum distance between two vsync estimates before the
+    //                                  vsyncs are considered the same vsync event.
     explicit VSyncDispatchTimerQueue(std::unique_ptr<TimeKeeper> tk, VSyncTracker& tracker,
-                                     nsecs_t timerSlack);
+                                     nsecs_t timerSlack, nsecs_t minVsyncDistance);
     ~VSyncDispatchTimerQueue();
 
-    CallbackToken registerCallback(std::function<void(nsecs_t)> const& callbackFn,
-                                   std::string callbackName) final;
+    CallbackToken registerCallback(Callback const& callbackFn, std::string callbackName) final;
     void unregisterCallback(CallbackToken token) final;
     ScheduleResult schedule(CallbackToken token, nsecs_t workDuration, nsecs_t earliestVsync) final;
     CancelResult cancel(CallbackToken token) final;
@@ -119,12 +131,24 @@ private:
     std::unique_ptr<TimeKeeper> const mTimeKeeper;
     VSyncTracker& mTracker;
     nsecs_t const mTimerSlack;
+    nsecs_t const mMinVsyncDistance;
 
     std::mutex mutable mMutex;
     size_t mCallbackToken GUARDED_BY(mMutex) = 0;
 
     CallbackMap mCallbacks GUARDED_BY(mMutex);
     nsecs_t mIntendedWakeupTime GUARDED_BY(mMutex) = kInvalidTime;
+
+    struct TraceBuffer {
+        static constexpr char const kTraceNamePrefix[] = "-alarm in:";
+        static constexpr char const kTraceNameSeparator[] = " for vs:";
+        static constexpr size_t kMaxNamePrint = 4;
+        static constexpr size_t kNumTsPrinted = 2;
+        static constexpr size_t maxlen = kMaxNamePrint + arrayLen(kTraceNamePrefix) +
+                arrayLen(kTraceNameSeparator) - 1 + (kNumTsPrinted * max64print);
+        std::array<char, maxlen> str_buffer;
+        void note(std::string_view name, nsecs_t in, nsecs_t vs);
+    } mTraceBuffer GUARDED_BY(mMutex);
 };
 
 } // namespace android::scheduler

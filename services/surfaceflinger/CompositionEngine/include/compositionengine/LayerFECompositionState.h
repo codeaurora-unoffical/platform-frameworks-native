@@ -18,19 +18,50 @@
 
 #include <cstdint>
 
-#include <gui/BufferQueue.h>
 #include <gui/HdrMetadata.h>
 #include <math/mat4.h>
 #include <ui/FloatRect.h>
-#include <ui/GraphicBuffer.h>
-#include <ui/GraphicTypes.h>
 #include <ui/Rect.h>
 #include <ui/Region.h>
 #include <ui/Transform.h>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
+#include <gui/BufferQueue.h>
+#include <ui/GraphicBuffer.h>
+#include <ui/GraphicTypes.h>
+
 #include "DisplayHardware/ComposerHal.h"
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
+
 namespace android::compositionengine {
+
+// More complex metadata for this layer
+struct GenericLayerMetadataEntry {
+    // True if the metadata may affect the composed result.
+    // See setLayerGenericMetadata in IComposerClient.hal
+    bool mandatory;
+
+    // Byte blob or parcel
+    std::vector<uint8_t> value;
+
+    std::string dumpAsString() const;
+};
+
+inline bool operator==(const GenericLayerMetadataEntry& lhs, const GenericLayerMetadataEntry& rhs) {
+    return lhs.mandatory == rhs.mandatory && lhs.value == rhs.value;
+}
+
+// Defining PrintTo helps with Google Tests.
+inline void PrintTo(const GenericLayerMetadataEntry& v, ::std::ostream* os) {
+    *os << v.dumpAsString();
+}
+
+using GenericLayerMetadataMap = std::unordered_map<std::string, GenericLayerMetadataEntry>;
 
 /*
  * Used by LayerFE::getCompositionState
@@ -63,6 +94,9 @@ struct LayerFECompositionState {
     // The alpha value for this layer
     float alpha{1.f};
 
+    // Background blur in pixels
+    int backgroundBlurRadius{0};
+
     // The transform from layer local coordinates to composition coordinates
     ui::Transform geomLayerTransform;
 
@@ -78,6 +112,9 @@ struct LayerFECompositionState {
 
     // The bounds of the layer in layer local coordinates
     FloatRect geomLayerBounds;
+
+    // length of the shadow in screen space
+    float shadowRadius;
 
     /*
      * Geometry state
@@ -100,6 +137,8 @@ struct LayerFECompositionState {
 
     // The appId for this layer
     int appId{0};
+
+    GenericLayerMetadataMap metadata;
 
     /*
      * Per-frame content
@@ -148,8 +187,10 @@ struct LayerFECompositionState {
     // The output-independent frame for the cursor
     Rect cursorFrame;
 
+    virtual ~LayerFECompositionState();
+
     // Debugging
-    void dump(std::string& out) const;
+    virtual void dump(std::string& out) const;
 };
 
 } // namespace android::compositionengine

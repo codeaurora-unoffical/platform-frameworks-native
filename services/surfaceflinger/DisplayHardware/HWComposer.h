@@ -27,7 +27,13 @@
 
 #include <android-base/thread_annotations.h>
 #include <ui/Fence.h>
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
 #include <ui/GraphicTypes.h>
+#pragma clang diagnostic pop
+
 #include <utils/StrongPointer.h>
 #include <utils/Timers.h>
 
@@ -49,11 +55,16 @@ namespace compositionengine {
 class Output;
 } // namespace compositionengine
 
+struct KnownHWCGenericLayerMetadata {
+    const char* name;
+    const uint32_t id;
+};
+
 class HWComposer {
 public:
     virtual ~HWComposer();
 
-    virtual void registerCallback(HWC2::ComposerCallback* callback, int32_t sequenceId) = 0;
+    virtual void setConfiguration(HWC2::ComposerCallback* callback, int32_t sequenceId) = 0;
 
     virtual bool getDisplayIdentificationData(hwc2_display_t hwcDisplayId, uint8_t* outPort,
                                               DisplayIdentificationData* outData) const = 0;
@@ -178,12 +189,19 @@ public:
     virtual bool isUsingVrComposer() const = 0;
 
     // Composer 2.4
+    virtual DisplayConnectionType getDisplayConnectionType(DisplayId) const = 0;
     virtual bool isVsyncPeriodSwitchSupported(DisplayId displayId) const = 0;
     virtual nsecs_t getDisplayVsyncPeriod(DisplayId displayId) const = 0;
     virtual status_t setActiveConfigWithConstraints(
             DisplayId displayId, size_t configId,
             const HWC2::VsyncPeriodChangeConstraints& constraints,
             HWC2::VsyncPeriodChangeTimeline* outTimeline) = 0;
+    virtual status_t setAutoLowLatencyMode(DisplayId displayId, bool on) = 0;
+    virtual status_t getSupportedContentTypes(
+            DisplayId displayId, std::vector<HWC2::ContentType>* outSupportedContentTypes) = 0;
+    virtual status_t setContentType(DisplayId displayId, HWC2::ContentType contentType) = 0;
+    virtual const std::unordered_map<std::string, bool>& getSupportedLayerGenericMetadata()
+            const = 0;
 
     // for debugging ----------------------------------------------------------
     virtual void dump(std::string& out) const = 0;
@@ -203,10 +221,11 @@ namespace impl {
 class HWComposer final : public android::HWComposer {
 public:
     explicit HWComposer(std::unique_ptr<Hwc2::Composer> composer);
+    explicit HWComposer(const std::string& composerServiceName);
 
     ~HWComposer() override;
 
-    void registerCallback(HWC2::ComposerCallback* callback, int32_t sequenceId) override;
+    void setConfiguration(HWC2::ComposerCallback* callback, int32_t sequenceId) override;
 
     bool getDisplayIdentificationData(hwc2_display_t hwcDisplayId, uint8_t* outPort,
                                       DisplayIdentificationData* outData) const override;
@@ -308,16 +327,23 @@ public:
     bool isUsingVrComposer() const override;
 
     // Composer 2.4
+    DisplayConnectionType getDisplayConnectionType(DisplayId) const override;
     bool isVsyncPeriodSwitchSupported(DisplayId displayId) const override;
     nsecs_t getDisplayVsyncPeriod(DisplayId displayId) const override;
     status_t setActiveConfigWithConstraints(DisplayId displayId, size_t configId,
                                             const HWC2::VsyncPeriodChangeConstraints& constraints,
                                             HWC2::VsyncPeriodChangeTimeline* outTimeline) override;
+    status_t setAutoLowLatencyMode(DisplayId displayId, bool) override;
+    status_t getSupportedContentTypes(DisplayId displayId,
+                                      std::vector<HWC2::ContentType>*) override;
+    status_t setContentType(DisplayId displayId, HWC2::ContentType) override;
+
+    const std::unordered_map<std::string, bool>& getSupportedLayerGenericMetadata() const override;
 
     // for debugging ----------------------------------------------------------
     void dump(std::string& out) const override;
 
-    Hwc2::Composer* getComposer() const override { return mHwcDevice->getComposer(); }
+    Hwc2::Composer* getComposer() const override { return mComposer.get(); }
 
     // TODO(b/74619554): Remove special cases for internal/external display.
     std::optional<hwc2_display_t> getInternalHwcDisplayId() const override {
@@ -335,11 +361,13 @@ private:
     friend TestableSurfaceFlinger;
 
     std::optional<DisplayIdentificationInfo> onHotplugConnect(hwc2_display_t hwcDisplayId);
+    void loadCapabilities();
+    void loadLayerMetadataSupport();
+    uint32_t getMaxVirtualDisplayCount() const;
 
     struct DisplayData {
         bool isVirtual = false;
-
-        HWC2::Display* hwcDisplay = nullptr;
+        std::unique_ptr<HWC2::Display> hwcDisplay;
         sp<Fence> lastPresentFence = Fence::NO_FENCE; // signals when the last set op retires
         std::unordered_map<HWC2::Layer*, sp<Fence>> releaseFences;
         buffer_handle_t outbufHandle = nullptr;
@@ -361,9 +389,10 @@ private:
 
     std::unordered_map<DisplayId, DisplayData> mDisplayData;
 
-    // This must be destroyed before mDisplayData, because destructor may call back into HWComposer
-    // and look up DisplayData.
-    std::unique_ptr<HWC2::Device> mHwcDevice;
+    std::unique_ptr<android::Hwc2::Composer> mComposer;
+    std::unordered_set<HWC2::Capability> mCapabilities;
+    std::unordered_map<std::string, bool> mSupportedLayerGenericMetadata;
+    bool mRegisteredCallback = false;
 
     std::unordered_map<hwc2_display_t, DisplayId> mPhysicalDisplayIdMap;
     std::optional<hwc2_display_t> mInternalHwcDisplayId;
@@ -372,7 +401,7 @@ private:
 
     std::unordered_set<DisplayId> mFreeVirtualDisplayIds;
     uint32_t mNextVirtualDisplayId = 0;
-    uint32_t mRemainingHwcVirtualDisplays{mHwcDevice->getMaxVirtualDisplayCount()};
+    uint32_t mRemainingHwcVirtualDisplays{getMaxVirtualDisplayCount()};
 };
 
 } // namespace impl

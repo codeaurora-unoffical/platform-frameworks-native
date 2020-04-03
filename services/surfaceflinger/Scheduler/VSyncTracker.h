@@ -33,8 +33,10 @@ public:
      * to the model.
      *
      * \param [in] timestamp    The timestamp when the vsync signal was.
+     * \return                  True if the timestamp was consistent with the internal model,
+     *                          False otherwise
      */
-    virtual void addVsyncTimestamp(nsecs_t timestamp) = 0;
+    virtual bool addVsyncTimestamp(nsecs_t timestamp) = 0;
 
     /*
      * Access the next anticipated vsync time such that the anticipated time >= timePoint.
@@ -60,6 +62,9 @@ public:
      * \param [in] period   The period that the system is changing into.
      */
     virtual void setPeriod(nsecs_t period) = 0;
+
+    /* Inform the tracker that the samples it has are not accurate for prediction. */
+    virtual void resetModel() = 0;
 
 protected:
     VSyncTracker(VSyncTracker const&) = delete;

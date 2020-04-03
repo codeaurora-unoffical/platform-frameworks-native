@@ -20,8 +20,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#include <utils/Errors.h>
-
+#include <android/native_window.h>
 #include <gui/IGraphicBufferProducer.h>
 #include <gui/ITransactionCompletedListener.h>
 #include <math/mat4.h>
@@ -35,6 +34,8 @@
 #include <ui/GraphicTypes.h>
 #include <ui/Rect.h>
 #include <ui/Region.h>
+#include <ui/Rotation.h>
+#include <utils/Errors.h>
 
 namespace android {
 
@@ -98,6 +99,10 @@ struct layer_state_t {
         eBackgroundColorChanged = 0x4'00000000,
         eMetadataChanged = 0x8'00000000,
         eColorSpaceAgnosticChanged = 0x10'00000000,
+        eFrameRateSelectionPriority = 0x20'00000000,
+        eFrameRateChanged = 0x40'00000000,
+        eBackgroundBlurRadiusChanged = 0x80'00000000,
+        eProducerDisconnect = 0x100'00000000,
     };
 
     layer_state_t()
@@ -114,6 +119,7 @@ struct layer_state_t {
             reserved(0),
             crop_legacy(Rect::INVALID_RECT),
             cornerRadius(0.0f),
+            backgroundBlurRadius(0),
             frameNumber_legacy(0),
             overrideScalingMode(-1),
             transform(0),
@@ -127,7 +133,10 @@ struct layer_state_t {
             bgColorAlpha(0),
             bgColorDataspace(ui::Dataspace::UNKNOWN),
             colorSpaceAgnostic(false),
-            shadowRadius(0.0f) {
+            shadowRadius(0.0f),
+            frameRateSelectionPriority(-1),
+            frameRate(0.0f),
+            frameRateCompatibility(ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT) {
         matrix.dsdx = matrix.dtdy = 1.0f;
         matrix.dsdy = matrix.dtdx = 0.0f;
         hdrMetadata.validTypes = 0;
@@ -158,6 +167,7 @@ struct layer_state_t {
     matrix22_t matrix;
     Rect crop_legacy;
     float cornerRadius;
+    uint32_t backgroundBlurRadius;
     sp<IBinder> barrierHandle_legacy;
     sp<IBinder> reparentHandle;
     uint64_t frameNumber_legacy;
@@ -208,6 +218,13 @@ struct layer_state_t {
 
     // Draws a shadow around the surface.
     float shadowRadius;
+
+    // Priority of the layer assigned by Window Manager.
+    int32_t frameRateSelectionPriority;
+
+    // Layer frame rate and compatibility. See ANativeWindow_setFrameRate().
+    float frameRate;
+    int8_t frameRateCompatibility;
 };
 
 struct ComposerState {
@@ -217,15 +234,6 @@ struct ComposerState {
 };
 
 struct DisplayState {
-    enum {
-        eOrientationDefault = 0,
-        eOrientation90 = 1,
-        eOrientation180 = 2,
-        eOrientation270 = 3,
-        eOrientationUnchanged = 4,
-        eOrientationSwapMask = 0x01
-    };
-
     enum {
         eSurfaceChanged = 0x01,
         eLayerStackChanged = 0x02,
@@ -252,7 +260,7 @@ struct DisplayState {
     // 0, layers will be scaled by a factor of 2 and translated by (20, 10).
     // When orientation is 1, layers will be additionally rotated by 90
     // degrees around the origin clockwise and translated by (W, 0).
-    uint32_t orientation;
+    ui::Rotation orientation = ui::ROTATION_0;
     Rect viewport;
     Rect frame;
 
@@ -263,12 +271,6 @@ struct DisplayState {
 };
 
 struct InputWindowCommands {
-    struct TransferTouchFocusCommand {
-        sp<IBinder> fromToken;
-        sp<IBinder> toToken;
-    };
-
-    std::vector<TransferTouchFocusCommand> transferTouchFocusCommands;
     bool syncInputWindows{false};
 
     void merge(const InputWindowCommands& other);
@@ -286,6 +288,12 @@ static inline int compare_type(const ComposerState& lhs, const ComposerState& rh
 static inline int compare_type(const DisplayState& lhs, const DisplayState& rhs) {
     return compare_type(lhs.token, rhs.token);
 }
+
+// Returns true if the frameRate and compatibility are valid values, false
+// othwerise. If either of the params are invalid, an error log is printed, and
+// functionName is added to the log to indicate which function call failed.
+// functionName can be null.
+bool ValidateFrameRate(float frameRate, int8_t compatibility, const char* functionName);
 
 }; // namespace android
 

@@ -33,6 +33,35 @@ namespace android {
 
 class BufferItemConsumer;
 
+class BLASTBufferItemConsumer : public BufferItemConsumer {
+public:
+    BLASTBufferItemConsumer(const sp<IGraphicBufferConsumer>& consumer, uint64_t consumerUsage,
+                            int bufferCount, bool controlledByApp)
+          : BufferItemConsumer(consumer, consumerUsage, bufferCount, controlledByApp),
+            mCurrentlyConnected(false),
+            mPreviouslyConnected(false) {}
+
+    void onDisconnect() override;
+    void addAndGetFrameTimestamps(const NewFrameEventsEntry* newTimestamps,
+                                  FrameEventHistoryDelta* outDelta) override
+            REQUIRES(mFrameEventHistoryMutex);
+    void updateFrameTimestamps(uint64_t frameNumber, nsecs_t refreshStartTime,
+                               const sp<Fence>& gpuCompositionDoneFence,
+                               const sp<Fence>& presentFence, const sp<Fence>& prevReleaseFence,
+                               CompositorTiming compositorTiming, nsecs_t latchTime,
+                               nsecs_t dequeueReadyTime) REQUIRES(mFrameEventHistoryMutex);
+    void getConnectionEvents(uint64_t frameNumber, bool* needsDisconnect);
+
+private:
+    uint64_t mCurrentFrameNumber = 0;
+
+    Mutex mFrameEventHistoryMutex;
+    ConsumerFrameEventHistory mFrameEventHistory GUARDED_BY(mFrameEventHistoryMutex);
+    std::queue<uint64_t> mDisconnectEvents GUARDED_BY(mFrameEventHistoryMutex);
+    bool mCurrentlyConnected GUARDED_BY(mFrameEventHistoryMutex);
+    bool mPreviouslyConnected GUARDED_BY(mFrameEventHistoryMutex);
+};
+
 class BLASTBufferQueue
     : public ConsumerBase::FrameAvailableListener, public BufferItemConsumer::BufferFreedListener
 {
@@ -68,29 +97,34 @@ private:
 
     std::mutex mMutex;
     std::condition_variable mCallbackCV;
-    uint64_t mPendingCallbacks GUARDED_BY(mMutex);
 
-    static const int MAX_BUFFERS = 3;
-    struct BufferInfo {
-        sp<GraphicBuffer> buffer;
-        int fence;
+    // BufferQueue internally allows 1 more than
+    // the max to be acquired
+    static const int MAX_ACQUIRED_BUFFERS = 1;
+
+    int32_t mNumFrameAvailable GUARDED_BY(mMutex);
+    int32_t mNumAcquired GUARDED_BY(mMutex);
+
+    struct PendingReleaseItem {
+        BufferItem item;
+        sp<Fence> releaseFence;
     };
 
-    std::queue<const BufferItem> mShadowQueue GUARDED_BY(mMutex);
-    bool mAcquired GUARDED_BY(mMutex);
+    std::queue<const BufferItem> mSubmitted GUARDED_BY(mMutex);
+    PendingReleaseItem mPendingReleaseItem GUARDED_BY(mMutex);
 
     int mWidth GUARDED_BY(mMutex);
     int mHeight GUARDED_BY(mMutex);
 
-    BufferItem mLastSubmittedBufferItem GUARDED_BY(mMutex);
-    BufferItem mNextCallbackBufferItem GUARDED_BY(mMutex);
-    sp<Fence> mLastFence GUARDED_BY(mMutex);
+    uint32_t mTransformHint GUARDED_BY(mMutex);
 
     sp<IGraphicBufferConsumer> mConsumer;
     sp<IGraphicBufferProducer> mProducer;
-    sp<BufferItemConsumer> mBufferItemConsumer;
+    sp<BLASTBufferItemConsumer> mBufferItemConsumer;
 
     SurfaceComposerClient::Transaction* mNextTransaction GUARDED_BY(mMutex);
+
+    bool mUseNextTransaction = false;
 };
 
 } // namespace android

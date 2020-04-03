@@ -154,7 +154,7 @@ public:
     // @return An error code indicating whether drawing was successful. For
     // now, this always returns NO_ERROR.
     virtual status_t drawLayers(const DisplaySettings& display,
-                                const std::vector<LayerSettings>& layers,
+                                const std::vector<const LayerSettings*>& layers,
                                 ANativeWindowBuffer* buffer, const bool useFramebufferCache,
                                 base::unique_fd&& bufferFence, base::unique_fd* drawFence) = 0;
 
@@ -174,6 +174,7 @@ struct RenderEngineCreationArgs {
     bool useColorManagement;
     bool enableProtectedContext;
     bool precacheToneMapperShaderOnly;
+    bool supportsBackgroundBlur;
     RenderEngine::ContextPriority contextPriority;
 
     struct Builder;
@@ -186,12 +187,14 @@ private:
             bool _useColorManagement,
             bool _enableProtectedContext,
             bool _precacheToneMapperShaderOnly,
+            bool _supportsBackgroundBlur,
             RenderEngine::ContextPriority _contextPriority)
         : pixelFormat(_pixelFormat)
         , imageCacheSize(_imageCacheSize)
         , useColorManagement(_useColorManagement)
         , enableProtectedContext(_enableProtectedContext)
         , precacheToneMapperShaderOnly(_precacheToneMapperShaderOnly)
+        , supportsBackgroundBlur(_supportsBackgroundBlur)
         , contextPriority(_contextPriority) {}
     RenderEngineCreationArgs() = delete;
 };
@@ -219,13 +222,18 @@ struct RenderEngineCreationArgs::Builder {
         this->precacheToneMapperShaderOnly = precacheToneMapperShaderOnly;
         return *this;
     }
+    Builder& setSupportsBackgroundBlur(bool supportsBackgroundBlur) {
+        this->supportsBackgroundBlur = supportsBackgroundBlur;
+        return *this;
+    }
     Builder& setContextPriority(RenderEngine::ContextPriority contextPriority) {
         this->contextPriority = contextPriority;
         return *this;
     }
     RenderEngineCreationArgs build() const {
         return RenderEngineCreationArgs(pixelFormat, imageCacheSize, useColorManagement,
-                enableProtectedContext, precacheToneMapperShaderOnly, contextPriority);
+                                        enableProtectedContext, precacheToneMapperShaderOnly,
+                                        supportsBackgroundBlur, contextPriority);
     }
 
 private:
@@ -235,6 +243,7 @@ private:
     bool useColorManagement = true;
     bool enableProtectedContext = false;
     bool precacheToneMapperShaderOnly = false;
+    bool supportsBackgroundBlur = false;
     RenderEngine::ContextPriority contextPriority = RenderEngine::ContextPriority::MEDIUM;
 };
 

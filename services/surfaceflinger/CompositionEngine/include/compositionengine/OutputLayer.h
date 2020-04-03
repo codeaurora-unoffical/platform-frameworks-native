@@ -21,8 +21,15 @@
 
 #include <utils/StrongPointer.h>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include "DisplayHardware/ComposerHal.h"
 #include "DisplayHardware/DisplayIdentification.h"
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
 
 namespace HWC2 {
 class Layer;
@@ -34,7 +41,6 @@ namespace compositionengine {
 
 class CompositionEngine;
 class Output;
-class Layer;
 class LayerFE;
 
 namespace impl {
@@ -53,9 +59,6 @@ public:
 
     // Gets the output which owns this output layer
     virtual const Output& getOutput() const = 0;
-
-    // Gets the display-independent layer which this output layer represents
-    virtual Layer& getLayer() const = 0;
 
     // Gets the front-end layer interface this output layer represents
     virtual LayerFE& getLayerFE() const = 0;

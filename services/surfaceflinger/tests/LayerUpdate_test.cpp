@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include "LayerTransactionTest.h"
 
 namespace android {
@@ -32,14 +36,13 @@ protected:
         const auto display = SurfaceComposerClient::getInternalDisplayToken();
         ASSERT_FALSE(display == nullptr);
 
-        DisplayInfo info;
-        ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getDisplayInfo(display, &info));
-
-        ssize_t displayWidth = info.w;
-        ssize_t displayHeight = info.h;
+        DisplayConfig config;
+        ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getActiveDisplayConfig(display, &config));
+        const ui::Size& resolution = config.resolution;
 
         // Background surface
-        mBGSurfaceControl = createLayer(String8("BG Test Surface"), displayWidth, displayHeight, 0);
+        mBGSurfaceControl = createLayer(String8("BG Test Surface"), resolution.getWidth(),
+                                        resolution.getHeight(), 0);
         ASSERT_TRUE(mBGSurfaceControl != nullptr);
         ASSERT_TRUE(mBGSurfaceControl->isValid());
         TransactionUtils::fillSurfaceRGBA8(mBGSurfaceControl, 63, 63, 195);
@@ -69,7 +72,8 @@ protected:
                     .show(mFGSurfaceControl);
 
             t.setLayer(mSyncSurfaceControl, INT32_MAX - 1)
-                    .setPosition(mSyncSurfaceControl, displayWidth - 2, displayHeight - 2)
+                    .setPosition(mSyncSurfaceControl, resolution.getWidth() - 2,
+                                 resolution.getHeight() - 2)
                     .show(mSyncSurfaceControl);
         });
     }
@@ -538,6 +542,7 @@ TEST_F(ChildLayerTest, ChildrenSurviveParentDestruction) {
         mCapture->checkPixel(64, 64, 111, 111, 111);
     }
 
+    Transaction().reparent(mChild, nullptr).apply();
     mChild.clear();
 
     {
@@ -1110,7 +1115,7 @@ TEST_F(BoundlessLayerTest, BufferLayerIgnoresSize) {
 TEST_F(BoundlessLayerTest, BoundlessColorLayerFillsParentBufferBounds) {
     sp<SurfaceControl> colorLayer =
             createSurface(mClient, "ColorLayer", 0, 0, PIXEL_FORMAT_RGBA_8888,
-                          ISurfaceComposerClient::eFXSurfaceColor, mFGSurfaceControl.get());
+                          ISurfaceComposerClient::eFXSurfaceEffect, mFGSurfaceControl.get());
     ASSERT_TRUE(colorLayer->isValid());
     asTransaction([&](Transaction& t) {
         t.setColor(colorLayer, half3{0, 0, 0});
@@ -1135,7 +1140,7 @@ TEST_F(BoundlessLayerTest, BoundlessColorLayerFillsParentCropBounds) {
     ASSERT_TRUE(cropLayer->isValid());
     sp<SurfaceControl> colorLayer =
             createSurface(mClient, "ColorLayer", 0, 0, PIXEL_FORMAT_RGBA_8888,
-                          ISurfaceComposerClient::eFXSurfaceColor, cropLayer.get());
+                          ISurfaceComposerClient::eFXSurfaceEffect, cropLayer.get());
     ASSERT_TRUE(colorLayer->isValid());
     asTransaction([&](Transaction& t) {
         t.setCrop_legacy(cropLayer, Rect(5, 5, 10, 10));
@@ -1160,7 +1165,7 @@ TEST_F(BoundlessLayerTest, BoundlessColorLayerFillsParentCropBounds) {
 TEST_F(BoundlessLayerTest, BoundlessColorLayerTransformHasNoEffect) {
     sp<SurfaceControl> colorLayer =
             createSurface(mClient, "ColorLayer", 0, 0, PIXEL_FORMAT_RGBA_8888,
-                          ISurfaceComposerClient::eFXSurfaceColor, mFGSurfaceControl.get());
+                          ISurfaceComposerClient::eFXSurfaceEffect, mFGSurfaceControl.get());
     ASSERT_TRUE(colorLayer->isValid());
     asTransaction([&](Transaction& t) {
         t.setPosition(colorLayer, 320, 320);
@@ -1191,7 +1196,7 @@ TEST_F(BoundlessLayerTest, IntermediateBoundlessLayerCanSetTransform) {
     ASSERT_TRUE(boundlessLayerDownShift->isValid());
     sp<SurfaceControl> colorLayer =
             createSurface(mClient, "ColorLayer", 0, 0, PIXEL_FORMAT_RGBA_8888,
-                          ISurfaceComposerClient::eFXSurfaceColor, boundlessLayerDownShift.get());
+                          ISurfaceComposerClient::eFXSurfaceEffect, boundlessLayerDownShift.get());
     ASSERT_TRUE(colorLayer->isValid());
     asTransaction([&](Transaction& t) {
         t.setPosition(boundlessLayerRightShift, 32, 0);
@@ -1225,7 +1230,7 @@ TEST_F(BoundlessLayerTest, IntermediateBoundlessLayerDoNotCrop) {
     ASSERT_TRUE(boundlessLayer->isValid());
     sp<SurfaceControl> colorLayer =
             mClient->createSurface(String8("ColorLayer"), 0, 0, PIXEL_FORMAT_RGBA_8888,
-                                   ISurfaceComposerClient::eFXSurfaceColor, boundlessLayer.get());
+                                   ISurfaceComposerClient::eFXSurfaceEffect, boundlessLayer.get());
     ASSERT_TRUE(colorLayer != nullptr);
     ASSERT_TRUE(colorLayer->isValid());
     asTransaction([&](Transaction& t) {
@@ -1257,7 +1262,7 @@ TEST_F(BoundlessLayerTest, RootBoundlessLayerCanSetTransform) {
     ASSERT_TRUE(rootBoundlessLayer->isValid());
     sp<SurfaceControl> colorLayer =
             createSurface(mClient, "ColorLayer", 0, 0, PIXEL_FORMAT_RGBA_8888,
-                          ISurfaceComposerClient::eFXSurfaceColor, rootBoundlessLayer.get());
+                          ISurfaceComposerClient::eFXSurfaceEffect, rootBoundlessLayer.get());
 
     ASSERT_TRUE(colorLayer->isValid());
     asTransaction([&](Transaction& t) {
@@ -1698,6 +1703,7 @@ TEST_F(ScreenCaptureTest, CaptureInvalidLayer) {
     ASSERT_NO_FATAL_FAILURE(fillBufferQueueLayerColor(redLayer, Color::RED, 60, 60));
 
     auto redLayerHandle = redLayer->getHandle();
+    Transaction().reparent(redLayer, nullptr).apply();
     redLayer.clear();
     SurfaceComposerClient::Transaction().apply(true);
 
@@ -1708,3 +1714,6 @@ TEST_F(ScreenCaptureTest, CaptureInvalidLayer) {
     ASSERT_EQ(NAME_NOT_FOUND, sf->captureLayers(redLayerHandle, &outBuffer, Rect::EMPTY_RECT, 1.0));
 }
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

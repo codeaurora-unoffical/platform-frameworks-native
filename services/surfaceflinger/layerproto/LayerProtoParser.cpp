@@ -106,13 +106,15 @@ LayerProtoParser::Layer LayerProtoParser::generateLayer(const LayerProto& layerP
     layer.refreshPending = layerProto.refresh_pending();
     layer.isProtected = layerProto.is_protected();
     layer.cornerRadius = layerProto.corner_radius();
+    layer.backgroundBlurRadius = layerProto.background_blur_radius();
     for (const auto& entry : layerProto.metadata()) {
         const std::string& dataStr = entry.second;
         std::vector<uint8_t>& outData = layer.metadata.mMap[entry.first];
         outData.resize(dataStr.size());
         memcpy(outData.data(), dataStr.data(), dataStr.size());
     }
-
+    layer.cornerRadiusCrop = generateFloatRect(layerProto.corner_radius_crop());
+    layer.shadowRadius = layerProto.shadow_radius();
     return layer;
 }
 
@@ -289,6 +291,7 @@ std::string LayerProtoParser::Layer::to_string() const {
     StringAppendF(&result, "isOpaque=%1d, invalidate=%1d, ", isOpaque, invalidate);
     StringAppendF(&result, "dataspace=%s, ", dataspace.c_str());
     StringAppendF(&result, "defaultPixelFormat=%s, ", pixelFormat.c_str());
+    StringAppendF(&result, "backgroundBlurRadius=%1d, ", backgroundBlurRadius);
     StringAppendF(&result, "color=(%.3f,%.3f,%.3f,%.3f), flags=0x%08x, ",
                   static_cast<double>(color.r), static_cast<double>(color.g),
                   static_cast<double>(color.b), static_cast<double>(color.a), flags);
@@ -307,8 +310,9 @@ std::string LayerProtoParser::Layer::to_string() const {
         first = false;
         result.append(metadata.itemToString(entry.first, ":"));
     }
-    result.append("}");
-
+    result.append("},");
+    StringAppendF(&result, " cornerRadiusCrop=%s, ", cornerRadiusCrop.to_string().c_str());
+    StringAppendF(&result, " shadowRadius=%.3f, ", shadowRadius);
     return result;
 }
 

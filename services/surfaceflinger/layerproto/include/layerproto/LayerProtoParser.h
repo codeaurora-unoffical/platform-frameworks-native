@@ -110,7 +110,10 @@ public:
         bool refreshPending;
         bool isProtected;
         float cornerRadius;
+        int backgroundBlurRadius;
         LayerMetadata metadata;
+        LayerProtoParser::FloatRect cornerRadiusCrop;
+        float shadowRadius;
 
         std::string to_string() const;
     };

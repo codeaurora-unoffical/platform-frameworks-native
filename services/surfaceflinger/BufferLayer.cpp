@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 //#define LOG_NDEBUG 0
 #undef LOG_TAG
 #define LOG_TAG "BufferLayer"
@@ -22,8 +26,6 @@
 #include "BufferLayer.h"
 
 #include <compositionengine/CompositionEngine.h>
-#include <compositionengine/Layer.h>
-#include <compositionengine/LayerCreationArgs.h>
 #include <compositionengine/LayerFECompositionState.h>
 #include <compositionengine/OutputLayer.h>
 #include <compositionengine/impl/OutputLayerCompositionState.h>
@@ -62,8 +64,7 @@ static constexpr float defaultMaxContentLuminance = 1000.0;
 BufferLayer::BufferLayer(const LayerCreationArgs& args)
       : Layer(args),
         mTextureName(args.textureName),
-        mCompositionLayer{mFlinger->getCompositionEngine().createLayer(
-                compositionengine::LayerCreationArgs{this})} {
+        mCompositionState{mFlinger->getCompositionEngine().createLayerFECompositionState()} {
     ALOGV("Creating Layer %s", getDebugName());
 
     mPremultipliedAlpha = !(args.flags & ISurfaceComposerClient::eNonPremultiplied);
@@ -140,11 +141,12 @@ static constexpr mat4 inverseOrientation(uint32_t transform) {
     return inverse(tr);
 }
 
-std::optional<renderengine::LayerSettings> BufferLayer::prepareClientComposition(
+std::optional<compositionengine::LayerFE::LayerSettings> BufferLayer::prepareClientComposition(
         compositionengine::LayerFE::ClientCompositionTargetSettings& targetSettings) {
     ATRACE_CALL();
 
-    auto result = Layer::prepareClientComposition(targetSettings);
+    std::optional<compositionengine::LayerFE::LayerSettings> result =
+            Layer::prepareClientComposition(targetSettings);
     if (!result) {
         return result;
     }
@@ -178,91 +180,92 @@ std::optional<renderengine::LayerSettings> BufferLayer::prepareClientComposition
     }
     bool blackOutLayer = (isProtected() && !targetSettings.supportsProtectedContent) ||
             (isSecure() && !targetSettings.isSecure);
-    const State& s(getDrawingState());
-    auto& layer = *result;
-    if (!blackOutLayer) {
-        layer.source.buffer.buffer = mBufferInfo.mBuffer;
-        layer.source.buffer.isOpaque = isOpaque(s);
-        layer.source.buffer.fence = mBufferInfo.mFence;
-        layer.source.buffer.textureName = mTextureName;
-        layer.source.buffer.usePremultipliedAlpha = getPremultipledAlpha();
-        layer.source.buffer.isY410BT2020 = isHdrY410();
-        bool hasSmpte2086 = mBufferInfo.mHdrMetadata.validTypes & HdrMetadata::SMPTE2086;
-        bool hasCta861_3 = mBufferInfo.mHdrMetadata.validTypes & HdrMetadata::CTA861_3;
-        layer.source.buffer.maxMasteringLuminance = hasSmpte2086
-                ? mBufferInfo.mHdrMetadata.smpte2086.maxLuminance
-                : defaultMaxMasteringLuminance;
-        layer.source.buffer.maxContentLuminance = hasCta861_3
-                ? mBufferInfo.mHdrMetadata.cta8613.maxContentLightLevel
-                : defaultMaxContentLuminance;
-        // TODO: we could be more subtle with isFixedSize()
-        const bool useFiltering = targetSettings.needsFiltering || mNeedsFiltering || isFixedSize();
-
-        // Query the texture matrix given our current filtering mode.
-        float textureMatrix[16];
-        getDrawingTransformMatrix(useFiltering, textureMatrix);
-
-        if (getTransformToDisplayInverse()) {
-            /*
-             * the code below applies the primary display's inverse transform to
-             * the texture transform
-             */
-            uint32_t transform = DisplayDevice::getPrimaryDisplayOrientationTransform();
-            mat4 tr = inverseOrientation(transform);
-
-            /**
-             * TODO(b/36727915): This is basically a hack.
-             *
-             * Ensure that regardless of the parent transformation,
-             * this buffer is always transformed from native display
-             * orientation to display orientation. For example, in the case
-             * of a camera where the buffer remains in native orientation,
-             * we want the pixels to always be upright.
-             */
-            sp<Layer> p = mDrawingParent.promote();
-            if (p != nullptr) {
-                const auto parentTransform = p->getTransform();
-                tr = tr * inverseOrientation(parentTransform.getOrientation());
-            }
-
-            // and finally apply it to the original texture matrix
-            const mat4 texTransform(mat4(static_cast<const float*>(textureMatrix)) * tr);
-            memcpy(textureMatrix, texTransform.asArray(), sizeof(textureMatrix));
-        }
-
-        const Rect win{getBounds()};
-        float bufferWidth = getBufferSize(s).getWidth();
-        float bufferHeight = getBufferSize(s).getHeight();
-
-        // BufferStateLayers can have a "buffer size" of [0, 0, -1, -1] when no display frame has
-        // been set and there is no parent layer bounds. In that case, the scale is meaningless so
-        // ignore them.
-        if (!getBufferSize(s).isValid()) {
-            bufferWidth = float(win.right) - float(win.left);
-            bufferHeight = float(win.bottom) - float(win.top);
-        }
-
-        const float scaleHeight = (float(win.bottom) - float(win.top)) / bufferHeight;
-        const float scaleWidth = (float(win.right) - float(win.left)) / bufferWidth;
-        const float translateY = float(win.top) / bufferHeight;
-        const float translateX = float(win.left) / bufferWidth;
-
-        // Flip y-coordinates because GLConsumer expects OpenGL convention.
-        mat4 tr = mat4::translate(vec4(.5, .5, 0, 1)) * mat4::scale(vec4(1, -1, 1, 1)) *
-                mat4::translate(vec4(-.5, -.5, 0, 1)) *
-                mat4::translate(vec4(translateX, translateY, 0, 1)) *
-                mat4::scale(vec4(scaleWidth, scaleHeight, 1.0, 1.0));
-
-        layer.source.buffer.useTextureFiltering = useFiltering;
-        layer.source.buffer.textureTransform = mat4(static_cast<const float*>(textureMatrix)) * tr;
-    } else {
-        // If layer is blacked out, force alpha to 1 so that we draw a black color
-        // layer.
-        layer.source.buffer.buffer = nullptr;
-        layer.alpha = 1.0;
+    compositionengine::LayerFE::LayerSettings& layer = *result;
+    if (blackOutLayer) {
+        prepareClearClientComposition(layer, true /* blackout */);
+        return layer;
     }
 
-    return result;
+    const State& s(getDrawingState());
+    layer.source.buffer.buffer = mBufferInfo.mBuffer;
+    layer.source.buffer.isOpaque = isOpaque(s);
+    layer.source.buffer.fence = mBufferInfo.mFence;
+    layer.source.buffer.textureName = mTextureName;
+    layer.source.buffer.usePremultipliedAlpha = getPremultipledAlpha();
+    layer.source.buffer.isY410BT2020 = isHdrY410();
+    bool hasSmpte2086 = mBufferInfo.mHdrMetadata.validTypes & HdrMetadata::SMPTE2086;
+    bool hasCta861_3 = mBufferInfo.mHdrMetadata.validTypes & HdrMetadata::CTA861_3;
+    layer.source.buffer.maxMasteringLuminance = hasSmpte2086
+            ? mBufferInfo.mHdrMetadata.smpte2086.maxLuminance
+            : defaultMaxMasteringLuminance;
+    layer.source.buffer.maxContentLuminance = hasCta861_3
+            ? mBufferInfo.mHdrMetadata.cta8613.maxContentLightLevel
+            : defaultMaxContentLuminance;
+    layer.frameNumber = mCurrentFrameNumber;
+    layer.bufferId = mBufferInfo.mBuffer ? mBufferInfo.mBuffer->getId() : 0;
+
+    // TODO: we could be more subtle with isFixedSize()
+    const bool useFiltering = targetSettings.needsFiltering || mNeedsFiltering || isFixedSize();
+
+    // Query the texture matrix given our current filtering mode.
+    float textureMatrix[16];
+    getDrawingTransformMatrix(useFiltering, textureMatrix);
+
+    if (getTransformToDisplayInverse()) {
+        /*
+         * the code below applies the primary display's inverse transform to
+         * the texture transform
+         */
+        uint32_t transform = DisplayDevice::getPrimaryDisplayRotationFlags();
+        mat4 tr = inverseOrientation(transform);
+
+        /**
+         * TODO(b/36727915): This is basically a hack.
+         *
+         * Ensure that regardless of the parent transformation,
+         * this buffer is always transformed from native display
+         * orientation to display orientation. For example, in the case
+         * of a camera where the buffer remains in native orientation,
+         * we want the pixels to always be upright.
+         */
+        sp<Layer> p = mDrawingParent.promote();
+        if (p != nullptr) {
+            const auto parentTransform = p->getTransform();
+            tr = tr * inverseOrientation(parentTransform.getOrientation());
+        }
+
+        // and finally apply it to the original texture matrix
+        const mat4 texTransform(mat4(static_cast<const float*>(textureMatrix)) * tr);
+        memcpy(textureMatrix, texTransform.asArray(), sizeof(textureMatrix));
+    }
+
+    const Rect win{getBounds()};
+    float bufferWidth = getBufferSize(s).getWidth();
+    float bufferHeight = getBufferSize(s).getHeight();
+
+    // BufferStateLayers can have a "buffer size" of [0, 0, -1, -1] when no display frame has
+    // been set and there is no parent layer bounds. In that case, the scale is meaningless so
+    // ignore them.
+    if (!getBufferSize(s).isValid()) {
+        bufferWidth = float(win.right) - float(win.left);
+        bufferHeight = float(win.bottom) - float(win.top);
+    }
+
+    const float scaleHeight = (float(win.bottom) - float(win.top)) / bufferHeight;
+    const float scaleWidth = (float(win.right) - float(win.left)) / bufferWidth;
+    const float translateY = float(win.top) / bufferHeight;
+    const float translateX = float(win.left) / bufferWidth;
+
+    // Flip y-coordinates because GLConsumer expects OpenGL convention.
+    mat4 tr = mat4::translate(vec4(.5, .5, 0, 1)) * mat4::scale(vec4(1, -1, 1, 1)) *
+            mat4::translate(vec4(-.5, -.5, 0, 1)) *
+            mat4::translate(vec4(translateX, translateY, 0, 1)) *
+            mat4::scale(vec4(scaleWidth, scaleHeight, 1.0, 1.0));
+
+    layer.source.buffer.useTextureFiltering = useFiltering;
+    layer.source.buffer.textureTransform = mat4(static_cast<const float*>(textureMatrix)) * tr;
+
+    return layer;
 }
 
 bool BufferLayer::isHdrY410() const {
@@ -272,17 +275,29 @@ bool BufferLayer::isHdrY410() const {
             mBufferInfo.mBuffer->getPixelFormat() == HAL_PIXEL_FORMAT_RGBA_1010102);
 }
 
-void BufferLayer::latchPerFrameState(
-        compositionengine::LayerFECompositionState& compositionState) const {
-    Layer::latchPerFrameState(compositionState);
+sp<compositionengine::LayerFE> BufferLayer::getCompositionEngineLayerFE() const {
+    return asLayerFE();
+}
+
+compositionengine::LayerFECompositionState* BufferLayer::editCompositionState() {
+    return mCompositionState.get();
+}
+
+const compositionengine::LayerFECompositionState* BufferLayer::getCompositionState() const {
+    return mCompositionState.get();
+}
+
+void BufferLayer::preparePerFrameCompositionState() {
+    Layer::preparePerFrameCompositionState();
 
     // Sideband layers
-    if (compositionState.sidebandStream.get()) {
-        compositionState.compositionType = Hwc2::IComposerClient::Composition::SIDEBAND;
+    auto* compositionState = editCompositionState();
+    if (compositionState->sidebandStream.get()) {
+        compositionState->compositionType = Hwc2::IComposerClient::Composition::SIDEBAND;
     } else {
         // Normal buffer layers
-        compositionState.hdrMetadata = mBufferInfo.mHdrMetadata;
-        compositionState.compositionType = mPotentialCursor
+        compositionState->hdrMetadata = mBufferInfo.mHdrMetadata;
+        compositionState->compositionType = mPotentialCursor
                 ? Hwc2::IComposerClient::Composition::CURSOR
                 : Hwc2::IComposerClient::Composition::DEVICE;
     }
@@ -310,6 +325,7 @@ bool BufferLayer::onPostComposition(sp<const DisplayDevice> displayDevice,
         Mutex::Autolock lock(mFrameEventHistoryMutex);
         mFrameEventHistory.addPostComposition(mCurrentFrameNumber, glDoneFence, presentFence,
                                               compositorTiming);
+        finalizeFrameEventHistory(glDoneFence, compositorTiming);
     }
 
     // Update mFrameTracker.
@@ -469,6 +485,10 @@ bool BufferLayer::latchBuffer(bool& recomputeVisibleRegions, nsecs_t latchTime,
         }
     }
 
+    if (recomputeVisibleRegions == true) {
+        maybeDirtyInput();
+    }
+
     return true;
 }
 
@@ -622,17 +642,13 @@ Rect BufferLayer::getBufferSize(const State& s) const {
     }
 
     if (getTransformToDisplayInverse()) {
-        uint32_t invTransform = DisplayDevice::getPrimaryDisplayOrientationTransform();
+        uint32_t invTransform = DisplayDevice::getPrimaryDisplayRotationFlags();
         if (invTransform & ui::Transform::ROT_90) {
             std::swap(bufWidth, bufHeight);
         }
     }
 
     return Rect(bufWidth, bufHeight);
-}
-
-std::shared_ptr<compositionengine::Layer> BufferLayer::getCompositionLayer() const {
-    return mCompositionLayer;
 }
 
 FloatRect BufferLayer::computeSourceBounds(const FloatRect& parentBounds) const {
@@ -658,7 +674,7 @@ FloatRect BufferLayer::computeSourceBounds(const FloatRect& parentBounds) const 
     }
 
     if (getTransformToDisplayInverse()) {
-        uint32_t invTransform = DisplayDevice::getPrimaryDisplayOrientationTransform();
+        uint32_t invTransform = DisplayDevice::getPrimaryDisplayRotationFlags();
         if (invTransform & ui::Transform::ROT_90) {
             std::swap(bufWidth, bufHeight);
         }
@@ -770,17 +786,20 @@ void BufferLayer::updateCloneBufferInfo() {
 
     // After buffer info is updated, the drawingState from the real layer needs to be copied into
     // the cloned. This is because some properties of drawingState can change when latchBuffer is
-    // called. However, copying the drawingState would also overwrite the cloned layer's relatives.
-    // Therefore, temporarily store the relatives so they can be set in the cloned drawingState
-    // again.
+    // called. However, copying the drawingState would also overwrite the cloned layer's relatives
+    // and touchableRegionCrop. Therefore, temporarily store the relatives so they can be set in
+    // the cloned drawingState again.
     wp<Layer> tmpZOrderRelativeOf = mDrawingState.zOrderRelativeOf;
     SortedVector<wp<Layer>> tmpZOrderRelatives = mDrawingState.zOrderRelatives;
+    wp<Layer> tmpTouchableRegionCrop = mDrawingState.touchableRegionCrop;
+    InputWindowInfo tmpInputInfo = mDrawingState.inputInfo;
+
     mDrawingState = clonedFrom->mDrawingState;
-    // TODO: (b/140756730) Ignore input for now since InputDispatcher doesn't support multiple
-    // InputWindows per client token yet.
-    mDrawingState.inputInfo.token = nullptr;
+
+    mDrawingState.touchableRegionCrop = tmpTouchableRegionCrop;
     mDrawingState.zOrderRelativeOf = tmpZOrderRelativeOf;
     mDrawingState.zOrderRelatives = tmpZOrderRelatives;
+    mDrawingState.inputInfo = tmpInputInfo;
 }
 
 } // namespace android
@@ -792,3 +811,6 @@ void BufferLayer::updateCloneBufferInfo() {
 #if defined(__gl2_h_)
 #error "don't include gl2/gl2.h in this file"
 #endif
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

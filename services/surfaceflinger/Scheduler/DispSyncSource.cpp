@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
 #include "DispSyncSource.h"
@@ -27,16 +31,14 @@
 
 namespace android {
 
-DispSyncSource::DispSyncSource(DispSync* dispSync, nsecs_t phaseOffset,
-                               nsecs_t offsetThresholdForNextVsync, bool traceVsync,
+DispSyncSource::DispSyncSource(DispSync* dispSync, nsecs_t phaseOffset, bool traceVsync,
                                const char* name)
       : mName(name),
         mValue(base::StringPrintf("VSYNC-%s", name), 0),
         mTraceVsync(traceVsync),
         mVsyncOnLabel(base::StringPrintf("VsyncOn-%s", name)),
         mDispSync(dispSync),
-        mPhaseOffset(base::StringPrintf("VsyncOffset-%s", name), phaseOffset),
-        mOffsetThresholdForNextVsync(offsetThresholdForNextVsync) {}
+        mPhaseOffset(base::StringPrintf("VsyncOffset-%s", name), phaseOffset) {}
 
 void DispSyncSource::setVSyncEnabled(bool enable) {
     std::lock_guard lock(mVsyncMutex);
@@ -67,10 +69,6 @@ void DispSyncSource::setCallback(VSyncSource::Callback* callback) {
 void DispSyncSource::setPhaseOffset(nsecs_t phaseOffset) {
     std::lock_guard lock(mVsyncMutex);
     const nsecs_t period = mDispSync->getPeriod();
-    // Check if offset should be handled as negative
-    if (phaseOffset >= mOffsetThresholdForNextVsync) {
-        phaseOffset -= period;
-    }
 
     // Normalize phaseOffset to [-period, period)
     const int numPeriods = phaseOffset / period;
@@ -110,3 +108,6 @@ void DispSyncSource::onDispSyncEvent(nsecs_t when) {
 }
 
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

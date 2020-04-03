@@ -18,7 +18,6 @@
 #include <compositionengine/impl/OutputLayerCompositionState.h>
 #include <compositionengine/mock/CompositionEngine.h>
 #include <compositionengine/mock/DisplayColorProfile.h>
-#include <compositionengine/mock/Layer.h>
 #include <compositionengine/mock/LayerFE.h>
 #include <compositionengine/mock/Output.h>
 #include <gtest/gtest.h>
@@ -56,15 +55,12 @@ MATCHER_P(ColorEq, expected, "") {
 
 struct OutputLayerTest : public testing::Test {
     struct OutputLayer final : public impl::OutputLayer {
-        OutputLayer(const compositionengine::Output& output,
-                    std::shared_ptr<compositionengine::Layer> layer,
-                    sp<compositionengine::LayerFE> layerFE)
-              : mOutput(output), mLayer(layer), mLayerFE(layerFE) {}
+        OutputLayer(const compositionengine::Output& output, sp<compositionengine::LayerFE> layerFE)
+              : mOutput(output), mLayerFE(layerFE) {}
         ~OutputLayer() override = default;
 
         // compositionengine::OutputLayer overrides
         const compositionengine::Output& getOutput() const override { return mOutput; }
-        compositionengine::Layer& getLayer() const override { return *mLayer; }
         compositionengine::LayerFE& getLayerFE() const override { return *mLayerFE; }
         const impl::OutputLayerCompositionState& getState() const override { return mState; }
         impl::OutputLayerCompositionState& editState() override { return mState; }
@@ -73,7 +69,6 @@ struct OutputLayerTest : public testing::Test {
         void dumpState(std::string& out) const override { mState.dump(out); }
 
         const compositionengine::Output& mOutput;
-        std::shared_ptr<compositionengine::Layer> mLayer;
         sp<compositionengine::LayerFE> mLayerFE;
         impl::OutputLayerCompositionState mState;
     };
@@ -82,16 +77,14 @@ struct OutputLayerTest : public testing::Test {
         EXPECT_CALL(*mLayerFE, getDebugName()).WillRepeatedly(Return("Test LayerFE"));
         EXPECT_CALL(mOutput, getName()).WillRepeatedly(ReturnRef(kOutputName));
 
-        EXPECT_CALL(*mLayer, getFEState()).WillRepeatedly(ReturnRef(mLayerFEState));
+        EXPECT_CALL(*mLayerFE, getCompositionState()).WillRepeatedly(Return(&mLayerFEState));
         EXPECT_CALL(mOutput, getState()).WillRepeatedly(ReturnRef(mOutputState));
     }
 
     compositionengine::mock::Output mOutput;
-    std::shared_ptr<compositionengine::mock::Layer> mLayer{
-            new StrictMock<compositionengine::mock::Layer>()};
     sp<compositionengine::mock::LayerFE> mLayerFE{
             new StrictMock<compositionengine::mock::LayerFE>()};
-    OutputLayer mOutputLayer{mOutput, mLayer, mLayerFE};
+    OutputLayer mOutputLayer{mOutput, mLayerFE};
 
     LayerFECompositionState mLayerFEState;
     impl::OutputCompositionState mOutputState;
@@ -364,6 +357,7 @@ TEST_F(OutputLayerTest, calculateOutputRelativeBufferTransformTestsNeeded) {
         mLayerFEState.geomLayerTransform.set(entry.layer, 1920, 1080);
         mLayerFEState.geomBufferTransform = entry.buffer;
         mOutputState.orientation = entry.display;
+        mOutputState.transform = ui::Transform{entry.display};
 
         auto actual = mOutputLayer.calculateOutputRelativeBufferTransform();
         EXPECT_EQ(entry.expected, actual) << "entry " << i;
@@ -422,6 +416,7 @@ TEST_F(OutputLayerTest,
         mLayerFEState.geomLayerTransform = ui::Transform{entry.layer};
         mLayerFEState.geomBufferTransform = entry.buffer;
         mOutputState.orientation = entry.display;
+        mOutputState.transform = ui::Transform{entry.display};
 
         auto actual = mOutputLayer.calculateOutputRelativeBufferTransform();
         EXPECT_EQ(entry.expected, actual) << "entry " << i;
@@ -434,9 +429,8 @@ TEST_F(OutputLayerTest,
 
 struct OutputLayerPartialMockForUpdateCompositionState : public impl::OutputLayer {
     OutputLayerPartialMockForUpdateCompositionState(const compositionengine::Output& output,
-                                                    std::shared_ptr<compositionengine::Layer> layer,
                                                     sp<compositionengine::LayerFE> layerFE)
-          : mOutput(output), mLayer(layer), mLayerFE(layerFE) {}
+          : mOutput(output), mLayerFE(layerFE) {}
     // Mock everything called by updateCompositionState to simplify testing it.
     MOCK_CONST_METHOD0(calculateOutputSourceCrop, FloatRect());
     MOCK_CONST_METHOD0(calculateOutputDisplayFrame, Rect());
@@ -444,7 +438,6 @@ struct OutputLayerPartialMockForUpdateCompositionState : public impl::OutputLaye
 
     // compositionengine::OutputLayer overrides
     const compositionengine::Output& getOutput() const override { return mOutput; }
-    compositionengine::Layer& getLayer() const override { return *mLayer; }
     compositionengine::LayerFE& getLayerFE() const override { return *mLayerFE; }
     const impl::OutputLayerCompositionState& getState() const override { return mState; }
     impl::OutputLayerCompositionState& editState() override { return mState; }
@@ -453,7 +446,6 @@ struct OutputLayerPartialMockForUpdateCompositionState : public impl::OutputLaye
     MOCK_CONST_METHOD1(dumpState, void(std::string&));
 
     const compositionengine::Output& mOutput;
-    std::shared_ptr<compositionengine::Layer> mLayer;
     sp<compositionengine::LayerFE> mLayerFE;
     impl::OutputLayerCompositionState mState;
 };
@@ -461,7 +453,6 @@ struct OutputLayerPartialMockForUpdateCompositionState : public impl::OutputLaye
 struct OutputLayerUpdateCompositionStateTest : public OutputLayerTest {
 public:
     OutputLayerUpdateCompositionStateTest() {
-        EXPECT_CALL(*mLayer, getFEState()).WillRepeatedly(ReturnRef(mLayerFEState));
         EXPECT_CALL(mOutput, getState()).WillRepeatedly(ReturnRef(mOutputState));
         EXPECT_CALL(mOutput, getDisplayColorProfile())
                 .WillRepeatedly(Return(&mDisplayColorProfile));
@@ -489,9 +480,15 @@ public:
     uint32_t mBufferTransform{21};
 
     using OutputLayer = OutputLayerPartialMockForUpdateCompositionState;
-    StrictMock<OutputLayer> mOutputLayer{mOutput, mLayer, mLayerFE};
+    StrictMock<OutputLayer> mOutputLayer{mOutput, mLayerFE};
     StrictMock<mock::DisplayColorProfile> mDisplayColorProfile;
 };
+
+TEST_F(OutputLayerUpdateCompositionStateTest, doesNothingIfNoFECompositionState) {
+    EXPECT_CALL(*mLayerFE, getCompositionState()).WillOnce(Return(nullptr));
+
+    mOutputLayer.updateCompositionState(true, false);
+}
 
 TEST_F(OutputLayerUpdateCompositionStateTest, setsStateNormally) {
     mLayerFEState.isSecure = true;
@@ -628,6 +625,8 @@ struct OutputLayerWriteStateToHWCTest : public OutputLayerTest {
     static constexpr ui::Dataspace kDataspace = static_cast<ui::Dataspace>(71);
     static constexpr int kSupportedPerFrameMetadata = 101;
     static constexpr int kExpectedHwcSlot = 0;
+    static constexpr bool kLayerGenericMetadata1Mandatory = true;
+    static constexpr bool kLayerGenericMetadata2Mandatory = true;
 
     static const half4 kColor;
     static const Rect kDisplayFrame;
@@ -638,6 +637,10 @@ struct OutputLayerWriteStateToHWCTest : public OutputLayerTest {
     static native_handle_t* kSidebandStreamHandle;
     static const sp<GraphicBuffer> kBuffer;
     static const sp<Fence> kFence;
+    static const std::string kLayerGenericMetadata1Key;
+    static const std::vector<uint8_t> kLayerGenericMetadata1Value;
+    static const std::string kLayerGenericMetadata2Key;
+    static const std::vector<uint8_t> kLayerGenericMetadata2Value;
 
     OutputLayerWriteStateToHWCTest() {
         auto& outputLayerState = mOutputLayer.editState();
@@ -671,6 +674,13 @@ struct OutputLayerWriteStateToHWCTest : public OutputLayerTest {
 
     // Some tests may need to simulate unsupported HWC calls
     enum class SimulateUnsupported { None, ColorTransform };
+
+    void includeGenericLayerMetadataInState() {
+        mLayerFEState.metadata[kLayerGenericMetadata1Key] = {kLayerGenericMetadata1Mandatory,
+                                                             kLayerGenericMetadata1Value};
+        mLayerFEState.metadata[kLayerGenericMetadata2Key] = {kLayerGenericMetadata2Mandatory,
+                                                             kLayerGenericMetadata2Value};
+    }
 
     void expectGeometryCommonCalls() {
         EXPECT_CALL(*mHwcLayer, setDisplayFrame(kDisplayFrame)).WillOnce(Return(kError));
@@ -723,6 +733,18 @@ struct OutputLayerWriteStateToHWCTest : public OutputLayerTest {
         EXPECT_CALL(*mHwcLayer, setBuffer(kExpectedHwcSlot, kBuffer, kFence));
     }
 
+    void expectGenericLayerMetadataCalls() {
+        // Note: Can be in any order.
+        EXPECT_CALL(*mHwcLayer,
+                    setLayerGenericMetadata(kLayerGenericMetadata1Key,
+                                            kLayerGenericMetadata1Mandatory,
+                                            kLayerGenericMetadata1Value));
+        EXPECT_CALL(*mHwcLayer,
+                    setLayerGenericMetadata(kLayerGenericMetadata2Key,
+                                            kLayerGenericMetadata2Mandatory,
+                                            kLayerGenericMetadata2Value));
+    }
+
     std::shared_ptr<HWC2::mock::Layer> mHwcLayer{std::make_shared<StrictMock<HWC2::mock::Layer>>()};
     StrictMock<mock::DisplayColorProfile> mDisplayColorProfile;
 };
@@ -742,6 +764,19 @@ native_handle_t* OutputLayerWriteStateToHWCTest::kSidebandStreamHandle =
         reinterpret_cast<native_handle_t*>(1031);
 const sp<GraphicBuffer> OutputLayerWriteStateToHWCTest::kBuffer;
 const sp<Fence> OutputLayerWriteStateToHWCTest::kFence;
+const std::string OutputLayerWriteStateToHWCTest::kLayerGenericMetadata1Key =
+        "com.example.metadata.1";
+const std::vector<uint8_t> OutputLayerWriteStateToHWCTest::kLayerGenericMetadata1Value{{1, 2, 3}};
+const std::string OutputLayerWriteStateToHWCTest::kLayerGenericMetadata2Key =
+        "com.example.metadata.2";
+const std::vector<uint8_t> OutputLayerWriteStateToHWCTest::kLayerGenericMetadata2Value{
+        {4, 5, 6, 7}};
+
+TEST_F(OutputLayerWriteStateToHWCTest, doesNothingIfNoFECompositionState) {
+    EXPECT_CALL(*mLayerFE, getCompositionState()).WillOnce(Return(nullptr));
+
+    mOutputLayer.writeStateToHWC(true);
+}
 
 TEST_F(OutputLayerWriteStateToHWCTest, doesNothingIfNoHWCState) {
     mOutputLayer.editState().hwc.reset();
@@ -762,6 +797,21 @@ TEST_F(OutputLayerWriteStateToHWCTest, canSetAllState) {
     expectNoSetCompositionTypeCall();
 
     mOutputLayer.writeStateToHWC(true);
+}
+
+TEST_F(OutputLayerTest, displayInstallOrientationBufferTransformSetTo90) {
+    mLayerFEState.geomBufferUsesDisplayInverseTransform = false;
+    mLayerFEState.geomLayerTransform = ui::Transform{TR_IDENT};
+    // This test simulates a scenario where displayInstallOrientation is set to
+    // ROT_90. This only has an effect on the transform; orientation stays 0 (see
+    // DisplayDevice::setProjection).
+    mOutputState.orientation = TR_IDENT;
+    mOutputState.transform = ui::Transform{TR_ROT_90};
+    // Buffers are pre-rotated based on the transform hint (ROT_90); their
+    // geomBufferTransform is set to the inverse transform.
+    mLayerFEState.geomBufferTransform = TR_ROT_270;
+
+    EXPECT_EQ(TR_IDENT, mOutputLayer.calculateOutputRelativeBufferTransform());
 }
 
 TEST_F(OutputLayerWriteStateToHWCTest, canSetPerFrameStateForSolidColor) {
@@ -844,6 +894,30 @@ TEST_F(OutputLayerWriteStateToHWCTest, compositionTypeIsSetToClientIfClientCompo
     mOutputLayer.writeStateToHWC(false);
 }
 
+TEST_F(OutputLayerWriteStateToHWCTest, allStateIncludesMetadataIfPresent) {
+    mLayerFEState.compositionType = Hwc2::IComposerClient::Composition::DEVICE;
+    includeGenericLayerMetadataInState();
+
+    expectGeometryCommonCalls();
+    expectPerFrameCommonCalls();
+    expectSetHdrMetadataAndBufferCalls();
+    expectGenericLayerMetadataCalls();
+    expectSetCompositionTypeCall(Hwc2::IComposerClient::Composition::DEVICE);
+
+    mOutputLayer.writeStateToHWC(true);
+}
+
+TEST_F(OutputLayerWriteStateToHWCTest, perFrameStateDoesNotIncludeMetadataIfPresent) {
+    mLayerFEState.compositionType = Hwc2::IComposerClient::Composition::DEVICE;
+    includeGenericLayerMetadataInState();
+
+    expectPerFrameCommonCalls();
+    expectSetHdrMetadataAndBufferCalls();
+    expectSetCompositionTypeCall(Hwc2::IComposerClient::Composition::DEVICE);
+
+    mOutputLayer.writeStateToHWC(false);
+}
+
 /*
  * OutputLayer::writeCursorPositionToHWC()
  */
@@ -870,6 +944,12 @@ struct OutputLayerWriteCursorPositionToHWCTest : public OutputLayerTest {
 
 const Rect OutputLayerWriteCursorPositionToHWCTest::kDefaultDisplayViewport{0, 0, 1920, 1080};
 const Rect OutputLayerWriteCursorPositionToHWCTest::kDefaultCursorFrame{1, 2, 3, 4};
+
+TEST_F(OutputLayerWriteCursorPositionToHWCTest, doesNothingIfNoFECompositionState) {
+    EXPECT_CALL(*mLayerFE, getCompositionState()).WillOnce(Return(nullptr));
+
+    mOutputLayer.writeCursorPositionToHWC();
+}
 
 TEST_F(OutputLayerWriteCursorPositionToHWCTest, writeCursorPositionToHWCHandlesNoHwcState) {
     mOutputLayer.editState().hwc.reset();

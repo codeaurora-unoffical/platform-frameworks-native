@@ -14,20 +14,26 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include <compositionengine/impl/CompositionEngine.h>
+#include <cutils/properties.h>
 #include <ui/GraphicBuffer.h>
 
 #include "BufferLayerConsumer.h"
 #include "BufferQueueLayer.h"
 #include "BufferStateLayer.h"
-#include "ColorLayer.h"
 #include "ContainerLayer.h"
 #include "DisplayDevice.h"
+#include "EffectLayer.h"
 #include "Layer.h"
 #include "MonitoredProducer.h"
 #include "NativeWindowSurface.h"
 #include "StartPropertySetThread.h"
 #include "SurfaceFlingerDefaultFactory.h"
+#include "SurfaceFlingerProperties.h"
 #include "SurfaceInterceptor.h"
 
 #include "DisplayHardware/ComposerHal.h"
@@ -51,22 +57,28 @@ std::unique_ptr<EventControlThread> DefaultFactory::createEventControlThread(
 }
 
 std::unique_ptr<HWComposer> DefaultFactory::createHWComposer(const std::string& serviceName) {
-    return std::make_unique<android::impl::HWComposer>(
-            std::make_unique<Hwc2::impl::Composer>(serviceName));
+    return std::make_unique<android::impl::HWComposer>(serviceName);
 }
 
 std::unique_ptr<MessageQueue> DefaultFactory::createMessageQueue() {
     return std::make_unique<android::impl::MessageQueue>();
 }
 
-std::unique_ptr<scheduler::PhaseOffsets> DefaultFactory::createPhaseOffsets() {
-    return std::make_unique<scheduler::impl::PhaseOffsets>();
+std::unique_ptr<scheduler::PhaseConfiguration> DefaultFactory::createPhaseConfiguration(
+        const scheduler::RefreshRateConfigs& refreshRateConfigs) {
+    if (property_get_bool("debug.sf.use_phase_offsets_as_durations", false)) {
+        return std::make_unique<scheduler::impl::PhaseDurations>(refreshRateConfigs);
+    } else {
+        return std::make_unique<scheduler::impl::PhaseOffsets>(refreshRateConfigs);
+    }
 }
 
 std::unique_ptr<Scheduler> DefaultFactory::createScheduler(
         SetVSyncEnabled setVSyncEnabled, const scheduler::RefreshRateConfigs& configs,
         ISchedulerCallback& schedulerCallback) {
-    return std::make_unique<Scheduler>(std::move(setVSyncEnabled), configs, schedulerCallback);
+    return std::make_unique<Scheduler>(std::move(setVSyncEnabled), configs, schedulerCallback,
+                                       property_get_bool("debug.sf.use_content_detection_v2", true),
+                                       sysprop::use_content_detection_for_refresh_rate(false));
 }
 
 std::unique_ptr<SurfaceInterceptor> DefaultFactory::createSurfaceInterceptor(
@@ -79,8 +91,8 @@ sp<StartPropertySetThread> DefaultFactory::createStartPropertySetThread(
     return new StartPropertySetThread(timestampPropertyValue);
 }
 
-sp<DisplayDevice> DefaultFactory::createDisplayDevice(DisplayDeviceCreationArgs&& creationArgs) {
-    return new DisplayDevice(std::move(creationArgs));
+sp<DisplayDevice> DefaultFactory::createDisplayDevice(DisplayDeviceCreationArgs& creationArgs) {
+    return new DisplayDevice(creationArgs);
 }
 
 sp<GraphicBuffer> DefaultFactory::createGraphicBuffer(uint32_t width, uint32_t height,
@@ -128,8 +140,11 @@ sp<BufferStateLayer> DefaultFactory::createBufferStateLayer(const LayerCreationA
     return new BufferStateLayer(args);
 }
 
-sp<ColorLayer> DefaultFactory::createColorLayer(const LayerCreationArgs& args) {
-    return new ColorLayer(args);
+sp<EffectLayer> DefaultFactory::createEffectLayer(const LayerCreationArgs& args) {
+    return new EffectLayer(args);
 }
 
 } // namespace android::surfaceflinger
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 //#define LOG_NDEBUG 0
 #undef LOG_TAG
 #define LOG_TAG "FakeComposer"
@@ -760,6 +764,43 @@ V2_4::Error FakeComposerClient::setActiveConfigWithConstraints(
     return V2_4::Error::UNSUPPORTED;
 }
 
+V2_4::Error FakeComposerClient::setAutoLowLatencyMode(Display, bool) {
+    ALOGV("setAutoLowLatencyMode");
+    return V2_4::Error::UNSUPPORTED;
+}
+
+V2_4::Error FakeComposerClient::getSupportedContentTypes(
+        Display, std::vector<IComposerClient::ContentType>*) {
+    ALOGV("getSupportedContentTypes");
+    return V2_4::Error::UNSUPPORTED;
+}
+
+V2_4::Error FakeComposerClient::setContentType(Display, IComposerClient::ContentType) {
+    ALOGV("setContentType");
+    return V2_4::Error::UNSUPPORTED;
+}
+
+V2_4::Error FakeComposerClient::validateDisplay_2_4(
+        Display /*display*/, std::vector<Layer>* /*outChangedLayers*/,
+        std::vector<IComposerClient::Composition>* /*outCompositionTypes*/,
+        uint32_t* /*outDisplayRequestMask*/, std::vector<Layer>* /*outRequestedLayers*/,
+        std::vector<uint32_t>* /*outRequestMasks*/,
+        IComposerClient::ClientTargetProperty* /*outClientTargetProperty*/) {
+    return V2_4::Error::NONE;
+}
+
+V2_4::Error FakeComposerClient::setLayerGenericMetadata(Display, Layer, const std::string&, bool,
+                                                        const std::vector<uint8_t>&) {
+    ALOGV("setLayerGenericMetadata");
+    return V2_4::Error::UNSUPPORTED;
+}
+
+V2_4::Error FakeComposerClient::getLayerGenericMetadataKeys(
+        std::vector<IComposerClient::LayerGenericMetadataKey>*) {
+    ALOGV("getLayerGenericMetadataKeys");
+    return V2_4::Error::UNSUPPORTED;
+}
+
 //////////////////////////////////////////////////////////////////
 
 void FakeComposerClient::requestVSync(uint64_t vsyncTime) {
@@ -880,3 +921,6 @@ Layer FakeComposerClient::getLayer(size_t index) const {
     // this might get more involving.
     return static_cast<Layer>(index);
 }
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

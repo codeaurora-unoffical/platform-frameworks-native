@@ -16,7 +16,6 @@
 
 #include <android-base/stringprintf.h>
 #include <compositionengine/DisplayColorProfile.h>
-#include <compositionengine/Layer.h>
 #include <compositionengine/LayerFE.h>
 #include <compositionengine/LayerFECompositionState.h>
 #include <compositionengine/Output.h>
@@ -24,7 +23,14 @@
 #include <compositionengine/impl/OutputLayer.h>
 #include <compositionengine/impl/OutputLayerCompositionState.h>
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include "DisplayHardware/HWComposer.h"
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"
 
 namespace android::compositionengine {
 
@@ -44,11 +50,9 @@ FloatRect reduce(const FloatRect& win, const Region& exclude) {
 
 } // namespace
 
-std::unique_ptr<OutputLayer> createOutputLayer(
-        const compositionengine::Output& output,
-        const std::shared_ptr<compositionengine::Layer>& layer,
-        const sp<compositionengine::LayerFE>& layerFE) {
-    return createOutputLayerTemplated<OutputLayer>(output, layer, layerFE);
+std::unique_ptr<OutputLayer> createOutputLayer(const compositionengine::Output& output,
+                                               const sp<compositionengine::LayerFE>& layerFE) {
+    return createOutputLayerTemplated<OutputLayer>(output, layerFE);
 }
 
 OutputLayer::~OutputLayer() = default;
@@ -63,7 +67,7 @@ void OutputLayer::setHwcLayer(std::shared_ptr<HWC2::Layer> hwcLayer) {
 }
 
 Rect OutputLayer::calculateInitialCrop() const {
-    const auto& layerState = getLayer().getFEState();
+    const auto& layerState = *getLayerFE().getCompositionState();
 
     // apply the projection's clipping to the window crop in
     // layerstack space, and convert-back to layer space.
@@ -96,7 +100,7 @@ Rect OutputLayer::calculateInitialCrop() const {
 }
 
 FloatRect OutputLayer::calculateOutputSourceCrop() const {
-    const auto& layerState = getLayer().getFEState();
+    const auto& layerState = *getLayerFE().getCompositionState();
     const auto& outputState = getOutput().getState();
 
     if (!layerState.geomUsesSourceCrop) {
@@ -173,7 +177,7 @@ FloatRect OutputLayer::calculateOutputSourceCrop() const {
 }
 
 Rect OutputLayer::calculateOutputDisplayFrame() const {
-    const auto& layerState = getLayer().getFEState();
+    const auto& layerState = *getLayerFE().getCompositionState();
     const auto& outputState = getOutput().getState();
 
     // apply the layer's transform, followed by the display's global transform
@@ -220,7 +224,7 @@ Rect OutputLayer::calculateOutputDisplayFrame() const {
 }
 
 uint32_t OutputLayer::calculateOutputRelativeBufferTransform() const {
-    const auto& layerState = getLayer().getFEState();
+    const auto& layerState = *getLayerFE().getCompositionState();
     const auto& outputState = getOutput().getState();
 
     /*
@@ -231,7 +235,7 @@ uint32_t OutputLayer::calculateOutputRelativeBufferTransform() const {
      * (NOTE: the matrices are multiplied in reverse order)
      */
     const ui::Transform& layerTransform = layerState.geomLayerTransform;
-    const ui::Transform displayTransform{outputState.orientation};
+    const ui::Transform displayTransform{outputState.transform};
     const ui::Transform bufferTransform{layerState.geomBufferTransform};
     ui::Transform transform(displayTransform * layerTransform * bufferTransform);
 
@@ -260,7 +264,11 @@ uint32_t OutputLayer::calculateOutputRelativeBufferTransform() const {
 } // namespace impl
 
 void OutputLayer::updateCompositionState(bool includeGeometry, bool forceClientComposition) {
-    const auto& layerFEState = getLayer().getFEState();
+    const auto* layerFEState = getLayerFE().getCompositionState();
+    if (!layerFEState) {
+        return;
+    }
+
     const auto& outputState = getOutput().getState();
     const auto& profile = *getOutput().getDisplayColorProfile();
     auto& state = editState();
@@ -278,7 +286,7 @@ void OutputLayer::updateCompositionState(bool includeGeometry, bool forceClientC
         state.bufferTransform =
                 static_cast<Hwc2::Transform>(calculateOutputRelativeBufferTransform());
 
-        if ((layerFEState.isSecure && !outputState.isSecure) ||
+        if ((layerFEState->isSecure && !outputState.isSecure) ||
             (state.bufferTransform & ui::Transform::ROT_INVALID)) {
             state.forceClientComposition = true;
         }
@@ -287,14 +295,14 @@ void OutputLayer::updateCompositionState(bool includeGeometry, bool forceClientC
     // Determine the output dependent dataspace for this layer. If it is
     // colorspace agnostic, it just uses the dataspace chosen for the output to
     // avoid the need for color conversion.
-    state.dataspace = layerFEState.isColorspaceAgnostic &&
+    state.dataspace = layerFEState->isColorspaceAgnostic &&
                     outputState.targetDataspace != ui::Dataspace::UNKNOWN
             ? outputState.targetDataspace
-            : layerFEState.dataspace;
+            : layerFEState->dataspace;
 
     // These are evaluated every frame as they can potentially change at any
     // time.
-    if (layerFEState.forceClientComposition || !profile.isDataspaceSupported(state.dataspace) ||
+    if (layerFEState->forceClientComposition || !profile.isDataspaceSupported(state.dataspace) ||
         forceClientComposition) {
         state.forceClientComposition = true;
     }
@@ -314,21 +322,25 @@ void OutputLayer::writeStateToHWC(bool includeGeometry) {
         return;
     }
 
-    const auto& outputIndependentState = getLayer().getFEState();
-    auto requestedCompositionType = outputIndependentState.compositionType;
+    const auto* outputIndependentState = getLayerFE().getCompositionState();
+    if (!outputIndependentState) {
+        return;
+    }
+
+    auto requestedCompositionType = outputIndependentState->compositionType;
 
     if (includeGeometry) {
         writeOutputDependentGeometryStateToHWC(hwcLayer.get(), requestedCompositionType);
-        writeOutputIndependentGeometryStateToHWC(hwcLayer.get(), outputIndependentState);
+        writeOutputIndependentGeometryStateToHWC(hwcLayer.get(), *outputIndependentState);
     }
 
     writeOutputDependentPerFrameStateToHWC(hwcLayer.get());
-    writeOutputIndependentPerFrameStateToHWC(hwcLayer.get(), outputIndependentState);
+    writeOutputIndependentPerFrameStateToHWC(hwcLayer.get(), *outputIndependentState);
 
     writeCompositionTypeToHWC(hwcLayer.get(), requestedCompositionType);
 
     // Always set the layer color after setting the composition type.
-    writeSolidColorStateToHWC(hwcLayer.get(), outputIndependentState);
+    writeSolidColorStateToHWC(hwcLayer.get(), *outputIndependentState);
 }
 
 void OutputLayer::writeOutputDependentGeometryStateToHWC(
@@ -388,10 +400,19 @@ void OutputLayer::writeOutputIndependentGeometryStateToHWC(
               outputIndependentState.alpha, to_string(error).c_str(), static_cast<int32_t>(error));
     }
 
-    if (auto error = hwcLayer->setInfo(outputIndependentState.type, outputIndependentState.appId);
+    if (auto error = hwcLayer->setInfo(static_cast<uint32_t>(outputIndependentState.type),
+                                       static_cast<uint32_t>(outputIndependentState.appId));
         error != HWC2::Error::None) {
         ALOGE("[%s] Failed to set info %s (%d)", getLayerFE().getDebugName(),
               to_string(error).c_str(), static_cast<int32_t>(error));
+    }
+
+    for (const auto& [name, entry] : outputIndependentState.metadata) {
+        if (auto error = hwcLayer->setLayerGenericMetadata(name, entry.mandatory, entry.value);
+            error != HWC2::Error::None) {
+            ALOGE("[%s] Failed to set generic metadata %s %s (%d)", getLayerFE().getDebugName(),
+                  name.c_str(), to_string(error).c_str(), static_cast<int32_t>(error));
+        }
     }
 }
 
@@ -538,10 +559,14 @@ void OutputLayer::writeCursorPositionToHWC() const {
         return;
     }
 
-    const auto& layerFEState = getLayer().getFEState();
+    const auto* layerFEState = getLayerFE().getCompositionState();
+    if (!layerFEState) {
+        return;
+    }
+
     const auto& outputState = getOutput().getState();
 
-    Rect frame = layerFEState.cursorFrame;
+    Rect frame = layerFEState->cursorFrame;
     frame.intersect(outputState.viewport, &frame);
     Rect position = outputState.transform.transform(frame);
 
@@ -638,8 +663,7 @@ bool OutputLayer::needsFiltering() const {
 void OutputLayer::dump(std::string& out) const {
     using android::base::StringAppendF;
 
-    StringAppendF(&out, "  - Output Layer %p (Composition layer %p) (%s)\n", this, &getLayer(),
-                  getLayerFE().getDebugName());
+    StringAppendF(&out, "  - Output Layer %p(%s)\n", this, getLayerFE().getDebugName());
     dumpState(out);
 }
 

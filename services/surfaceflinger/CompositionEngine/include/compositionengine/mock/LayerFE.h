@@ -30,17 +30,14 @@ public:
     LayerFE();
     virtual ~LayerFE();
 
+    MOCK_CONST_METHOD0(getCompositionState, const LayerFECompositionState*());
+
     MOCK_METHOD1(onPreComposition, bool(nsecs_t));
 
-    MOCK_CONST_METHOD2(latchCompositionState,
-                       void(LayerFECompositionState&, compositionengine::LayerFE::StateSubset));
-    MOCK_CONST_METHOD1(latchCursorCompositionState, void(LayerFECompositionState&));
-    MOCK_METHOD1(prepareClientComposition,
-                 std::optional<renderengine::LayerSettings>(
+    MOCK_METHOD1(prepareCompositionState, void(compositionengine::LayerFE::StateSubset));
+    MOCK_METHOD1(prepareClientCompositionList,
+                 std::vector<compositionengine::LayerFE::LayerSettings>(
                          compositionengine::LayerFE::ClientCompositionTargetSettings&));
-    MOCK_METHOD3(prepareShadowClientComposition,
-                 std::optional<renderengine::LayerSettings>(const renderengine::LayerSettings&,
-                                                            const Rect&, ui::Dataspace));
 
     MOCK_METHOD1(onLayerDisplayed, void(const sp<Fence>&));
 

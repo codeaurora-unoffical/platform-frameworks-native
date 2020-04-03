@@ -31,6 +31,7 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -53,6 +54,7 @@
 #include <log/log.h>               // TODO: Move everything to base/logging.
 #include <logwrap/logwrap.h>
 #include <private/android_filesystem_config.h>
+#include <private/android_projectid_config.h>
 #include <selinux/android.h>
 #include <system/thread_defs.h>
 #include <utils/Trace.h>
@@ -65,6 +67,7 @@
 #include "view_compiler.h"
 
 #include "CacheTracker.h"
+#include "CrateManager.h"
 #include "MatchExtensionGen.h"
 #include "QuotaUtils.h"
 
@@ -86,6 +89,9 @@ static constexpr const mode_t kRollbackFolderMode = 0700;
 static constexpr const char* kCpPath = "/system/bin/cp";
 static constexpr const char* kXattrDefault = "user.default";
 
+static constexpr const char* kDataMirrorCePath = "/data_mirror/data_ce";
+static constexpr const char* kDataMirrorDePath = "/data_mirror/data_de";
+
 static constexpr const int MIN_RESTRICTED_HOME_SDK_VERSION = 24; // > M
 
 static constexpr const char* PKG_LIB_POSTFIX = "/lib";
@@ -98,6 +104,15 @@ static constexpr int kVerityPageSize = 4096;
 static constexpr size_t kSha256Size = 32;
 static constexpr const char* kPropApkVerityMode = "ro.apk_verity.mode";
 static constexpr const char* kFuseProp = "persist.sys.fuse";
+
+/**
+ * Property to control if app data isolation is enabled.
+ */
+static constexpr const char* kAppDataIsolationEnabledProperty = "persist.zygote.app_data_isolation";
+static constexpr const char* kMntSdcardfs = "/mnt/runtime/default/";
+static constexpr const char* kMntFuse = "/mnt/pass_through/0/";
+
+static std::atomic<bool> sAppDataIsolationEnabled(false);
 
 namespace {
 
@@ -258,6 +273,8 @@ status_t InstalldNativeService::start() {
     sp<ProcessState> ps(ProcessState::self());
     ps->startThreadPool();
     ps->giveThreadPoolName();
+    sAppDataIsolationEnabled = android::base::GetBoolProperty(
+            kAppDataIsolationEnabledProperty, true);
     return android::OK;
 }
 
@@ -450,9 +467,12 @@ binder::Status InstalldNativeService::createAppData(const std::unique_ptr<std::s
 
         // And return the CE inode of the top-level data directory so we can
         // clear contents while CE storage is locked
-        if ((_aidl_return != nullptr)
-                && get_path_inode(path, reinterpret_cast<ino_t*>(_aidl_return)) != 0) {
-            return error("Failed to get_path_inode for " + path);
+        if (_aidl_return != nullptr) {
+            ino_t result;
+            if (get_path_inode(path, &result) != 0) {
+                return error("Failed to get_path_inode for " + path);
+            }
+            *_aidl_return = static_cast<uint64_t>(result);
         }
     }
     if (flags & FLAG_STORAGE_DE) {
@@ -622,10 +642,8 @@ binder::Status InstalldNativeService::clearAppData(const std::unique_ptr<std::st
                 if (delete_dir_contents(path, true) != 0) {
                     res = error("Failed to delete contents of " + path);
                 }
-                path = StringPrintf("%s/Android/obb/%s", extPath.c_str(), pkgname);
-                if (delete_dir_contents(path, true) != 0) {
-                    res = error("Failed to delete contents of " + path);
-                }
+                // Note that we explicitly don't delete OBBs - those are only removed on
+                // app uninstall.
             }
         }
     }
@@ -684,11 +702,13 @@ binder::Status InstalldNativeService::destroyAppData(const std::unique_ptr<std::
         if (delete_dir_contents_and_dir(path) != 0) {
             res = error("Failed to delete " + path);
         }
-        destroy_app_current_profiles(packageName, userId);
-        // TODO(calin): If the package is still installed by other users it's probably
-        // beneficial to keep the reference profile around.
-        // Verify if it's ok to do that.
-        destroy_app_reference_profile(packageName);
+        if ((flags & FLAG_CLEAR_APP_DATA_KEEP_ART_PROFILES) == 0) {
+            destroy_app_current_profiles(packageName, userId);
+            // TODO(calin): If the package is still installed by other users it's probably
+            // beneficial to keep the reference profile around.
+            // Verify if it's ok to do that.
+            destroy_app_reference_profile(packageName);
+        }
     }
     if (flags & FLAG_STORAGE_EXTERNAL) {
         std::lock_guard<std::recursive_mutex> lock(mMountsLock);
@@ -1084,8 +1104,8 @@ binder::Status InstalldNativeService::destroyAppDataSnapshot(
 
 binder::Status InstalldNativeService::moveCompleteApp(const std::unique_ptr<std::string>& fromUuid,
         const std::unique_ptr<std::string>& toUuid, const std::string& packageName,
-        const std::string& dataAppName, int32_t appId, const std::string& seInfo,
-        int32_t targetSdkVersion) {
+        int32_t appId, const std::string& seInfo,
+        int32_t targetSdkVersion, const std::string& fromCodePath) {
     ENFORCE_UID(AID_SYSTEM);
     CHECK_ARGUMENT_UUID(fromUuid);
     CHECK_ARGUMENT_UUID(toUuid);
@@ -1095,25 +1115,24 @@ binder::Status InstalldNativeService::moveCompleteApp(const std::unique_ptr<std:
     const char* from_uuid = fromUuid ? fromUuid->c_str() : nullptr;
     const char* to_uuid = toUuid ? toUuid->c_str() : nullptr;
     const char* package_name = packageName.c_str();
-    const char* data_app_name = dataAppName.c_str();
 
     binder::Status res = ok();
     std::vector<userid_t> users = get_known_users(from_uuid);
 
+    auto to_app_package_path_parent = create_data_app_path(to_uuid);
+    auto to_app_package_path = StringPrintf("%s/%s", to_app_package_path_parent.c_str(),
+                                            android::base::Basename(fromCodePath).c_str());
+
     // Copy app
     {
-        auto from = create_data_app_package_path(from_uuid, data_app_name);
-        auto to = create_data_app_package_path(to_uuid, data_app_name);
-        auto to_parent = create_data_app_path(to_uuid);
-
-        int rc = copy_directory_recursive(from.c_str(), to_parent.c_str());
+        int rc = copy_directory_recursive(fromCodePath.c_str(), to_app_package_path_parent.c_str());
         if (rc != 0) {
-            res = error(rc, "Failed copying " + from + " to " + to);
+            res = error(rc, "Failed copying " + fromCodePath + " to " + to_app_package_path);
             goto fail;
         }
 
-        if (selinux_android_restorecon(to.c_str(), SELINUX_ANDROID_RESTORECON_RECURSE) != 0) {
-            res = error("Failed to restorecon " + to);
+        if (selinux_android_restorecon(to_app_package_path.c_str(), SELINUX_ANDROID_RESTORECON_RECURSE) != 0) {
+            res = error("Failed to restorecon " + to_app_package_path);
             goto fail;
         }
     }
@@ -1170,9 +1189,8 @@ binder::Status InstalldNativeService::moveCompleteApp(const std::unique_ptr<std:
 fail:
     // Nuke everything we might have already copied
     {
-        auto to = create_data_app_package_path(to_uuid, data_app_name);
-        if (delete_dir_contents(to.c_str(), 1, nullptr) != 0) {
-            LOG(WARNING) << "Failed to rollback " << to;
+        if (delete_dir_contents(to_app_package_path.c_str(), 1, nullptr) != 0) {
+            LOG(WARNING) << "Failed to rollback " << to_app_package_path;
         }
     }
     for (auto user : users) {
@@ -1470,8 +1488,8 @@ static std::string toString(std::vector<int64_t> values) {
 static void collectQuotaStats(const std::string& uuid, int32_t userId,
         int32_t appId, struct stats* stats, struct stats* extStats) {
     int64_t space;
+    uid_t uid = multiuser_get_uid(userId, appId);
     if (stats != nullptr) {
-        uid_t uid = multiuser_get_uid(userId, appId);
         if ((space = GetOccupiedSpaceForUid(uuid, uid)) != -1) {
             stats->dataSize += space;
         }
@@ -1492,19 +1510,43 @@ static void collectQuotaStats(const std::string& uuid, int32_t userId,
     }
 
     if (extStats != nullptr) {
-        int extGid = multiuser_get_ext_gid(userId, appId);
-        if (extGid != -1) {
-            if ((space = GetOccupiedSpaceForGid(uuid, extGid)) != -1) {
-                extStats->dataSize += space;
+        static const bool supportsSdCardFs = supports_sdcardfs();
+        space = get_occupied_app_space_external(uuid, userId, appId);
+
+        if (space != -1) {
+            extStats->dataSize += space;
+            if (!supportsSdCardFs && stats != nullptr) {
+                // On devices without sdcardfs, if internal and external are on
+                // the same volume, a uid such as u0_a123 is used for
+                // application dirs on both internal and external storage;
+                // therefore, substract that amount from internal to make sure
+                // we don't count it double.
+                stats->dataSize -= space;
             }
         }
 
-        int extCacheGid = multiuser_get_ext_cache_gid(userId, appId);
-        if (extCacheGid != -1) {
-            if ((space = GetOccupiedSpaceForGid(uuid, extCacheGid)) != -1) {
-                extStats->dataSize += space;
-                extStats->cacheSize += space;
+        space = get_occupied_app_cache_space_external(uuid, userId, appId);
+        if (space != -1) {
+            extStats->dataSize += space; // cache counts for "data"
+            extStats->cacheSize += space;
+            if (!supportsSdCardFs && stats != nullptr) {
+                // On devices without sdcardfs, if internal and external are on
+                // the same volume, a uid such as u0_a123 is used for both
+                // internal and external storage; therefore, substract that
+                // amount from internal to make sure we don't count it double.
+                stats->dataSize -= space;
             }
+        }
+
+        if (!supportsSdCardFs && stats != nullptr) {
+            // On devices without sdcardfs, the UID of OBBs on external storage
+            // matches the regular app UID (eg u0_a123); therefore, to avoid
+            // OBBs being include in stats->dataSize, compute the OBB size for
+            // this app, and substract it from the size reported on internal
+            // storage
+            long obbProjectId = uid - AID_APP_START + PROJECT_ID_EXT_OBB_START;
+            int64_t appObbSize = GetOccupiedSpaceForProjectId(uuid, obbProjectId);
+            stats->dataSize -= appObbSize;
         }
     }
 }
@@ -1754,6 +1796,106 @@ binder::Status InstalldNativeService::getAppSize(const std::unique_ptr<std::stri
     return ok();
 }
 
+struct external_sizes {
+    int64_t audioSize;
+    int64_t videoSize;
+    int64_t imageSize;
+    int64_t totalSize; // excludes OBBs (Android/obb), but includes app data + cache
+    int64_t obbSize;
+};
+
+#define PER_USER_RANGE 100000
+
+static long getProjectIdForUser(int userId, long projectId) {
+    return userId * PER_USER_RANGE + projectId;
+}
+
+static external_sizes getExternalSizesForUserWithQuota(const std::string& uuid, int32_t userId, const std::vector<int32_t>& appIds) {
+    struct external_sizes sizes = {};
+    int64_t space;
+
+    if (supports_sdcardfs()) {
+        uid_t uid = multiuser_get_uid(userId, AID_MEDIA_RW);
+        if ((space = GetOccupiedSpaceForUid(uuid, uid)) != -1) {
+            sizes.totalSize = space;
+        }
+
+        gid_t audioGid = multiuser_get_uid(userId, AID_MEDIA_AUDIO);
+        if ((space = GetOccupiedSpaceForGid(uuid, audioGid)) != -1) {
+            sizes.audioSize = space;
+        }
+
+        gid_t videoGid = multiuser_get_uid(userId, AID_MEDIA_VIDEO);
+        if ((space = GetOccupiedSpaceForGid(uuid, videoGid)) != -1) {
+            sizes.videoSize = space;
+        }
+
+        gid_t imageGid = multiuser_get_uid(userId, AID_MEDIA_IMAGE);
+        if ((space = GetOccupiedSpaceForGid(uuid, imageGid)) != -1) {
+            sizes.imageSize = space;
+        }
+
+        if ((space = GetOccupiedSpaceForGid(uuid, AID_MEDIA_OBB)) != -1) {
+            sizes.obbSize = space;
+        }
+    } else {
+        int64_t totalSize = 0;
+        long defaultProjectId = getProjectIdForUser(userId, PROJECT_ID_EXT_DEFAULT);
+        if ((space = GetOccupiedSpaceForProjectId(uuid, defaultProjectId)) != -1) {
+            // This is all files that are not audio/video/images, excluding
+            // OBBs and app-private data
+            totalSize += space;
+        }
+
+        long audioProjectId = getProjectIdForUser(userId, PROJECT_ID_EXT_MEDIA_AUDIO);
+        if ((space = GetOccupiedSpaceForProjectId(uuid, audioProjectId)) != -1) {
+            sizes.audioSize = space;
+            totalSize += space;
+        }
+
+        long videoProjectId = getProjectIdForUser(userId, PROJECT_ID_EXT_MEDIA_VIDEO);
+        if ((space = GetOccupiedSpaceForProjectId(uuid, videoProjectId)) != -1) {
+            sizes.videoSize = space;
+            totalSize += space;
+        }
+
+        long imageProjectId = getProjectIdForUser(userId, PROJECT_ID_EXT_MEDIA_IMAGE);
+        if ((space = GetOccupiedSpaceForProjectId(uuid, imageProjectId)) != -1) {
+            sizes.imageSize = space;
+            totalSize += space;
+        }
+
+        int64_t totalAppDataSize = 0;
+        int64_t totalAppCacheSize = 0;
+        int64_t totalAppObbSize = 0;
+        for (auto appId : appIds) {
+            if (appId >= AID_APP_START) {
+                // App data
+                uid_t uid = multiuser_get_uid(userId, appId);
+                long projectId = uid - AID_APP_START + PROJECT_ID_EXT_DATA_START;
+                totalAppDataSize += GetOccupiedSpaceForProjectId(uuid, projectId);
+
+                // App cache
+                long cacheProjectId = uid - AID_APP_START + PROJECT_ID_EXT_CACHE_START;
+                totalAppCacheSize += GetOccupiedSpaceForProjectId(uuid, cacheProjectId);
+
+                // App OBBs
+                long obbProjectId = uid - AID_APP_START + PROJECT_ID_EXT_OBB_START;
+                totalAppObbSize += GetOccupiedSpaceForProjectId(uuid, obbProjectId);
+            }
+        }
+        // Total size should include app data + cache
+        totalSize += totalAppDataSize;
+        totalSize += totalAppCacheSize;
+        sizes.totalSize = totalSize;
+
+        // Only OBB is separate
+        sizes.obbSize = totalAppObbSize;
+    }
+
+    return sizes;
+}
+
 binder::Status InstalldNativeService::getUserSize(const std::unique_ptr<std::string>& uuid,
         int32_t userId, int32_t flags, const std::vector<int32_t>& appIds,
         std::vector<int64_t>* _aidl_return) {
@@ -1782,14 +1924,6 @@ binder::Status InstalldNativeService::getUserSize(const std::unique_ptr<std::str
     }
 
     if (flags & FLAG_USE_QUOTA) {
-        int64_t space;
-
-        ATRACE_BEGIN("obb");
-        if ((space = GetOccupiedSpaceForGid(uuidString, AID_MEDIA_OBB)) != -1) {
-            extStats.codeSize += space;
-        }
-        ATRACE_END();
-
         ATRACE_BEGIN("code");
         calculate_tree_size(create_data_app_path(uuid_), &stats.codeSize, -1, -1, true);
         ATRACE_END();
@@ -1811,10 +1945,9 @@ binder::Status InstalldNativeService::getUserSize(const std::unique_ptr<std::str
         }
 
         ATRACE_BEGIN("external");
-        uid_t uid = multiuser_get_uid(userId, AID_MEDIA_RW);
-        if ((space = GetOccupiedSpaceForUid(uuidString, uid)) != -1) {
-            extStats.dataSize += space;
-        }
+        auto sizes = getExternalSizesForUserWithQuota(uuidString, userId, appIds);
+        extStats.dataSize += sizes.totalSize;
+        extStats.codeSize += sizes.obbSize;
         ATRACE_END();
 
         if (!uuid) {
@@ -1825,13 +1958,11 @@ binder::Status InstalldNativeService::getUserSize(const std::unique_ptr<std::str
                     -1, -1, true);
             ATRACE_END();
         }
-
         ATRACE_BEGIN("quota");
         int64_t dataSize = extStats.dataSize;
         for (auto appId : appIds) {
             if (appId >= AID_APP_START) {
                 collectQuotaStats(uuidString, userId, appId, &stats, &extStats);
-
 #if MEASURE_DEBUG
                 // Sleep to make sure we don't lose logs
                 usleep(1);
@@ -1927,29 +2058,13 @@ binder::Status InstalldNativeService::getExternalSize(const std::unique_ptr<std:
     }
 
     if (flags & FLAG_USE_QUOTA) {
-        int64_t space;
-
         ATRACE_BEGIN("quota");
-        uid_t uid = multiuser_get_uid(userId, AID_MEDIA_RW);
-        if ((space = GetOccupiedSpaceForUid(uuidString, uid)) != -1) {
-            totalSize = space;
-        }
-
-        gid_t audioGid = multiuser_get_uid(userId, AID_MEDIA_AUDIO);
-        if ((space = GetOccupiedSpaceForGid(uuidString, audioGid)) != -1) {
-            audioSize = space;
-        }
-        gid_t videoGid = multiuser_get_uid(userId, AID_MEDIA_VIDEO);
-        if ((space = GetOccupiedSpaceForGid(uuidString, videoGid)) != -1) {
-            videoSize = space;
-        }
-        gid_t imageGid = multiuser_get_uid(userId, AID_MEDIA_IMAGE);
-        if ((space = GetOccupiedSpaceForGid(uuidString, imageGid)) != -1) {
-            imageSize = space;
-        }
-        if ((space = GetOccupiedSpaceForGid(uuidString, AID_MEDIA_OBB)) != -1) {
-            obbSize = space;
-        }
+        auto sizes = getExternalSizesForUserWithQuota(uuidString, userId, appIds);
+        totalSize = sizes.totalSize;
+        audioSize = sizes.audioSize;
+        videoSize = sizes.videoSize;
+        imageSize = sizes.imageSize;
+        obbSize = sizes.obbSize;
         ATRACE_END();
 
         ATRACE_BEGIN("apps");
@@ -2026,6 +2141,100 @@ binder::Status InstalldNativeService::getExternalSize(const std::unique_ptr<std:
     LOG(DEBUG) << "Final result " << toString(ret);
 #endif
     *_aidl_return = ret;
+    return ok();
+}
+
+binder::Status InstalldNativeService::getAppCrates(
+        const std::unique_ptr<std::string>& uuid,
+        const std::vector<std::string>& packageNames, int32_t userId,
+        std::unique_ptr<std::vector<std::unique_ptr<CrateMetadata>>>* _aidl_return) {
+    ENFORCE_UID(AID_SYSTEM);
+    CHECK_ARGUMENT_UUID(uuid);
+    for (const auto& packageName : packageNames) {
+        CHECK_ARGUMENT_PACKAGE_NAME(packageName);
+    }
+#ifdef ENABLE_STORAGE_CRATES
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+
+    auto retVector = std::make_unique<std::vector<std::unique_ptr<CrateMetadata>>>();
+    const char* uuid_ = uuid ? uuid->c_str() : nullptr;
+
+    std::function<void(CratedFolder, std::unique_ptr<CrateMetadata> &)> onCreateCrate =
+            [&](CratedFolder cratedFolder, std::unique_ptr<CrateMetadata> &crateMetadata) -> void {
+        if (cratedFolder == nullptr) {
+            return;
+        }
+        retVector->push_back(std::move(crateMetadata));
+    };
+
+    for (const auto& packageName : packageNames) {
+#if CRATE_DEBUG
+        LOG(DEBUG) << "packageName = " << packageName;
+#endif
+        auto crateManager = std::make_unique<CrateManager>(uuid_, userId, packageName);
+        crateManager->traverseAllCrates(onCreateCrate);
+    }
+
+#if CRATE_DEBUG
+    LOG(WARNING) << "retVector->size() =" << retVector->size();
+    for (auto iter = retVector->begin(); iter != retVector->end(); ++iter) {
+        CrateManager::dump(*iter);
+    }
+#endif
+
+    *_aidl_return = std::move(retVector);
+#else // ENABLE_STORAGE_CRATES
+    *_aidl_return = nullptr;
+
+    /* prevent compile warning fail */
+    if (userId < 0) {
+        return error();
+    }
+#endif // ENABLE_STORAGE_CRATES
+    return ok();
+}
+
+binder::Status InstalldNativeService::getUserCrates(
+        const std::unique_ptr<std::string>& uuid, int32_t userId,
+        std::unique_ptr<std::vector<std::unique_ptr<CrateMetadata>>>* _aidl_return) {
+    ENFORCE_UID(AID_SYSTEM);
+    CHECK_ARGUMENT_UUID(uuid);
+#ifdef ENABLE_STORAGE_CRATES
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+
+    const char* uuid_ = uuid ? uuid->c_str() : nullptr;
+    auto retVector = std::make_unique<std::vector<std::unique_ptr<CrateMetadata>>>();
+
+    std::function<void(CratedFolder, std::unique_ptr<CrateMetadata> &)> onCreateCrate =
+            [&](CratedFolder cratedFolder, std::unique_ptr<CrateMetadata> &crateMetadata) -> void {
+        if (cratedFolder == nullptr) {
+            return;
+        }
+        retVector->push_back(std::move(crateMetadata));
+    };
+
+    std::function<void(FTSENT*)> onHandingPackage = [&](FTSENT* packageDir) -> void {
+        auto crateManager = std::make_unique<CrateManager>(uuid_, userId, packageDir->fts_name);
+        crateManager->traverseAllCrates(onCreateCrate);
+    };
+    CrateManager::traverseAllPackagesForUser(uuid, userId, onHandingPackage);
+
+#if CRATE_DEBUG
+    LOG(DEBUG) << "retVector->size() =" << retVector->size();
+    for (auto iter = retVector->begin(); iter != retVector->end(); ++iter) {
+        CrateManager::dump(*iter);
+    }
+#endif
+
+    *_aidl_return = std::move(retVector);
+#else // ENABLE_STORAGE_CRATES
+    *_aidl_return = nullptr;
+
+    /* prevent compile warning fail */
+    if (userId < 0) {
+        return error();
+    }
+#endif // ENABLE_STORAGE_CRATES
     return ok();
 }
 
@@ -2155,26 +2364,6 @@ binder::Status InstalldNativeService::compileLayouts(const std::string& apkPath,
     const char* out_dex_file = outDexFile.c_str();
     *_aidl_return = android::installd::view_compiler(apk_path, package_name, out_dex_file, uid);
     return *_aidl_return ? ok() : error("viewcompiler failed");
-}
-
-binder::Status InstalldNativeService::markBootComplete(const std::string& instructionSet) {
-    ENFORCE_UID(AID_SYSTEM);
-    std::lock_guard<std::recursive_mutex> lock(mLock);
-
-    const char* instruction_set = instructionSet.c_str();
-
-    char boot_marker_path[PKG_PATH_MAX];
-    sprintf(boot_marker_path,
-          "%s/%s/%s/.booting",
-          android_data_dir.c_str(),
-          DALVIK_CACHE,
-          instruction_set);
-
-    ALOGV("mark_boot_complete : %s", boot_marker_path);
-    if (unlink(boot_marker_path) != 0) {
-        return error(StringPrintf("Failed to unlink %s", boot_marker_path));
-    }
-    return ok();
 }
 
 binder::Status InstalldNativeService::linkNativeLibraryDirectory(
@@ -2421,7 +2610,7 @@ struct fsverity_measurement {
 #endif
 
 binder::Status InstalldNativeService::installApkVerity(const std::string& filePath,
-        const ::android::base::unique_fd& verityInputAshmem, int32_t contentSize) {
+        android::base::unique_fd verityInputAshmem, int32_t contentSize) {
     ENFORCE_UID(AID_SYSTEM);
     CHECK_ARGUMENT_PATH(filePath);
     std::lock_guard<std::recursive_mutex> lock(mLock);
@@ -2595,15 +2784,13 @@ binder::Status InstalldNativeService::invalidateMounts() {
         std::getline(in, ignored);
 
         if (android::base::GetBoolProperty(kFuseProp, false)) {
-            // TODO(b/146139106): Use sdcardfs mounts on devices running sdcardfs so we don't bypass
-            // it's VFS cache
-            if (target.compare(0, 17, "/mnt/pass_through") == 0) {
+            if (target.find(kMntFuse) == 0) {
                 LOG(DEBUG) << "Found storage mount " << source << " at " << target;
                 mStorageMounts[source] = target;
             }
         } else {
 #if !BYPASS_SDCARDFS
-            if (target.compare(0, 21, "/mnt/runtime/default/") == 0) {
+            if (target.find(kMntSdcardfs) == 0) {
                 LOG(DEBUG) << "Found storage mount " << source << " at " << target;
                 mStorageMounts[source] = target;
             }
@@ -2613,22 +2800,120 @@ binder::Status InstalldNativeService::invalidateMounts() {
     return ok();
 }
 
+// Mount volume's CE and DE storage to mirror
+binder::Status InstalldNativeService::tryMountDataMirror(
+        const std::unique_ptr<std::string>& uuid) {
+    ENFORCE_UID(AID_SYSTEM);
+    CHECK_ARGUMENT_UUID(uuid);
+    if (!sAppDataIsolationEnabled) {
+        return ok();
+    }
+    if (!uuid) {
+        return error("Should not happen, mounting uuid == null");
+    }
+
+    const char* uuid_ = uuid->c_str();
+
+    std::string mirrorVolCePath(StringPrintf("%s/%s", kDataMirrorCePath, uuid_));
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+    if (fs_prepare_dir(mirrorVolCePath.c_str(), 0711, AID_SYSTEM, AID_SYSTEM) != 0) {
+        return error("Failed to create CE mirror");
+    }
+
+    std::string mirrorVolDePath(StringPrintf("%s/%s", kDataMirrorDePath, uuid_));
+    if (fs_prepare_dir(mirrorVolDePath.c_str(), 0711, AID_SYSTEM, AID_SYSTEM) != 0) {
+        return error("Failed to create DE mirror");
+    }
+
+    auto cePath = StringPrintf("%s/user", create_data_path(uuid_).c_str());
+    auto dePath = StringPrintf("%s/user_de", create_data_path(uuid_).c_str());
+
+    if (access(cePath.c_str(), F_OK) != 0) {
+        return error("Cannot access CE path: " + cePath);
+    }
+    if (access(dePath.c_str(), F_OK) != 0) {
+        return error("Cannot access DE path: " + dePath);
+    }
+
+    struct stat ceStat, mirrorCeStat;
+    if (stat(cePath.c_str(), &ceStat) != 0) {
+        return error("Failed to stat " + cePath);
+    }
+    if (stat(mirrorVolCePath.c_str(), &mirrorCeStat) != 0) {
+        return error("Failed to stat " + mirrorVolCePath);
+    }
+
+    if (mirrorCeStat.st_ino == ceStat.st_ino) {
+        // As it's being called by prepareUserStorage, it can be called multiple times.
+        // Hence, we if we mount it already, we should skip it.
+        LOG(WARNING) << "CE dir is mounted already: " + cePath;
+        return ok();
+    }
+
+    // Mount CE mirror
+    if (TEMP_FAILURE_RETRY(mount(cePath.c_str(), mirrorVolCePath.c_str(), NULL,
+            MS_NOSUID | MS_NODEV | MS_NOATIME | MS_BIND | MS_NOEXEC, nullptr)) == -1) {
+        return error("Failed to mount " + mirrorVolCePath);
+    }
+
+    // Mount DE mirror
+    if (TEMP_FAILURE_RETRY(mount(dePath.c_str(), mirrorVolDePath.c_str(), NULL,
+            MS_NOSUID | MS_NODEV | MS_NOATIME | MS_BIND | MS_NOEXEC, nullptr)) == -1) {
+        return error("Failed to mount " + mirrorVolDePath);
+    }
+    return ok();
+}
+
+// Unmount volume's CE and DE storage from mirror
+binder::Status InstalldNativeService::onPrivateVolumeRemoved(
+        const std::unique_ptr<std::string>& uuid) {
+    ENFORCE_UID(AID_SYSTEM);
+    CHECK_ARGUMENT_UUID(uuid);
+    if (!sAppDataIsolationEnabled) {
+        return ok();
+    }
+    if (!uuid) {
+        // It happens when private volume failed to mount.
+        LOG(INFO) << "Ignore unmount uuid=null";
+        return ok();
+    }
+    const char* uuid_ = uuid->c_str();
+
+    binder::Status res = ok();
+
+    std::string mirrorCeVolPath(StringPrintf("%s/%s", kDataMirrorCePath, uuid_));
+    std::string mirrorDeVolPath(StringPrintf("%s/%s", kDataMirrorDePath, uuid_));
+
+    // Unmount CE storage
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+    if (TEMP_FAILURE_RETRY(umount(mirrorCeVolPath.c_str())) != 0) {
+        if (errno != ENOENT) {
+            res = error(StringPrintf("Failed to umount %s %s", mirrorCeVolPath.c_str(),
+                                strerror(errno)));
+        }
+    }
+    if (delete_dir_contents_and_dir(mirrorCeVolPath, true) != 0) {
+        res = error("Failed to delete " + mirrorCeVolPath);
+    }
+
+    // Unmount DE storage
+    if (TEMP_FAILURE_RETRY(umount(mirrorDeVolPath.c_str())) != 0) {
+        if (errno != ENOENT) {
+            res = error(StringPrintf("Failed to umount %s %s", mirrorDeVolPath.c_str(),
+                                strerror(errno)));
+        }
+    }
+    if (delete_dir_contents_and_dir(mirrorDeVolPath, true) != 0) {
+        res = error("Failed to delete " + mirrorDeVolPath);
+    }
+    return res;
+}
+
 std::string InstalldNativeService::findDataMediaPath(
         const std::unique_ptr<std::string>& uuid, userid_t userid) {
     std::lock_guard<std::recursive_mutex> lock(mMountsLock);
     const char* uuid_ = uuid ? uuid->c_str() : nullptr;
     auto path = StringPrintf("%s/media", create_data_path(uuid_).c_str());
-    if (android::base::GetBoolProperty(kFuseProp, false)) {
-        // TODO(b/146139106): This is only safe on devices not running sdcardfs where there is no
-        // risk of bypassing the sdcardfs VFS cache
-
-        // Always use the lower filesystem path on FUSE enabled devices not running sdcardfs
-        // The upper filesystem path, /mnt/pass_through/<userid>/<vol>/ which was a bind mount
-        // to the lower filesytem may have been unmounted already when a user is
-        // removed and the path will now be pointing to a tmpfs without content
-        return StringPrintf("%s/%u", path.c_str(), userid);
-    }
-
     auto resolved = mStorageMounts[path];
     if (resolved.empty()) {
         LOG(WARNING) << "Failed to find storage mount for " << path;

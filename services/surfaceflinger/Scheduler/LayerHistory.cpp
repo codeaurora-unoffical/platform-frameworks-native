@@ -34,17 +34,26 @@
 #include "LayerInfo.h"
 #include "SchedulerUtils.h"
 
-namespace android::scheduler {
+namespace android::scheduler::impl {
 
 namespace {
 
 bool isLayerActive(const Layer& layer, const LayerInfo& info, nsecs_t threshold) {
+    if (layer.getFrameRate().rate > 0) {
+        return layer.isVisible();
+    }
     return layer.isVisible() && info.getLastUpdatedTime() >= threshold;
 }
 
 bool traceEnabled() {
     char value[PROPERTY_VALUE_MAX];
     property_get("debug.sf.layer_history_trace", value, "0");
+    return atoi(value);
+}
+
+bool useFrameRatePriority() {
+    char value[PROPERTY_VALUE_MAX];
+    property_get("debug.sf.use_frame_rate_priority", value, "1");
     return atoi(value);
 }
 
@@ -57,13 +66,14 @@ void trace(const wp<Layer>& weak, int fps) {
     ATRACE_INT(tag.c_str(), fps);
     ALOGD("%s: %s @ %d Hz", __FUNCTION__, name.c_str(), fps);
 }
-
 } // namespace
 
-LayerHistory::LayerHistory() : mTraceEnabled(traceEnabled()) {}
+LayerHistory::LayerHistory()
+      : mTraceEnabled(traceEnabled()), mUseFrameRatePriority(useFrameRatePriority()) {}
 LayerHistory::~LayerHistory() = default;
 
-void LayerHistory::registerLayer(Layer* layer, float lowRefreshRate, float highRefreshRate) {
+void LayerHistory::registerLayer(Layer* layer, float lowRefreshRate, float highRefreshRate,
+                                 LayerVoteType /*type*/) {
     auto info = std::make_unique<LayerInfo>(lowRefreshRate, highRefreshRate);
     std::lock_guard lock(mLock);
     mLayerInfos.emplace_back(layer, std::move(info));
@@ -87,31 +97,44 @@ void LayerHistory::record(Layer* layer, nsecs_t presentTime, nsecs_t now) {
 }
 
 LayerHistory::Summary LayerHistory::summarize(nsecs_t now) {
-    float maxRefreshRate = 0;
-
+    ATRACE_CALL();
     std::lock_guard lock(mLock);
 
     partitionLayers(now);
 
-    // Find the maximum refresh rate among recently active layers.
-    for (const auto& [layer, info] : activeLayers()) {
+    LayerHistory::Summary summary;
+    for (const auto& [weakLayer, info] : activeLayers()) {
         const bool recent = info->isRecentlyActive(now);
-        if (recent || CC_UNLIKELY(mTraceEnabled)) {
-            const float refreshRate = info->getRefreshRate(now);
-            if (recent && refreshRate > maxRefreshRate) {
-                maxRefreshRate = refreshRate;
+        auto layer = weakLayer.promote();
+        // Only use the layer if the reference still exists.
+        if (layer || CC_UNLIKELY(mTraceEnabled)) {
+            // Check if frame rate was set on layer.
+            const auto frameRate = layer->getFrameRate();
+            if (frameRate.rate > 0.f) {
+                const auto voteType = [&]() {
+                    switch (frameRate.type) {
+                        case Layer::FrameRateCompatibility::Default:
+                            return LayerVoteType::ExplicitDefault;
+                        case Layer::FrameRateCompatibility::ExactOrMultiple:
+                            return LayerVoteType::ExplicitExactOrMultiple;
+                        case Layer::FrameRateCompatibility::NoVote:
+                            return LayerVoteType::NoVote;
+                    }
+                }();
+                summary.push_back({layer->getName(), voteType, frameRate.rate, /* weight */ 1.0f});
+            } else if (recent) {
+                summary.push_back({layer->getName(), LayerVoteType::Heuristic,
+                                   info->getRefreshRate(now),
+                                   /* weight */ 1.0f});
             }
 
             if (CC_UNLIKELY(mTraceEnabled)) {
-                trace(layer, std::round(refreshRate));
+                trace(weakLayer, round<int>(frameRate.rate));
             }
         }
     }
-    if (CC_UNLIKELY(mTraceEnabled)) {
-        ALOGD("%s: maxRefreshRate=%.2f", __FUNCTION__, maxRefreshRate);
-    }
 
-    return {maxRefreshRate};
+    return summary;
 }
 
 void LayerHistory::partitionLayers(nsecs_t now) {
@@ -144,7 +167,7 @@ void LayerHistory::partitionLayers(nsecs_t now) {
         }
     }
 
-    mLayerInfos.erase(mLayerInfos.begin() + end, mLayerInfos.end());
+    mLayerInfos.erase(mLayerInfos.begin() + static_cast<long>(end), mLayerInfos.end());
 }
 
 void LayerHistory::clear() {
@@ -156,5 +179,4 @@ void LayerHistory::clear() {
 
     mActiveLayersEnd = 0;
 }
-
-} // namespace android::scheduler
+} // namespace android::scheduler::impl

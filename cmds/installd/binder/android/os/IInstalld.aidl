@@ -40,11 +40,19 @@ interface IInstalld {
     long[] getUserSize(@nullable @utf8InCpp String uuid, int userId, int flags, in int[] appIds);
     long[] getExternalSize(@nullable @utf8InCpp String uuid, int userId, int flags, in int[] appIds);
 
+    @nullable
+    android.os.storage.CrateMetadata[] getAppCrates(
+            @nullable @utf8InCpp String uuid, in @utf8InCpp String[] packageNames,
+             int userId);
+    @nullable
+    android.os.storage.CrateMetadata[] getUserCrates(
+            @nullable @utf8InCpp String uuid, int userId);
+
     void setAppQuota(@nullable @utf8InCpp String uuid, int userId, int appId, long cacheQuota);
 
     void moveCompleteApp(@nullable @utf8InCpp String fromUuid, @nullable @utf8InCpp String toUuid,
-            @utf8InCpp String packageName, @utf8InCpp String dataAppName, int appId,
-            @utf8InCpp String seInfo, int targetSdkVersion);
+            @utf8InCpp String packageName, int appId,
+            @utf8InCpp String seInfo, int targetSdkVersion, @utf8InCpp String fromCodePath);
 
     void dexopt(@utf8InCpp String apkPath, int uid, @nullable @utf8InCpp String packageName,
             @utf8InCpp String instructionSet, int dexoptNeeded,
@@ -73,7 +81,6 @@ interface IInstalld {
     void destroyProfileSnapshot(@utf8InCpp String packageName, @utf8InCpp String profileName);
 
     void rmPackageDir(@utf8InCpp String packageDir);
-    void markBootComplete(@utf8InCpp String instructionSet);
     void freeCache(@nullable @utf8InCpp String uuid, long targetFreeBytes,
             long cacheReservedBytes, int flags);
     void linkNativeLibraryDirectory(@nullable @utf8InCpp String uuid,
@@ -109,6 +116,8 @@ interface IInstalld {
             int appId, @utf8InCpp String seInfo, int user, int snapshotId, int storageflags);
     void destroyAppDataSnapshot(@nullable @utf8InCpp String uuid, @utf8InCpp String packageName,
             int userId, long ceSnapshotInode, int snapshotId, int storageFlags);
+    void tryMountDataMirror(@nullable @utf8InCpp String volumeUuid);
+    void onPrivateVolumeRemoved(@nullable @utf8InCpp String volumeUuid);
 
     void migrateLegacyObbData();
 

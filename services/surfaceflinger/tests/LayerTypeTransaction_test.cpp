@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconversion"
+
 #include <gui/BufferItemConsumer.h>
 #include "TransactionTestHarnesses.h"
 
@@ -65,13 +69,13 @@ TEST_P(LayerTypeTransactionTest, SetRelativeZNegative) {
 TEST_P(LayerTypeTransactionTest, SetLayerAndRelative) {
     sp<SurfaceControl> parent =
             LayerTransactionTest::createLayer("Parent", 0 /* buffer width */, 0 /* buffer height */,
-                                              ISurfaceComposerClient::eFXSurfaceColor);
+                                              ISurfaceComposerClient::eFXSurfaceEffect);
 
     sp<SurfaceControl> childLayer;
     ASSERT_NO_FATAL_FAILURE(
             childLayer = LayerTransactionTest::createLayer("childLayer", 0 /* buffer width */,
                                                            0 /* buffer height */,
-                                                           ISurfaceComposerClient::eFXSurfaceColor,
+                                                           ISurfaceComposerClient::eFXSurfaceEffect,
                                                            parent.get()));
     Transaction()
             .setColor(childLayer, half3{1.0f, 0.0f, 0.0f})
@@ -112,17 +116,17 @@ TEST_P(LayerTypeTransactionTest, SetLayerAndRelative) {
 TEST_P(LayerTypeTransactionTest, HideRelativeParentHidesLayer) {
     sp<SurfaceControl> parent =
             LayerTransactionTest::createLayer("Parent", 0 /* buffer width */, 0 /* buffer height */,
-                                              ISurfaceComposerClient::eFXSurfaceColor);
+                                              ISurfaceComposerClient::eFXSurfaceEffect);
     sp<SurfaceControl> relativeParent =
             LayerTransactionTest::createLayer("RelativeParent", 0 /* buffer width */,
                                               0 /* buffer height */,
-                                              ISurfaceComposerClient::eFXSurfaceColor);
+                                              ISurfaceComposerClient::eFXSurfaceEffect);
 
     sp<SurfaceControl> childLayer;
     ASSERT_NO_FATAL_FAILURE(
             childLayer = LayerTransactionTest::createLayer("childLayer", 0 /* buffer width */,
                                                            0 /* buffer height */,
-                                                           ISurfaceComposerClient::eFXSurfaceColor,
+                                                           ISurfaceComposerClient::eFXSurfaceEffect,
                                                            parent.get()));
     Transaction()
             .setColor(childLayer, half3{1.0f, 0.0f, 0.0f})
@@ -186,3 +190,6 @@ TEST_P(LayerTypeTransactionTest, RefreshRateIsInitialized) {
 }
 
 } // namespace android
+
+// TODO(b/129481165): remove the #pragma below and fix conversion issues
+#pragma clang diagnostic pop // ignored "-Wconversion"

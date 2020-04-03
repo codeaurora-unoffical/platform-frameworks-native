@@ -138,6 +138,11 @@ int32_t ANativeWindow_setBuffersDataSpace(ANativeWindow* window, int32_t dataSpa
     static_assert(static_cast<int>(ADATASPACE_SCRGB) == static_cast<int>(HAL_DATASPACE_V0_SCRGB));
     static_assert(static_cast<int>(ADATASPACE_DISPLAY_P3) == static_cast<int>(HAL_DATASPACE_DISPLAY_P3));
     static_assert(static_cast<int>(ADATASPACE_BT2020_PQ) == static_cast<int>(HAL_DATASPACE_BT2020_PQ));
+    static_assert(static_cast<int>(ADATASPACE_ADOBE_RGB) == static_cast<int>(HAL_DATASPACE_ADOBE_RGB));
+    static_assert(static_cast<int>(ADATASPACE_BT2020) == static_cast<int>(HAL_DATASPACE_BT2020));
+    static_assert(static_cast<int>(ADATASPACE_BT709) == static_cast<int>(HAL_DATASPACE_V0_BT709));
+    static_assert(static_cast<int>(ADATASPACE_DCI_P3) == static_cast<int>(HAL_DATASPACE_DCI_P3));
+    static_assert(static_cast<int>(ADATASPACE_SRGB_LINEAR) == static_cast<int>(HAL_DATASPACE_V0_SRGB_LINEAR));
 
     if (!window || !query(window, NATIVE_WINDOW_IS_VALID) ||
             !isDataSpaceValid(window, dataSpace)) {
@@ -152,6 +157,21 @@ int32_t ANativeWindow_getBuffersDataSpace(ANativeWindow* window) {
         return -EINVAL;
     return query(window, NATIVE_WINDOW_DATASPACE);
 }
+
+int32_t ANativeWindow_setFrameRate(ANativeWindow* window, float frameRate, int8_t compatibility) {
+    if (!window || !query(window, NATIVE_WINDOW_IS_VALID)) {
+        return -EINVAL;
+    }
+    return native_window_set_frame_rate(window, frameRate, compatibility);
+}
+
+void ANativeWindow_tryAllocateBuffers(ANativeWindow* window) {
+    if (!window || !query(window, NATIVE_WINDOW_IS_VALID)) {
+        return;
+    }
+    window->perform(window, NATIVE_WINDOW_ALLOCATE_BUFFERS);
+}
+
 
 /**************************************************************************************************
  * vndk-stable
@@ -291,4 +311,27 @@ int64_t ANativeWindow_getLastDequeueStartTime(ANativeWindow* window) {
 
 int ANativeWindow_setDequeueTimeout(ANativeWindow* window, int64_t timeout) {
     return window->perform(window, NATIVE_WINDOW_SET_DEQUEUE_TIMEOUT, timeout);
+}
+
+int ANativeWindow_setCancelBufferInterceptor(ANativeWindow* window,
+                                             ANativeWindow_cancelBufferInterceptor interceptor,
+                                             void* data) {
+    return window->perform(window, NATIVE_WINDOW_SET_CANCEL_INTERCEPTOR, interceptor, data);
+}
+
+int ANativeWindow_setDequeueBufferInterceptor(ANativeWindow* window,
+                                              ANativeWindow_dequeueBufferInterceptor interceptor,
+                                              void* data) {
+    return window->perform(window, NATIVE_WINDOW_SET_DEQUEUE_INTERCEPTOR, interceptor, data);
+}
+
+int ANativeWindow_setPerformInterceptor(ANativeWindow* window,
+                                        ANativeWindow_performInterceptor interceptor, void* data) {
+    return window->perform(window, NATIVE_WINDOW_SET_PERFORM_INTERCEPTOR, interceptor, data);
+}
+
+int ANativeWindow_setQueueBufferInterceptor(ANativeWindow* window,
+                                            ANativeWindow_queueBufferInterceptor interceptor,
+                                            void* data) {
+    return window->perform(window, NATIVE_WINDOW_SET_QUEUE_INTERCEPTOR, interceptor, data);
 }
