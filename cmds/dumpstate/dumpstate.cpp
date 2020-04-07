@@ -1477,6 +1477,8 @@ static Dumpstate::RunStatus dumpstate() {
         ds.AddDir(WMTRACE_DATA_DIR, false);
     }
 
+    ds.AddDir(SNAPSHOTCTL_LOG_DIR, false);
+
     RUN_SLOW_FUNCTION_WITH_CONSENT_CHECK(ds.DumpstateBoard);
 
     /* Migrate the ril_dumpstate to a device specific dumpstate? */
@@ -1605,7 +1607,6 @@ Dumpstate::RunStatus Dumpstate::DumpstateDefaultAfterCritical() {
     ds.AddDir(RECOVERY_DATA_DIR, true);
     ds.AddDir(UPDATE_ENGINE_LOG_DIR, true);
     ds.AddDir(LOGPERSIST_DATA_DIR, false);
-    ds.AddDir(SNAPSHOTCTL_LOG_DIR, false);
     if (!PropertiesHelper::IsUserBuild()) {
         ds.AddDir(PROFILE_DATA_DIR_CUR, true);
         ds.AddDir(PROFILE_DATA_DIR_REF, true);
@@ -1727,6 +1728,8 @@ static void DumpstateTelephonyOnly(const std::string& calling_package) {
     RunDumpsys("DUMPSYS", {"wifi"}, CommandOptions::WithTimeout(90).Build(), SEC_TO_MSEC(10));
     RunDumpsys("DUMPSYS", {"netpolicy"}, CommandOptions::WithTimeout(90).Build(), SEC_TO_MSEC(10));
     RunDumpsys("DUMPSYS", {"network_management"}, CommandOptions::WithTimeout(90).Build(),
+               SEC_TO_MSEC(10));
+    RunDumpsys("DUMPSYS", {"telephony.registry"}, CommandOptions::WithTimeout(90).Build(),
                SEC_TO_MSEC(10));
     if (include_sensitive_info) {
         // Contains raw IP addresses, omit from reports on user builds.
@@ -2246,20 +2249,21 @@ static inline const char* ModeToString(Dumpstate::BugreportMode mode) {
     }
 }
 
-static void SetOptionsFromMode(Dumpstate::BugreportMode mode, Dumpstate::DumpOptions* options) {
+static void SetOptionsFromMode(Dumpstate::BugreportMode mode, Dumpstate::DumpOptions* options,
+                               bool is_screenshot_requested) {
     // Modify com.android.shell.BugreportProgressService#isDefaultScreenshotRequired as well for
     // default system screenshots.
     options->bugreport_mode = ModeToString(mode);
     switch (mode) {
         case Dumpstate::BugreportMode::BUGREPORT_FULL:
-            options->do_screenshot = true;
+            options->do_screenshot = is_screenshot_requested;
             options->dumpstate_hal_mode = DumpstateMode::FULL;
             break;
         case Dumpstate::BugreportMode::BUGREPORT_INTERACTIVE:
             // Currently, the dumpstate binder is only used by Shell to update progress.
             options->do_start_service = true;
             options->do_progress_updates = true;
-            options->do_screenshot = true;
+            options->do_screenshot = is_screenshot_requested;
             options->dumpstate_hal_mode = DumpstateMode::INTERACTIVE;
             break;
         case Dumpstate::BugreportMode::BUGREPORT_REMOTE:
@@ -2272,7 +2276,7 @@ static void SetOptionsFromMode(Dumpstate::BugreportMode mode, Dumpstate::DumpOpt
             options->do_start_service = true;
             options->do_progress_updates = true;
             options->do_zip_file = true;
-            options->do_screenshot = true;
+            options->do_screenshot = is_screenshot_requested;
             options->dumpstate_hal_mode = DumpstateMode::WEAR;
             break;
         // TODO(b/148168577) rename TELEPHONY everywhere to CONNECTIVITY.
@@ -2309,7 +2313,8 @@ static void LogDumpOptions(const Dumpstate::DumpOptions& options) {
 
 void Dumpstate::DumpOptions::Initialize(BugreportMode bugreport_mode,
                                         const android::base::unique_fd& bugreport_fd_in,
-                                        const android::base::unique_fd& screenshot_fd_in) {
+                                        const android::base::unique_fd& screenshot_fd_in,
+                                        bool is_screenshot_requested) {
     // In the new API world, date is always added; output is always a zip file.
     // TODO(111441001): remove these options once they are obsolete.
     do_add_date = true;
@@ -2319,7 +2324,7 @@ void Dumpstate::DumpOptions::Initialize(BugreportMode bugreport_mode,
     bugreport_fd.reset(dup(bugreport_fd_in.get()));
     screenshot_fd.reset(dup(screenshot_fd_in.get()));
 
-    SetOptionsFromMode(bugreport_mode, this);
+    SetOptionsFromMode(bugreport_mode, this, is_screenshot_requested);
 }
 
 Dumpstate::RunStatus Dumpstate::DumpOptions::Initialize(int argc, char* argv[]) {

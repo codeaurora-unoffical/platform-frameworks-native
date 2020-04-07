@@ -16,16 +16,18 @@
 
 #pragma once
 
+#include <android-base/thread_annotations.h>
 #include <layerproto/LayerProtoHeader.h>
 #include <utils/Errors.h>
 #include <utils/StrongPointer.h>
 
-#include <android-base/thread_annotations.h>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
+
+#include "DisplayDevice.h"
 
 using namespace android::surfaceflinger;
 
@@ -85,19 +87,21 @@ private:
     void mainLoop();
     void addFirstEntry();
     LayersTraceProto traceWhenNotified();
-    LayersTraceProto traceLayersLocked(const char* where) REQUIRES(mSfLock);
+    LayersTraceProto traceLayersLocked(const char* where,
+                                       const sp<const DisplayDevice>& displayDevice)
+            REQUIRES(mSfLock);
 
     // Returns true if trace is enabled.
     bool addTraceToBuffer(LayersTraceProto& entry);
     void writeProtoFileLocked() REQUIRES(mTraceLock);
 
-    const SurfaceFlinger& mFlinger;
+    SurfaceFlinger& mFlinger;
     status_t mLastErr = NO_ERROR;
     std::thread mThread;
     std::condition_variable mCanStartTrace;
 
     std::mutex& mSfLock;
-    uint32_t mTraceFlags GUARDED_BY(mSfLock) = TRACE_ALL;
+    uint32_t mTraceFlags GUARDED_BY(mSfLock) = TRACE_CRITICAL | TRACE_INPUT;
     const char* mWhere GUARDED_BY(mSfLock) = "";
 
     mutable std::mutex mTraceLock;
