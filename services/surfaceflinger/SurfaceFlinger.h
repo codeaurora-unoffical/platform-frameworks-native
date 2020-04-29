@@ -259,6 +259,9 @@ public:
     // overhead that is caused by reading from sysprop.
     static bool useFrameRateApi;
 
+    // set main thread scheduling policy
+    static status_t setSchedFifo(bool enabled) ANDROID_API;
+
     static char const* getServiceName() ANDROID_API {
         return "SurfaceFlinger";
     }
@@ -404,7 +407,8 @@ private:
      */
     status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) override;
     status_t dump(int fd, const Vector<String16>& args) override { return priorityDump(fd, args); }
-    bool callingThreadHasUnscopedSurfaceFlingerAccess() EXCLUDES(mStateLock);
+    bool callingThreadHasUnscopedSurfaceFlingerAccess(bool usePermissionCache = true)
+            EXCLUDES(mStateLock);
 
     /* ------------------------------------------------------------------------
      * ISurfaceComposer interface
@@ -500,6 +504,7 @@ private:
                                      float lightPosY, float lightPosZ, float lightRadius) override;
     status_t setFrameRate(const sp<IGraphicBufferProducer>& surface, float frameRate,
                           int8_t compatibility) override;
+    status_t acquireFrameRateFlexibilityToken(sp<IBinder>* outToken) override;
     /* ------------------------------------------------------------------------
      * DeathRecipient interface
      */
@@ -571,9 +576,9 @@ private:
     void setPowerModeInternal(const sp<DisplayDevice>& display, int mode) REQUIRES(mStateLock);
 
     // Sets the desired display configs.
-    status_t setDesiredDisplayConfigSpecsInternal(const sp<DisplayDevice>& display,
-                                                  HwcConfigIndexType defaultConfig,
-                                                  float minRefreshRate, float maxRefreshRate)
+    status_t setDesiredDisplayConfigSpecsInternal(
+            const sp<DisplayDevice>& display,
+            const std::optional<scheduler::RefreshRateConfigs::Policy>& policy, bool overridePolicy)
             EXCLUDES(mStateLock);
 
     // called on the main thread in response to setAutoLowLatencyMode()
@@ -844,7 +849,21 @@ private:
 
     bool isDisplayConfigAllowed(HwcConfigIndexType configId) const REQUIRES(mStateLock);
 
-    bool previousFrameMissed(int graceTimeMs = 0);
+    // Gets the fence for the previous frame.
+    // Must be called on the main thread.
+    sp<Fence> previousFrameFence();
+
+    // Whether the previous frame has not yet been presented to the display.
+    // If graceTimeMs is positive, this method waits for at most the provided
+    // grace period before reporting if the frame missed.
+    // Must be called on the main thread.
+    bool previousFramePending(int graceTimeMs = 0);
+
+    // Returns the previous time that the frame was presented. If the frame has
+    // not been presented yet, then returns Fence::SIGNAL_TIME_PENDING. If there
+    // is no pending frame, then returns Fence::SIGNAL_TIME_INVALID.
+    // Must be called on the main thread.
+    nsecs_t previousFramePresentTime();
 
     // Populates the expected present time for this frame. For negative offsets, performs a
     // correction using the predicted vsync for the next frame instead.
@@ -951,6 +970,8 @@ private:
         return doDump(fd, args, asProto);
     }
 
+    void onFrameRateFlexibilityTokenReleased();
+
     /* ------------------------------------------------------------------------
      * VrFlinger
      */
@@ -1056,6 +1077,7 @@ private:
     std::unique_ptr<SurfaceInterceptor> mInterceptor;
     SurfaceTracing mTracing{*this};
     bool mTracingEnabled = false;
+    bool mAddCompositionStateToTrace = false;
     bool mTracingEnabledChanged GUARDED_BY(mStateLock) = false;
     const std::shared_ptr<TimeStats> mTimeStats;
     const std::unique_ptr<FrameTracer> mFrameTracer;
@@ -1258,6 +1280,8 @@ private:
     std::atomic<bool> mInputDirty = true;
     void dirtyInput() { mInputDirty = true; }
     bool inputDirty() { return mInputDirty; }
+
+    int mFrameRateFlexibilityTokenCount = 0;
 };
 
 } // namespace android
