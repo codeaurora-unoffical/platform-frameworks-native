@@ -346,8 +346,6 @@ status_t BufferQueueLayer::updateActiveBuffer() {
     mPreviousBufferId = getCurrentBufferId();
     mBufferInfo.mBuffer =
             mConsumer->getCurrentBuffer(&mBufferInfo.mBufferSlot, &mBufferInfo.mFence);
-    auto* layerCompositionState = editCompositionState();
-    layerCompositionState->buffer = mBufferInfo.mBuffer;
 
     if (mBufferInfo.mBuffer == nullptr) {
         // this can only happen if the very first buffer was rejected.
@@ -441,7 +439,7 @@ void BufferQueueLayer::onFrameAvailable(const BufferItem& item) {
         mQueueItemCondition.broadcast();
     }
 
-    mFlinger->mInterceptor->saveBufferUpdate(this, item.mGraphicBuffer->getWidth(),
+    mFlinger->mInterceptor->saveBufferUpdate(layerId, item.mGraphicBuffer->getWidth(),
                                              item.mGraphicBuffer->getHeight(), item.mFrameNumber);
 
     mFlinger->signalLayerUpdate();
@@ -527,8 +525,6 @@ status_t BufferQueueLayer::setDefaultBufferProperties(uint32_t w, uint32_t h, Pi
         return BAD_VALUE;
     }
 
-    mFormat = format;
-
     setDefaultBufferSize(w, h);
     mConsumer->setDefaultBufferFormat(format);
     mConsumer->setConsumerUsageBits(getEffectiveUsage(0));
@@ -552,6 +548,8 @@ uint32_t BufferQueueLayer::getProducerStickyTransform() const {
 }
 
 void BufferQueueLayer::gatherBufferInfo() {
+    BufferLayer::gatherBufferInfo();
+
     mBufferInfo.mDesiredPresentTime = mConsumer->getTimestamp();
     mBufferInfo.mFenceTime = mConsumer->getCurrentFenceTime();
     mBufferInfo.mFence = mConsumer->getCurrentFence();
@@ -562,7 +560,6 @@ void BufferQueueLayer::gatherBufferInfo() {
     mBufferInfo.mSurfaceDamage = mConsumer->getSurfaceDamage();
     mBufferInfo.mHdrMetadata = mConsumer->getCurrentHdrMetadata();
     mBufferInfo.mApi = mConsumer->getCurrentApi();
-    mBufferInfo.mPixelFormat = mFormat;
     mBufferInfo.mTransformToDisplayInverse = mConsumer->getTransformToDisplayInverse();
 }
 

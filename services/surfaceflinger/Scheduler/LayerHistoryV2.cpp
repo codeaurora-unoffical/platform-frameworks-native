@@ -40,7 +40,7 @@ namespace android::scheduler::impl {
 namespace {
 
 bool isLayerActive(const Layer& layer, const LayerInfoV2& info, nsecs_t threshold) {
-    if (layer.getFrameRate().rate > 0) {
+    if (layer.getFrameRateForLayerTree().rate > 0) {
         return layer.isVisible();
     }
     return layer.isVisible() && info.getLastUpdatedTime() >= threshold;
@@ -166,7 +166,7 @@ void LayerHistoryV2::partitionLayers(nsecs_t now) {
         if (const auto layer = weak.promote(); layer && isLayerActive(*layer, *info, threshold)) {
             i++;
             // Set layer vote if set
-            const auto frameRate = layer->getFrameRate();
+            const auto frameRate = layer->getFrameRateForLayerTree();
             const auto voteType = [&]() {
                 switch (frameRate.type) {
                     case Layer::FrameRateCompatibility::Default:
@@ -212,7 +212,5 @@ void LayerHistoryV2::clear() {
     for (const auto& [layer, info] : activeLayers()) {
         info->clearHistory();
     }
-
-    mActiveLayersEnd = 0;
 }
 } // namespace android::scheduler::impl

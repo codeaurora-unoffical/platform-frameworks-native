@@ -42,6 +42,7 @@
 #include <system/graphics.h>
 #include <ui/FenceTime.h>
 #include <ui/PixelFormat.h>
+#include <ui/Size.h>
 #include <utils/Errors.h>
 #include <utils/KeyedVector.h>
 #include <utils/RefBase.h>
@@ -225,6 +226,11 @@ public:
     // FramebufferSurface
     static int64_t maxFrameBufferAcquiredBuffers;
 
+    // Controls the maximum width and height in pixels that the graphics pipeline can support for
+    // GPU fallback composition. For example, 8k devices with 4k GPUs, or 4k devices with 2k GPUs.
+    static uint32_t maxGraphicsWidth;
+    static uint32_t maxGraphicsHeight;
+
     // Indicate if a device has wide color gamut display. This is typically
     // found on devices with wide color gamut (e.g. Display-P3) display.
     static bool hasWideColorDisplay;
@@ -252,6 +258,9 @@ public:
     // variable is caches in SF, so that we can check it with each layer creation, and a void the
     // overhead that is caused by reading from sysprop.
     static bool useFrameRateApi;
+
+    // set main thread scheduling policy
+    static status_t setSchedFifo(bool enabled) ANDROID_API;
 
     static char const* getServiceName() ANDROID_API {
         return "SurfaceFlinger";
@@ -398,7 +407,8 @@ private:
      */
     status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) override;
     status_t dump(int fd, const Vector<String16>& args) override { return priorityDump(fd, args); }
-    bool callingThreadHasUnscopedSurfaceFlingerAccess() EXCLUDES(mStateLock);
+    bool callingThreadHasUnscopedSurfaceFlingerAccess(bool usePermissionCache = true)
+            EXCLUDES(mStateLock);
 
     /* ------------------------------------------------------------------------
      * ISurfaceComposer interface
@@ -494,6 +504,7 @@ private:
                                      float lightPosY, float lightPosZ, float lightRadius) override;
     status_t setFrameRate(const sp<IGraphicBufferProducer>& surface, float frameRate,
                           int8_t compatibility) override;
+    status_t acquireFrameRateFlexibilityToken(sp<IBinder>* outToken) override;
     /* ------------------------------------------------------------------------
      * DeathRecipient interface
      */
@@ -565,9 +576,9 @@ private:
     void setPowerModeInternal(const sp<DisplayDevice>& display, int mode) REQUIRES(mStateLock);
 
     // Sets the desired display configs.
-    status_t setDesiredDisplayConfigSpecsInternal(const sp<DisplayDevice>& display,
-                                                  HwcConfigIndexType defaultConfig,
-                                                  float minRefreshRate, float maxRefreshRate)
+    status_t setDesiredDisplayConfigSpecsInternal(
+            const sp<DisplayDevice>& display,
+            const std::optional<scheduler::RefreshRateConfigs::Policy>& policy, bool overridePolicy)
             EXCLUDES(mStateLock);
 
     // called on the main thread in response to setAutoLowLatencyMode()
@@ -814,9 +825,14 @@ private:
             const wp<IBinder>& displayToken,
             std::shared_ptr<compositionengine::Display> compositionDisplay,
             const DisplayDeviceState& state,
-            const sp<compositionengine::DisplaySurface>& dispSurface,
+            const sp<compositionengine::DisplaySurface>& displaySurface,
             const sp<IGraphicBufferProducer>& producer);
     void processDisplayChangesLocked();
+    void processDisplayAdded(const wp<IBinder>& displayToken, const DisplayDeviceState& state);
+    void processDisplayRemoved(const wp<IBinder>& displayToken);
+    void processDisplayChanged(const wp<IBinder>& displayToken,
+                               const DisplayDeviceState& currentState,
+                               const DisplayDeviceState& drawingState);
     void processDisplayHotplugEventsLocked();
 
     void dispatchDisplayHotplugEvent(PhysicalDisplayId displayId, bool connected);
@@ -833,7 +849,21 @@ private:
 
     bool isDisplayConfigAllowed(HwcConfigIndexType configId) const REQUIRES(mStateLock);
 
-    bool previousFrameMissed(int graceTimeMs = 0);
+    // Gets the fence for the previous frame.
+    // Must be called on the main thread.
+    sp<Fence> previousFrameFence();
+
+    // Whether the previous frame has not yet been presented to the display.
+    // If graceTimeMs is positive, this method waits for at most the provided
+    // grace period before reporting if the frame missed.
+    // Must be called on the main thread.
+    bool previousFramePending(int graceTimeMs = 0);
+
+    // Returns the previous time that the frame was presented. If the frame has
+    // not been presented yet, then returns Fence::SIGNAL_TIME_PENDING. If there
+    // is no pending frame, then returns Fence::SIGNAL_TIME_INVALID.
+    // Must be called on the main thread.
+    nsecs_t previousFramePresentTime();
 
     // Populates the expected present time for this frame. For negative offsets, performs a
     // correction using the predicted vsync for the next frame instead.
@@ -917,7 +947,8 @@ private:
     void dumpDisplayIdentificationData(std::string& result) const;
     void dumpRawDisplayIdentificationData(const DumpArgs&, std::string& result) const;
     void dumpWideColorInfo(std::string& result) const;
-    LayersProto dumpDrawingStateProto(uint32_t traceFlags = SurfaceTracing::TRACE_ALL) const;
+    LayersProto dumpDrawingStateProto(uint32_t traceFlags = SurfaceTracing::TRACE_ALL,
+                                      const sp<const DisplayDevice>& displayDevice = nullptr) const;
     void dumpOffscreenLayersProto(LayersProto& layersProto,
                                   uint32_t traceFlags = SurfaceTracing::TRACE_ALL) const;
     // Dumps state from HW Composer
@@ -938,6 +969,8 @@ private:
     status_t dumpAll(int fd, const DumpArgs& args, bool asProto) override {
         return doDump(fd, args, asProto);
     }
+
+    void onFrameRateFlexibilityTokenReleased();
 
     /* ------------------------------------------------------------------------
      * VrFlinger
@@ -1044,12 +1077,15 @@ private:
     std::unique_ptr<SurfaceInterceptor> mInterceptor;
     SurfaceTracing mTracing{*this};
     bool mTracingEnabled = false;
+    bool mAddCompositionStateToTrace = false;
     bool mTracingEnabledChanged GUARDED_BY(mStateLock) = false;
     const std::shared_ptr<TimeStats> mTimeStats;
     const std::unique_ptr<FrameTracer> mFrameTracer;
     bool mUseHwcVirtualDisplays = false;
+    // If blurs should be enabled on this device.
+    bool mSupportsBlur = false;
     // Disable blurs, for debugging
-    bool mEnableBlurs = false;
+    std::atomic<bool> mDisableBlurs = false;
     // If blurs are considered expensive and should require high GPU frequency.
     bool mBlursAreExpensive = false;
     std::atomic<uint32_t> mFrameMissedCount = 0;
@@ -1123,6 +1159,10 @@ private:
 
     // to linkToDeath
     sp<IBinder> mWindowManager;
+    // We want to avoid multiple calls to BOOT_FINISHED as they come in on
+    // different threads without a lock and could trigger unsynchronized writes to
+    // to mWindowManager or mInputFlinger
+    std::atomic<bool> mBootFinished = false;
 
     std::unique_ptr<dvr::VrFlinger> mVrFlinger;
     std::atomic<bool> mVrFlingerRequestsDisplay = false;
@@ -1240,6 +1280,8 @@ private:
     std::atomic<bool> mInputDirty = true;
     void dirtyInput() { mInputDirty = true; }
     bool inputDirty() { return mInputDirty; }
+
+    int mFrameRateFlexibilityTokenCount = 0;
 };
 
 } // namespace android

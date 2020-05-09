@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include <functional>
+#include <string_view>
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -93,7 +96,7 @@ const unsigned char kHisenseTvEdid[] =
         "\x0a\x20\x20\x20\x20\x20\x01\x47\x02\x03\x2d\x71\x50\x90\x05"
         "\x04\x03\x07\x02\x06\x01\x1f\x14\x13\x12\x16\x11\x15\x20\x2c"
         "\x09\x07\x03\x15\x07\x50\x57\x07\x00\x39\x07\xbb\x66\x03\x0c"
-        "\x00\x20\x00\x00\x83\x01\x00\x00\x01\x1d\x00\x72\x51\xd0\x1e"
+        "\x00\x12\x34\x00\x83\x01\x00\x00\x01\x1d\x00\x72\x51\xd0\x1e"
         "\x20\x6e\x28\x55\x00\xc4\x8e\x21\x00\x00\x1e\x01\x1d\x80\x18"
         "\x71\x1c\x16\x20\x58\x2c\x25\x00\xc4\x8e\x21\x00\x00\x9e\x8c"
         "\x0a\xd0\x8a\x20\xe0\x2d\x10\x10\x3e\x96\x00\x13\x8e\x21\x00"
@@ -122,6 +125,10 @@ const unsigned char kCtlDisplayEdid[] =
 template <size_t N>
 DisplayIdentificationData asDisplayIdentificationData(const unsigned char (&bytes)[N]) {
     return DisplayIdentificationData(bytes, bytes + N - 1);
+}
+
+uint32_t hash(const char* str) {
+    return static_cast<uint32_t>(std::hash<std::string_view>()(str));
 }
 
 } // namespace
@@ -173,55 +180,89 @@ TEST(DisplayIdentificationTest, parseEdid) {
     EXPECT_EQ(0x4ca3u, edid->manufacturerId);
     EXPECT_STREQ("SEC", edid->pnpId.data());
     // ASCII text should be used as fallback if display name and serial number are missing.
-    EXPECT_EQ("121AT11-801", edid->displayName);
+    EXPECT_EQ(hash("121AT11-801"), edid->modelHash);
+    EXPECT_TRUE(edid->displayName.empty());
     EXPECT_EQ(12610, edid->productId);
     EXPECT_EQ(21, edid->manufactureOrModelYear);
     EXPECT_EQ(0, edid->manufactureWeek);
+    EXPECT_FALSE(edid->cea861Block);
 
     edid = parseEdid(getExternalEdid());
     ASSERT_TRUE(edid);
     EXPECT_EQ(0x22f0u, edid->manufacturerId);
     EXPECT_STREQ("HWP", edid->pnpId.data());
+    EXPECT_EQ(hash("HP ZR30w"), edid->modelHash);
     EXPECT_EQ("HP ZR30w", edid->displayName);
     EXPECT_EQ(10348, edid->productId);
     EXPECT_EQ(22, edid->manufactureOrModelYear);
     EXPECT_EQ(2, edid->manufactureWeek);
+    EXPECT_FALSE(edid->cea861Block);
 
     edid = parseEdid(getExternalEedid());
     ASSERT_TRUE(edid);
     EXPECT_EQ(0x4c2du, edid->manufacturerId);
     EXPECT_STREQ("SAM", edid->pnpId.data());
+    EXPECT_EQ(hash("SAMSUNG"), edid->modelHash);
     EXPECT_EQ("SAMSUNG", edid->displayName);
     EXPECT_EQ(2302, edid->productId);
     EXPECT_EQ(21, edid->manufactureOrModelYear);
     EXPECT_EQ(41, edid->manufactureWeek);
+    ASSERT_TRUE(edid->cea861Block);
+    ASSERT_TRUE(edid->cea861Block->hdmiVendorDataBlock);
+    ASSERT_TRUE(edid->cea861Block->hdmiVendorDataBlock->physicalAddress);
+    auto physicalAddress = edid->cea861Block->hdmiVendorDataBlock->physicalAddress;
+    EXPECT_EQ(2, physicalAddress->a);
+    EXPECT_EQ(0, physicalAddress->b);
+    EXPECT_EQ(0, physicalAddress->c);
+    EXPECT_EQ(0, physicalAddress->d);
 
     edid = parseEdid(getPanasonicTvEdid());
     ASSERT_TRUE(edid);
     EXPECT_EQ(13481, edid->manufacturerId);
     EXPECT_STREQ("MEI", edid->pnpId.data());
+    EXPECT_EQ(hash("Panasonic-TV"), edid->modelHash);
     EXPECT_EQ("Panasonic-TV", edid->displayName);
     EXPECT_EQ(41622, edid->productId);
     EXPECT_EQ(29, edid->manufactureOrModelYear);
     EXPECT_EQ(0, edid->manufactureWeek);
+    ASSERT_TRUE(edid->cea861Block);
+    ASSERT_TRUE(edid->cea861Block->hdmiVendorDataBlock);
+    ASSERT_TRUE(edid->cea861Block->hdmiVendorDataBlock->physicalAddress);
+    physicalAddress = edid->cea861Block->hdmiVendorDataBlock->physicalAddress;
+    EXPECT_EQ(2, physicalAddress->a);
+    EXPECT_EQ(0, physicalAddress->b);
+    EXPECT_EQ(0, physicalAddress->c);
+    EXPECT_EQ(0, physicalAddress->d);
 
     edid = parseEdid(getHisenseTvEdid());
     ASSERT_TRUE(edid);
     EXPECT_EQ(8355, edid->manufacturerId);
     EXPECT_STREQ("HEC", edid->pnpId.data());
+    EXPECT_EQ(hash("Hisense"), edid->modelHash);
     EXPECT_EQ("Hisense", edid->displayName);
     EXPECT_EQ(0, edid->productId);
     EXPECT_EQ(29, edid->manufactureOrModelYear);
     EXPECT_EQ(18, edid->manufactureWeek);
+    ASSERT_TRUE(edid->cea861Block);
+    ASSERT_TRUE(edid->cea861Block->hdmiVendorDataBlock);
+    ASSERT_TRUE(edid->cea861Block->hdmiVendorDataBlock->physicalAddress);
+    physicalAddress = edid->cea861Block->hdmiVendorDataBlock->physicalAddress;
+    EXPECT_EQ(1, physicalAddress->a);
+    EXPECT_EQ(2, physicalAddress->b);
+    EXPECT_EQ(3, physicalAddress->c);
+    EXPECT_EQ(4, physicalAddress->d);
 
     edid = parseEdid(getCtlDisplayEdid());
     ASSERT_TRUE(edid);
     EXPECT_EQ(3724, edid->manufacturerId);
     EXPECT_STREQ("CTL", edid->pnpId.data());
+    EXPECT_EQ(hash("LP2361"), edid->modelHash);
     EXPECT_EQ("LP2361", edid->displayName);
     EXPECT_EQ(9373, edid->productId);
     EXPECT_EQ(23, edid->manufactureOrModelYear);
     EXPECT_EQ(0xff, edid->manufactureWeek);
+    ASSERT_TRUE(edid->cea861Block);
+    EXPECT_FALSE(edid->cea861Block->hdmiVendorDataBlock);
 }
 
 TEST(DisplayIdentificationTest, parseInvalidEdid) {
@@ -234,13 +275,15 @@ TEST(DisplayIdentificationTest, parseInvalidEdid) {
     auto edid = parseEdid(data);
     ASSERT_TRUE(edid);
     // Serial number should be used as fallback if display name is invalid.
-    EXPECT_EQ("CN4202137Q", edid->displayName);
+    const auto modelHash = hash("CN4202137Q");
+    EXPECT_EQ(modelHash, edid->modelHash);
+    EXPECT_TRUE(edid->displayName.empty());
 
     // Parsing should succeed even if EDID is truncated.
     data.pop_back();
     edid = parseEdid(data);
     ASSERT_TRUE(edid);
-    EXPECT_EQ("CN4202137Q", edid->displayName);
+    EXPECT_EQ(modelHash, edid->modelHash);
 }
 
 TEST(DisplayIdentificationTest, getPnpId) {
@@ -278,7 +321,7 @@ TEST(DisplayIdentificationTest, deviceProductInfo) {
         ASSERT_TRUE(displayIdInfo);
         ASSERT_TRUE(displayIdInfo->deviceProductInfo);
         const auto& info = *displayIdInfo->deviceProductInfo;
-        EXPECT_STREQ("121AT11-801", info.name.data());
+        EXPECT_STREQ("", info.name.data());
         EXPECT_STREQ("SEC", info.manufacturerPnpId.data());
         EXPECT_STREQ("12610", info.productId.data());
         ASSERT_TRUE(std::holds_alternative<ManufactureYear>(info.manufactureOrModelDate));

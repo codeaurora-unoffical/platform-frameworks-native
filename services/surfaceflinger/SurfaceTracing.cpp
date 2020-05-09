@@ -36,28 +36,31 @@ SurfaceTracing::SurfaceTracing(SurfaceFlinger& flinger)
       : mFlinger(flinger), mSfLock(flinger.mDrawingStateLock) {}
 
 void SurfaceTracing::mainLoop() {
-    addFirstEntry();
-    bool enabled = true;
+    bool enabled = addFirstEntry();
     while (enabled) {
         LayersTraceProto entry = traceWhenNotified();
         enabled = addTraceToBuffer(entry);
     }
 }
 
-void SurfaceTracing::addFirstEntry() {
+bool SurfaceTracing::addFirstEntry() {
+    const auto displayDevice = mFlinger.getDefaultDisplayDevice();
     LayersTraceProto entry;
     {
         std::scoped_lock lock(mSfLock);
-        entry = traceLayersLocked("tracing.enable");
+        entry = traceLayersLocked("tracing.enable", displayDevice);
     }
-    addTraceToBuffer(entry);
+    return addTraceToBuffer(entry);
 }
 
 LayersTraceProto SurfaceTracing::traceWhenNotified() {
+    const auto displayDevice = mFlinger.getDefaultDisplayDevice();
     std::unique_lock<std::mutex> lock(mSfLock);
     mCanStartTrace.wait(lock);
     android::base::ScopedLockAssertion assumeLock(mSfLock);
-    LayersTraceProto entry = traceLayersLocked(mWhere);
+    LayersTraceProto entry = traceLayersLocked(mWhere, displayDevice);
+    mTracingInProgress = false;
+    mMissedTraceEntries = 0;
     lock.unlock();
     return entry;
 }
@@ -74,7 +77,15 @@ bool SurfaceTracing::addTraceToBuffer(LayersTraceProto& entry) {
 
 void SurfaceTracing::notify(const char* where) {
     std::scoped_lock lock(mSfLock);
+    notifyLocked(where);
+}
+
+void SurfaceTracing::notifyLocked(const char* where) {
     mWhere = where;
+    if (mTracingInProgress) {
+        mMissedTraceEntries++;
+    }
+    mTracingInProgress = true;
     mCanStartTrace.notify_one();
 }
 
@@ -127,7 +138,12 @@ void SurfaceTracing::enable() {
 }
 
 status_t SurfaceTracing::writeToFile() {
-    mThread.join();
+    std::thread thread;
+    {
+        std::scoped_lock lock(mTraceLock);
+        thread = std::move(mThread);
+    }
+    thread.join();
     return mLastErr;
 }
 
@@ -160,14 +176,18 @@ void SurfaceTracing::setTraceFlags(uint32_t flags) {
     mTraceFlags = flags;
 }
 
-LayersTraceProto SurfaceTracing::traceLayersLocked(const char* where) {
+LayersTraceProto SurfaceTracing::traceLayersLocked(const char* where,
+                                                   const sp<const DisplayDevice>& displayDevice) {
     ATRACE_CALL();
 
     LayersTraceProto entry;
     entry.set_elapsed_realtime_nanos(elapsedRealtimeNano());
     entry.set_where(where);
-    LayersProto layers(mFlinger.dumpDrawingStateProto(mTraceFlags));
-    mFlinger.dumpOffscreenLayersProto(layers);
+    LayersProto layers(mFlinger.dumpDrawingStateProto(mTraceFlags, displayDevice));
+
+    if (flagIsSetLocked(SurfaceTracing::TRACE_EXTRA)) {
+        mFlinger.dumpOffscreenLayersProto(layers);
+    }
     entry.mutable_layers()->Swap(&layers);
 
     if (mTraceFlags & SurfaceTracing::TRACE_HWC) {
@@ -175,6 +195,10 @@ LayersTraceProto SurfaceTracing::traceLayersLocked(const char* where) {
         mFlinger.dumpHwc(hwcDump);
         entry.set_hwc_blob(hwcDump);
     }
+    if (!flagIsSetLocked(SurfaceTracing::TRACE_COMPOSITION)) {
+        entry.set_excludes_composition_state(true);
+    }
+    entry.set_missed_entries(mMissedTraceEntries);
 
     return entry;
 }

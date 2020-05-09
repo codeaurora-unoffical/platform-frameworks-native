@@ -35,6 +35,7 @@ namespace {
 
 using byte_view = std::basic_string_view<uint8_t>;
 
+constexpr size_t kEdidBlockSize = 128;
 constexpr size_t kEdidHeaderLength = 5;
 
 constexpr uint16_t kFallbackEdidManufacturerId = 0;
@@ -98,15 +99,65 @@ DeviceProductInfo buildDeviceProductInfo(const Edid& edid) {
     return info;
 }
 
+Cea861ExtensionBlock parseCea861Block(const byte_view& block) {
+    Cea861ExtensionBlock cea861Block;
+
+    constexpr size_t kRevisionNumberOffset = 1;
+    cea861Block.revisionNumber = block[kRevisionNumberOffset];
+
+    constexpr size_t kDetailedTimingDescriptorsOffset = 2;
+    const size_t dtdStart =
+            std::min(kEdidBlockSize, static_cast<size_t>(block[kDetailedTimingDescriptorsOffset]));
+
+    // Parse data blocks.
+    for (size_t dataBlockOffset = 4; dataBlockOffset < dtdStart;) {
+        const uint8_t header = block[dataBlockOffset];
+        const uint8_t tag = header >> 5;
+        const size_t bodyLength = header & 0b11111;
+        constexpr size_t kDataBlockHeaderSize = 1;
+        const size_t dataBlockSize = bodyLength + kDataBlockHeaderSize;
+
+        if (block.size() < dataBlockOffset + dataBlockSize) {
+            ALOGW("Invalid EDID: CEA 861 data block is truncated.");
+            break;
+        }
+
+        const byte_view dataBlock(block.data() + dataBlockOffset, dataBlockSize);
+        constexpr uint8_t kVendorSpecificDataBlockTag = 0x3;
+
+        if (tag == kVendorSpecificDataBlockTag) {
+            const uint32_t ieeeRegistrationId =
+                    dataBlock[1] | (dataBlock[2] << 8) | (dataBlock[3] << 16);
+            constexpr uint32_t kHdmiIeeeRegistrationId = 0xc03;
+
+            if (ieeeRegistrationId == kHdmiIeeeRegistrationId) {
+                const uint8_t a = dataBlock[4] >> 4;
+                const uint8_t b = dataBlock[4] & 0b1111;
+                const uint8_t c = dataBlock[5] >> 4;
+                const uint8_t d = dataBlock[5] & 0b1111;
+                cea861Block.hdmiVendorDataBlock =
+                        HdmiVendorDataBlock{.physicalAddress = HdmiPhysicalAddress{a, b, c, d}};
+            } else {
+                ALOGV("Ignoring vendor specific data block for vendor with IEEE OUI %x",
+                      ieeeRegistrationId);
+            }
+        } else {
+            ALOGV("Ignoring CEA-861 data block with tag %x", tag);
+        }
+        dataBlockOffset += bodyLength + kDataBlockHeaderSize;
+    }
+
+    return cea861Block;
+}
+
 } // namespace
 
 uint16_t DisplayId::manufacturerId() const {
     return static_cast<uint16_t>(value >> 40);
 }
 
-DisplayId DisplayId::fromEdid(uint8_t port, uint16_t manufacturerId, uint32_t displayNameHash) {
-    return {(static_cast<Type>(manufacturerId) << 40) | (static_cast<Type>(displayNameHash) << 8) |
-            port};
+DisplayId DisplayId::fromEdid(uint8_t port, uint16_t manufacturerId, uint32_t modelHash) {
+    return {(static_cast<Type>(manufacturerId) << 40) | (static_cast<Type>(modelHash) << 8) | port};
 }
 
 bool isEdid(const DisplayIdentificationData& data) {
@@ -116,13 +167,12 @@ bool isEdid(const DisplayIdentificationData& data) {
 }
 
 std::optional<Edid> parseEdid(const DisplayIdentificationData& edid) {
-    constexpr size_t kMinLength = 128;
-    if (edid.size() < kMinLength) {
+    if (edid.size() < kEdidBlockSize) {
         ALOGW("Invalid EDID: structure is truncated.");
         // Attempt parsing even if EDID is malformed.
     } else {
-        ALOGW_IF(edid[126] != 0, "EDID extensions are currently unsupported.");
-        ALOGW_IF(std::accumulate(edid.begin(), edid.begin() + kMinLength, static_cast<uint8_t>(0)),
+        ALOGW_IF(std::accumulate(edid.begin(), edid.begin() + kEdidBlockSize,
+                                 static_cast<uint8_t>(0)),
                  "Invalid EDID: structure does not checksum.");
     }
 
@@ -209,25 +259,62 @@ std::optional<Edid> parseEdid(const DisplayIdentificationData& edid) {
         view.remove_prefix(kDescriptorLength);
     }
 
-    if (displayName.empty()) {
+    std::string_view modelString = displayName;
+
+    if (modelString.empty()) {
         ALOGW("Invalid EDID: falling back to serial number due to missing display name.");
-        displayName = serialNumber;
+        modelString = serialNumber;
     }
-    if (displayName.empty()) {
+    if (modelString.empty()) {
         ALOGW("Invalid EDID: falling back to ASCII text due to missing serial number.");
-        displayName = asciiText;
+        modelString = asciiText;
     }
-    if (displayName.empty()) {
+    if (modelString.empty()) {
         ALOGE("Invalid EDID: display name and fallback descriptors are missing.");
         return {};
     }
 
+    // Hash model string instead of using product code or (integer) serial number, since the latter
+    // have been observed to change on some displays with multiple inputs.
+    const auto modelHash = static_cast<uint32_t>(std::hash<std::string_view>()(modelString));
+
+    // Parse extension blocks.
+    std::optional<Cea861ExtensionBlock> cea861Block;
+    if (edid.size() < kEdidBlockSize) {
+        ALOGW("Invalid EDID: block 0 is truncated.");
+    } else {
+        constexpr size_t kNumExtensionsOffset = 126;
+        const size_t numExtensions = edid[kNumExtensionsOffset];
+        view = byte_view(edid.data(), edid.size());
+        for (size_t blockNumber = 1; blockNumber <= numExtensions; blockNumber++) {
+            view.remove_prefix(kEdidBlockSize);
+            if (view.size() < kEdidBlockSize) {
+                ALOGW("Invalid EDID: block %zu is truncated.", blockNumber);
+                break;
+            }
+
+            const byte_view block(view.data(), kEdidBlockSize);
+            ALOGW_IF(std::accumulate(block.begin(), block.end(), static_cast<uint8_t>(0)),
+                     "Invalid EDID: block %zu does not checksum.", blockNumber);
+            const uint8_t tag = block[0];
+
+            constexpr uint8_t kCea861BlockTag = 0x2;
+            if (tag == kCea861BlockTag) {
+                cea861Block = parseCea861Block(block);
+            } else {
+                ALOGV("Ignoring block number %zu with tag %x.", blockNumber, tag);
+            }
+        }
+    }
+
     return Edid{.manufacturerId = manufacturerId,
-                .pnpId = *pnpId,
-                .displayName = displayName,
                 .productId = productId,
+                .pnpId = *pnpId,
+                .modelHash = modelHash,
+                .displayName = displayName,
+                .manufactureOrModelYear = manufactureOrModelYear,
                 .manufactureWeek = manufactureWeek,
-                .manufactureOrModelYear = manufactureOrModelYear};
+                .cea861Block = cea861Block};
 }
 
 std::optional<PnpId> getPnpId(uint16_t manufacturerId) {
@@ -253,10 +340,8 @@ std::optional<DisplayIdentificationInfo> parseDisplayIdentificationData(
         return {};
     }
 
-    // Hash display name instead of using product code or serial number, since the latter have been
-    // observed to change on some displays with multiple inputs.
-    const auto hash = static_cast<uint32_t>(std::hash<std::string_view>()(edid->displayName));
-    return DisplayIdentificationInfo{.id = DisplayId::fromEdid(port, edid->manufacturerId, hash),
+    const auto displayId = DisplayId::fromEdid(port, edid->manufacturerId, edid->modelHash);
+    return DisplayIdentificationInfo{.id = displayId,
                                      .name = std::string(edid->displayName),
                                      .deviceProductInfo = buildDeviceProductInfo(*edid)};
 }

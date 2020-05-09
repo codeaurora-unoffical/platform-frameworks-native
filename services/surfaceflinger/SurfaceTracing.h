@@ -16,16 +16,18 @@
 
 #pragma once
 
+#include <android-base/thread_annotations.h>
 #include <layerproto/LayerProtoHeader.h>
 #include <utils/Errors.h>
 #include <utils/StrongPointer.h>
 
-#include <android-base/thread_annotations.h>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
+
+#include "DisplayDevice.h"
 
 using namespace android::surfaceflinger;
 
@@ -47,6 +49,7 @@ public:
     status_t writeToFile();
     bool isEnabled() const;
     void notify(const char* where);
+    void notifyLocked(const char* where) NO_THREAD_SAFETY_ANALYSIS /* REQUIRES(mSfLock) */;
 
     void setBufferSize(size_t bufferSizeInByte);
     void writeToFileAsync();
@@ -55,11 +58,15 @@ public:
     enum : uint32_t {
         TRACE_CRITICAL = 1 << 0,
         TRACE_INPUT = 1 << 1,
-        TRACE_EXTRA = 1 << 2,
-        TRACE_HWC = 1 << 3,
+        TRACE_COMPOSITION = 1 << 2,
+        TRACE_EXTRA = 1 << 3,
+        TRACE_HWC = 1 << 4,
         TRACE_ALL = 0xffffffff
     };
     void setTraceFlags(uint32_t flags);
+    bool flagIsSetLocked(uint32_t flags) NO_THREAD_SAFETY_ANALYSIS /* REQUIRES(mSfLock) */ {
+        return (mTraceFlags & flags) == flags;
+    }
 
 private:
     static constexpr auto kDefaultBufferCapInByte = 5_MB;
@@ -83,22 +90,26 @@ private:
     };
 
     void mainLoop();
-    void addFirstEntry();
+    bool addFirstEntry();
     LayersTraceProto traceWhenNotified();
-    LayersTraceProto traceLayersLocked(const char* where) REQUIRES(mSfLock);
+    LayersTraceProto traceLayersLocked(const char* where,
+                                       const sp<const DisplayDevice>& displayDevice)
+            REQUIRES(mSfLock);
 
     // Returns true if trace is enabled.
     bool addTraceToBuffer(LayersTraceProto& entry);
     void writeProtoFileLocked() REQUIRES(mTraceLock);
 
-    const SurfaceFlinger& mFlinger;
+    SurfaceFlinger& mFlinger;
     status_t mLastErr = NO_ERROR;
     std::thread mThread;
     std::condition_variable mCanStartTrace;
 
     std::mutex& mSfLock;
-    uint32_t mTraceFlags GUARDED_BY(mSfLock) = TRACE_ALL;
+    uint32_t mTraceFlags GUARDED_BY(mSfLock) = TRACE_CRITICAL | TRACE_INPUT;
     const char* mWhere GUARDED_BY(mSfLock) = "";
+    uint32_t mMissedTraceEntries GUARDED_BY(mSfLock) = 0;
+    bool mTracingInProgress GUARDED_BY(mSfLock) = false;
 
     mutable std::mutex mTraceLock;
     LayersTraceBuffer mBuffer GUARDED_BY(mTraceLock);
