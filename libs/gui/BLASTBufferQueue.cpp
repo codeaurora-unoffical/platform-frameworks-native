@@ -95,7 +95,8 @@ void BLASTBufferItemConsumer::getConnectionEvents(uint64_t frameNumber, bool* ne
     if (needsDisconnect != nullptr) *needsDisconnect = disconnect;
 }
 
-BLASTBufferQueue::BLASTBufferQueue(const sp<SurfaceControl>& surface, int width, int height)
+BLASTBufferQueue::BLASTBufferQueue(const sp<SurfaceControl>& surface, int width, int height,
+                                   bool enableTripleBuffering)
       : mSurfaceControl(surface),
         mWidth(width),
         mHeight(height),
@@ -105,8 +106,7 @@ BLASTBufferQueue::BLASTBufferQueue(const sp<SurfaceControl>& surface, int width,
     // explicitly so that dequeueBuffer will block
     mProducer->setDequeueTimeout(std::numeric_limits<int64_t>::max());
 
-    int8_t disableTripleBuffer = property_get_bool("ro.sf.disable_triple_buffer", 0);
-    if (!disableTripleBuffer) {
+    if (enableTripleBuffering) {
         mProducer->setMaxDequeuedBufferCount(2);
     }
     mBufferItemConsumer =
@@ -189,13 +189,13 @@ void BLASTBufferQueue::transactionCallback(nsecs_t /*latchTime*/, const sp<Fence
     mPendingReleaseItem.item = std::move(mSubmitted.front());
     mSubmitted.pop();
 
-    processNextBufferLocked();
+    processNextBufferLocked(false);
 
     mCallbackCV.notify_all();
     decStrong((void*)transactionCallbackThunk);
 }
 
-void BLASTBufferQueue::processNextBufferLocked() {
+void BLASTBufferQueue::processNextBufferLocked(bool useNextTransaction) {
     ATRACE_CALL();
     if (mNumFrameAvailable == 0 || mNumAcquired == MAX_ACQUIRED_BUFFERS + 1) {
         return;
@@ -209,7 +209,7 @@ void BLASTBufferQueue::processNextBufferLocked() {
     SurfaceComposerClient::Transaction localTransaction;
     bool applyTransaction = true;
     SurfaceComposerClient::Transaction* t = &localTransaction;
-    if (mNextTransaction != nullptr && mUseNextTransaction) {
+    if (mNextTransaction != nullptr && useNextTransaction) {
         t = mNextTransaction;
         mNextTransaction = nullptr;
         applyTransaction = false;
@@ -274,16 +274,14 @@ void BLASTBufferQueue::onFrameAvailable(const BufferItem& /*item*/) {
         while (mNumFrameAvailable > 0 || mNumAcquired == MAX_ACQUIRED_BUFFERS + 1) {
             mCallbackCV.wait(_lock);
         }
-        mUseNextTransaction = true;
     }
     // add to shadow queue
     mNumFrameAvailable++;
-    processNextBufferLocked();
+    processNextBufferLocked(true);
 }
 
 void BLASTBufferQueue::setNextTransaction(SurfaceComposerClient::Transaction* t) {
     std::lock_guard _lock{mMutex};
-    mUseNextTransaction = false;
     mNextTransaction = t;
 }
 

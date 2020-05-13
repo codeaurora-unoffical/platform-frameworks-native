@@ -79,8 +79,9 @@ std::string toString(const DisplayEventReceiver::Event& event) {
                                 event.hotplug.connected ? "connected" : "disconnected");
         case DisplayEventReceiver::DISPLAY_EVENT_VSYNC:
             return StringPrintf("VSync{displayId=%" ANDROID_PHYSICAL_DISPLAY_ID_FORMAT
-                                ", count=%u}",
-                                event.header.displayId, event.vsync.count);
+                                ", count=%u, expectedVSyncTimestamp=%" PRId64 "}",
+                                event.header.displayId, event.vsync.count,
+                                event.vsync.expectedVSyncTimestamp);
         case DisplayEventReceiver::DISPLAY_EVENT_CONFIG_CHANGED:
             return StringPrintf("ConfigChanged{displayId=%" ANDROID_PHYSICAL_DISPLAY_ID_FORMAT
                                 ", configId=%u}",
@@ -99,10 +100,11 @@ DisplayEventReceiver::Event makeHotplug(PhysicalDisplayId displayId, nsecs_t tim
 }
 
 DisplayEventReceiver::Event makeVSync(PhysicalDisplayId displayId, nsecs_t timestamp,
-                                      uint32_t count) {
+                                      uint32_t count, nsecs_t expectedVSyncTimestamp) {
     DisplayEventReceiver::Event event;
     event.header = {DisplayEventReceiver::DISPLAY_EVENT_VSYNC, displayId, timestamp};
     event.vsync.count = count;
+    event.vsync.expectedVSyncTimestamp = expectedVSyncTimestamp;
     return event;
 }
 
@@ -312,11 +314,12 @@ void EventThread::onScreenAcquired() {
     mCondition.notify_all();
 }
 
-void EventThread::onVSyncEvent(nsecs_t timestamp) {
+void EventThread::onVSyncEvent(nsecs_t timestamp, nsecs_t expectedVSyncTimestamp) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     LOG_FATAL_IF(!mVSyncState);
-    mPendingEvents.push_back(makeVSync(mVSyncState->displayId, timestamp, ++mVSyncState->count));
+    mPendingEvents.push_back(makeVSync(mVSyncState->displayId, timestamp, ++mVSyncState->count,
+                                       expectedVSyncTimestamp));
     mCondition.notify_all();
 }
 
@@ -423,19 +426,27 @@ void EventThread::threadMain(std::unique_lock<std::mutex>& lock) {
         } else {
             // Generate a fake VSYNC after a long timeout in case the driver stalls. When the
             // display is off, keep feeding clients at 60 Hz.
-            const auto timeout = mState == State::SyntheticVSync ? 16ms : 1000ms;
+            const std::chrono::nanoseconds timeout =
+                    mState == State::SyntheticVSync ? 16ms : 1000ms;
             if (mCondition.wait_for(lock, timeout) == std::cv_status::timeout) {
                 if (mState == State::VSync) {
                     ALOGW("Faking VSYNC due to driver stall for thread %s", mThreadName);
                     std::string debugInfo = "VsyncSource debug info:\n";
                     mVSyncSource->dump(debugInfo);
-                    ALOGW("%s", debugInfo.c_str());
+                    // Log the debug info line-by-line to avoid logcat overflow
+                    auto pos = debugInfo.find('\n');
+                    while (pos != std::string::npos) {
+                        ALOGW("%s", debugInfo.substr(0, pos).c_str());
+                        debugInfo = debugInfo.substr(pos + 1);
+                        pos = debugInfo.find('\n');
+                    }
                 }
 
                 LOG_FATAL_IF(!mVSyncState);
-                mPendingEvents.push_back(makeVSync(mVSyncState->displayId,
-                                                   systemTime(SYSTEM_TIME_MONOTONIC),
-                                                   ++mVSyncState->count));
+                const auto now = systemTime(SYSTEM_TIME_MONOTONIC);
+                const auto expectedVSyncTime = now + timeout.count();
+                mPendingEvents.push_back(makeVSync(mVSyncState->displayId, now,
+                                                   ++mVSyncState->count, expectedVSyncTime));
             }
         }
     }
