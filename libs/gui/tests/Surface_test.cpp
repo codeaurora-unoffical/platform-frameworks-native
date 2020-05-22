@@ -18,17 +18,18 @@
 
 #include <gtest/gtest.h>
 
+#include <SurfaceFlingerProperties.h>
 #include <android/hardware/configstore/1.0/ISurfaceFlingerConfigs.h>
 #include <binder/ProcessState.h>
 #include <configstore/Utils.h>
 #include <cutils/properties.h>
-#include <inttypes.h>
 #include <gui/BufferItemConsumer.h>
 #include <gui/IDisplayEventConnection.h>
 #include <gui/IProducerListener.h>
 #include <gui/ISurfaceComposer.h>
 #include <gui/Surface.h>
 #include <gui/SurfaceComposerClient.h>
+#include <inttypes.h>
 #include <private/gui/ComposerService.h>
 #include <ui/Rect.h>
 #include <utils/String8.h>
@@ -46,11 +47,9 @@ using ui::ColorMode;
 
 using Transaction = SurfaceComposerClient::Transaction;
 
-static bool hasWideColorDisplay =
-        getBool<ISurfaceFlingerConfigs, &ISurfaceFlingerConfigs::hasWideColorDisplay>(false);
+static bool hasWideColorDisplay = android::sysprop::has_wide_color_display(false);
 
-static bool hasHdrDisplay =
-        getBool<ISurfaceFlingerConfigs, &ISurfaceFlingerConfigs::hasHDRDisplay>(false);
+static bool hasHdrDisplay = android::sysprop::has_HDR_display(false);
 
 class FakeSurfaceComposer;
 class FakeProducerFrameEventHistory;
@@ -804,7 +803,7 @@ public:
     }
     status_t setDisplayContentSamplingEnabled(const sp<IBinder>& /*display*/, bool /*enable*/,
                                               uint8_t /*componentMask*/,
-                                              uint64_t /*maxFrames*/) const override {
+                                              uint64_t /*maxFrames*/) override {
         return NO_ERROR;
     }
     status_t getDisplayedContentSample(const sp<IBinder>& /*display*/, uint64_t /*maxFrames*/,
@@ -822,7 +821,7 @@ public:
         return NO_ERROR;
     }
     status_t setDisplayBrightness(const sp<IBinder>& /*displayToken*/,
-                                  float /*brightness*/) const override {
+                                  float /*brightness*/) override {
         return NO_ERROR;
     }
 
