@@ -62,7 +62,7 @@ public:
     std::array<uint8_t, 32> sign(const VerifiedInputEvent& event) const;
 
 private:
-    std::array<uint8_t, 32> sign(const std::vector<uint8_t>& data) const;
+    std::array<uint8_t, 32> sign(const uint8_t* data, size_t size) const;
     const std::array<uint8_t, 128> mHmacKey;
 };
 
@@ -103,7 +103,8 @@ public:
     virtual void notifyDeviceReset(const NotifyDeviceResetArgs* args) override;
 
     virtual int32_t injectInputEvent(const InputEvent* event, int32_t injectorPid,
-                                     int32_t injectorUid, int32_t syncMode, int32_t timeoutMillis,
+                                     int32_t injectorUid, int32_t syncMode,
+                                     std::chrono::milliseconds timeout,
                                      uint32_t policyFlags) override;
 
     virtual std::unique_ptr<VerifiedInputEvent> verifyInputEvent(const InputEvent& event) override;
@@ -196,6 +197,11 @@ private:
     // All registered connections mapped by channel file descriptor.
     std::unordered_map<int, sp<Connection>> mConnectionsByFd GUARDED_BY(mLock);
 
+    sp<Connection> getConnectionLocked(const sp<IBinder>& inputConnectionToken) const
+            REQUIRES(mLock);
+
+    void removeConnectionLocked(const sp<Connection>& connection) REQUIRES(mLock);
+
     struct IBinderHash {
         std::size_t operator()(const sp<IBinder>& b) const {
             return std::hash<IBinder*>{}(b.get());
@@ -208,7 +214,6 @@ private:
     std::optional<int32_t> findGestureMonitorDisplayByTokenLocked(const sp<IBinder>& token)
             REQUIRES(mLock);
 
-    sp<Connection> getConnectionLocked(const sp<IBinder>& inputConnectionToken) REQUIRES(mLock);
 
     // Input channels that will receive a copy of all input events sent to the provided display.
     std::unordered_map<int32_t, std::vector<Monitor>> mGlobalMonitorsByDisplay GUARDED_BY(mLock);
@@ -219,7 +224,11 @@ private:
     // the pointer stream in order to claim it for a system gesture.
     std::unordered_map<int32_t, std::vector<Monitor>> mGestureMonitorsByDisplay GUARDED_BY(mLock);
 
-    HmacKeyManager mHmacKeyManager;
+    const HmacKeyManager mHmacKeyManager;
+    const std::array<uint8_t, 32> getSignature(const MotionEntry& motionEntry,
+                                               const DispatchEntry& dispatchEntry) const;
+    const std::array<uint8_t, 32> getSignature(const KeyEntry& keyEntry,
+                                               const DispatchEntry& dispatchEntry) const;
 
     // Event injection and synchronization.
     std::condition_variable mInjectionResultAvailable;
@@ -310,7 +319,7 @@ private:
     int32_t mFocusedDisplayId GUARDED_BY(mLock);
 
     // Dispatcher state at time of last ANR.
-    std::string mLastANRState GUARDED_BY(mLock);
+    std::string mLastAnrState GUARDED_BY(mLock);
 
     // Dispatch inbound events.
     bool dispatchConfigurationChangedLocked(nsecs_t currentTime, ConfigurationChangedEntry* entry)
@@ -340,6 +349,8 @@ private:
     bool mInputTargetWaitTimeoutExpired GUARDED_BY(mLock);
     sp<IBinder> mInputTargetWaitApplicationToken GUARDED_BY(mLock);
 
+    bool shouldPruneInboundQueueLocked(const MotionEntry& motionEntry) REQUIRES(mLock);
+
     // Contains the last window which received a hover event.
     sp<InputWindowHandle> mLastHoverWindowHandle GUARDED_BY(mLock);
 
@@ -356,7 +367,7 @@ private:
                                                  const sp<IBinder>& inputConnectionToken)
             REQUIRES(mLock);
     nsecs_t getTimeSpentWaitingForApplicationLocked(nsecs_t currentTime) REQUIRES(mLock);
-    void resetANRTimeoutsLocked() REQUIRES(mLock);
+    void resetAnrTimeoutsLocked() REQUIRES(mLock);
 
     int32_t getTargetDisplayId(const EventEntry& entry);
     int32_t findFocusedWindowTargetsLocked(nsecs_t currentTime, const EventEntry& entry,
@@ -464,7 +475,7 @@ private:
             REQUIRES(mLock);
     void onFocusChangedLocked(const sp<InputWindowHandle>& oldFocus,
                               const sp<InputWindowHandle>& newFocus) REQUIRES(mLock);
-    void onANRLocked(nsecs_t currentTime, const sp<InputApplicationHandle>& applicationHandle,
+    void onAnrLocked(nsecs_t currentTime, const sp<InputApplicationHandle>& applicationHandle,
                      const sp<InputWindowHandle>& windowHandle, nsecs_t eventTime,
                      nsecs_t waitStartTime, const char* reason) REQUIRES(mLock);
 
@@ -473,7 +484,7 @@ private:
             REQUIRES(mLock);
     void doNotifyInputChannelBrokenLockedInterruptible(CommandEntry* commandEntry) REQUIRES(mLock);
     void doNotifyFocusChangedLockedInterruptible(CommandEntry* commandEntry) REQUIRES(mLock);
-    void doNotifyANRLockedInterruptible(CommandEntry* commandEntry) REQUIRES(mLock);
+    void doNotifyAnrLockedInterruptible(CommandEntry* commandEntry) REQUIRES(mLock);
     void doInterceptKeyBeforeDispatchingLockedInterruptible(CommandEntry* commandEntry)
             REQUIRES(mLock);
     void doDispatchCycleFinishedLockedInterruptible(CommandEntry* commandEntry) REQUIRES(mLock);
@@ -492,8 +503,8 @@ private:
     LatencyStatistics mTouchStatistics{TOUCH_STATS_REPORT_PERIOD};
 
     void reportTouchEventForStatistics(const MotionEntry& entry);
-    void updateDispatchStatistics(nsecs_t currentTime, const EventEntry& entry,
-                                  int32_t injectionResult, nsecs_t timeSpentWaitingForApplication);
+    void reportDispatchStatistics(std::chrono::nanoseconds eventDuration,
+                                  const Connection& connection, bool handled);
     void traceInboundQueueLengthLocked() REQUIRES(mLock);
     void traceOutboundQueueLength(const sp<Connection>& connection);
     void traceWaitQueueLength(const sp<Connection>& connection);

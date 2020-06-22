@@ -87,10 +87,26 @@ ScheduleResult VSyncDispatchTimerQueueEntry::schedule(nsecs_t workDuration, nsec
     return ScheduleResult::Scheduled;
 }
 
+void VSyncDispatchTimerQueueEntry::addPendingWorkloadUpdate(nsecs_t workDuration,
+                                                            nsecs_t earliestVsync) {
+    mWorkloadUpdateInfo = {.earliestVsync = earliestVsync, .duration = workDuration};
+}
+
+bool VSyncDispatchTimerQueueEntry::hasPendingWorkloadUpdate() const {
+    return mWorkloadUpdateInfo.has_value();
+}
+
 void VSyncDispatchTimerQueueEntry::update(VSyncTracker& tracker, nsecs_t now) {
-    if (!mArmedInfo) {
+    if (!mArmedInfo && !mWorkloadUpdateInfo) {
         return;
     }
+
+    if (mWorkloadUpdateInfo) {
+        mEarliestVsync = mWorkloadUpdateInfo->earliestVsync;
+        mWorkDuration = mWorkloadUpdateInfo->duration;
+        mWorkloadUpdateInfo.reset();
+    }
+
     auto const nextVsyncTime =
             tracker.nextAnticipatedVSyncTimeFrom(std::max(mEarliestVsync, now + mWorkDuration));
     mArmedInfo = {nextVsyncTime - mWorkDuration, nextVsyncTime};
@@ -168,6 +184,7 @@ void VSyncDispatchTimerQueue::setTimer(nsecs_t targetTime, nsecs_t now) {
     mIntendedWakeupTime = targetTime;
     mTimeKeeper->alarmIn(std::bind(&VSyncDispatchTimerQueue::timerCallback, this),
                          targetTime - now);
+    mLastTimerSchedule = mTimeKeeper->now();
 }
 
 void VSyncDispatchTimerQueue::rearmTimer(nsecs_t now) {
@@ -191,7 +208,7 @@ void VSyncDispatchTimerQueue::rearmTimerSkippingUpdateFor(
     std::optional<std::string_view> nextWakeupName;
     for (auto it = mCallbacks.begin(); it != mCallbacks.end(); it++) {
         auto& callback = it->second;
-        if (!callback->wakeupTime()) {
+        if (!callback->wakeupTime() && !callback->hasPendingWorkloadUpdate()) {
             continue;
         }
 
@@ -226,6 +243,7 @@ void VSyncDispatchTimerQueue::timerCallback() {
     std::vector<Invocation> invocations;
     {
         std::lock_guard<decltype(mMutex)> lk(mMutex);
+        mLastTimerCallback = mTimeKeeper->now();
         for (auto it = mCallbacks.begin(); it != mCallbacks.end(); it++) {
             auto& callback = it->second;
             auto const wakeupTime = callback->wakeupTime();
@@ -289,6 +307,15 @@ ScheduleResult VSyncDispatchTimerQueue::schedule(CallbackToken token, nsecs_t wo
         }
         auto& callback = it->second;
         auto const now = mTimeKeeper->now();
+
+        /* If the timer thread will run soon, we'll apply this work update via the callback
+         * timer recalculation to avoid cancelling a callback that is about to fire. */
+        auto const rearmImminent = now > mIntendedWakeupTime;
+        if (CC_UNLIKELY(rearmImminent)) {
+            callback->addPendingWorkloadUpdate(workDuration, earliestVsync);
+            return ScheduleResult::Scheduled;
+        }
+
         result = callback->schedule(workDuration, earliestVsync, mTracker, now);
         if (result == ScheduleResult::CannotSchedule) {
             return result;
@@ -322,10 +349,15 @@ CancelResult VSyncDispatchTimerQueue::cancel(CallbackToken token) {
 
 void VSyncDispatchTimerQueue::dump(std::string& result) const {
     std::lock_guard<decltype(mMutex)> lk(mMutex);
+    StringAppendF(&result, "\tTimer:\n");
+    mTimeKeeper->dump(result);
     StringAppendF(&result, "\tmTimerSlack: %.2fms mMinVsyncDistance: %.2fms\n", mTimerSlack / 1e6f,
                   mMinVsyncDistance / 1e6f);
     StringAppendF(&result, "\tmIntendedWakeupTime: %.2fms from now\n",
-                  (mIntendedWakeupTime - systemTime()) / 1e6f);
+                  (mIntendedWakeupTime - mTimeKeeper->now()) / 1e6f);
+    StringAppendF(&result, "\tmLastTimerCallback: %.2fms ago mLastTimerSchedule: %.2fms ago\n",
+                  (mTimeKeeper->now() - mLastTimerCallback) / 1e6f,
+                  (mTimeKeeper->now() - mLastTimerSchedule) / 1e6f);
     StringAppendF(&result, "\tCallbacks:\n");
     for (const auto& [token, entry] : mCallbacks) {
         entry->dump(result);

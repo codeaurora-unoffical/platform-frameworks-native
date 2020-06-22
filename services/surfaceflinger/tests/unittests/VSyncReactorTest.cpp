@@ -135,7 +135,7 @@ std::shared_ptr<FenceTime> generateSignalledFenceWithTime(nsecs_t time) {
 
 class StubCallback : public DispSync::Callback {
 public:
-    void onDispSyncEvent(nsecs_t when) final {
+    void onDispSyncEvent(nsecs_t when, nsecs_t /*expectedVSyncTimestamp*/) final {
         std::lock_guard<std::mutex> lk(mMutex);
         mLastCallTime = when;
     }
@@ -157,7 +157,8 @@ protected:
             mMockClock(std::make_shared<NiceMock<MockClock>>()),
             mReactor(std::make_unique<ClockWrapper>(mMockClock),
                      std::make_unique<VSyncDispatchWrapper>(mMockDispatch),
-                     std::make_unique<VSyncTrackerWrapper>(mMockTracker), kPendingLimit) {
+                     std::make_unique<VSyncTrackerWrapper>(mMockTracker), kPendingLimit,
+                     false /* supportKernelIdleTimer */) {
         ON_CALL(*mMockClock, now()).WillByDefault(Return(mFakeNow));
         ON_CALL(*mMockTracker, currentPeriod()).WillByDefault(Return(period));
     }
@@ -270,7 +271,7 @@ TEST_F(VSyncReactorTest, queriesTrackerForNextRefreshNow) {
             .Times(1)
             .WillOnce(Return(fakeTimestamp));
 
-    EXPECT_THAT(mReactor.computeNextRefresh(0), Eq(fakeTimestamp));
+    EXPECT_THAT(mReactor.computeNextRefresh(0, mMockClock->now()), Eq(fakeTimestamp));
 }
 
 TEST_F(VSyncReactorTest, queriesTrackerForExpectedPresentTime) {
@@ -280,7 +281,7 @@ TEST_F(VSyncReactorTest, queriesTrackerForExpectedPresentTime) {
             .Times(1)
             .WillOnce(Return(fakeTimestamp));
 
-    EXPECT_THAT(mReactor.expectedPresentTime(), Eq(fakeTimestamp));
+    EXPECT_THAT(mReactor.expectedPresentTime(mMockClock->now()), Eq(fakeTimestamp));
 }
 
 TEST_F(VSyncReactorTest, queriesTrackerForNextRefreshFuture) {
@@ -292,7 +293,7 @@ TEST_F(VSyncReactorTest, queriesTrackerForNextRefreshFuture) {
     EXPECT_CALL(*mMockTracker, currentPeriod()).WillOnce(Return(fakePeriod));
     EXPECT_CALL(*mMockTracker, nextAnticipatedVSyncTimeFrom(mFakeNow + numPeriodsOut * fakePeriod))
             .WillOnce(Return(fakeTimestamp));
-    EXPECT_THAT(mReactor.computeNextRefresh(numPeriodsOut), Eq(fakeTimestamp));
+    EXPECT_THAT(mReactor.computeNextRefresh(numPeriodsOut, mMockClock->now()), Eq(fakeTimestamp));
 }
 
 TEST_F(VSyncReactorTest, getPeriod) {
@@ -544,7 +545,9 @@ TEST_F(VSyncReactorTest, selfRemovingEventListenerStopsCallbacks) {
     class SelfRemovingCallback : public DispSync::Callback {
     public:
         SelfRemovingCallback(VSyncReactor& vsr) : mVsr(vsr) {}
-        void onDispSyncEvent(nsecs_t when) final { mVsr.removeEventListener(this, &when); }
+        void onDispSyncEvent(nsecs_t when, nsecs_t /*expectedVSyncTimestamp*/) final {
+            mVsr.removeEventListener(this, &when);
+        }
 
     private:
         VSyncReactor& mVsr;
@@ -659,6 +662,28 @@ TEST_F(VSyncReactorTest, periodChangeWithGivenVsyncPeriod) {
     EXPECT_TRUE(periodFlushed);
 
     EXPECT_TRUE(mReactor.addPresentFence(generateSignalledFenceWithTime(0)));
+}
+
+TEST_F(VSyncReactorTest, periodIsMeasuredIfIgnoringComposer) {
+    // Create a reactor which supports the kernel idle timer
+    auto idleReactor = VSyncReactor(std::make_unique<ClockWrapper>(mMockClock),
+                                    std::make_unique<VSyncDispatchWrapper>(mMockDispatch),
+                                    std::make_unique<VSyncTrackerWrapper>(mMockTracker),
+                                    kPendingLimit, true /* supportKernelIdleTimer */);
+
+    bool periodFlushed = true;
+    EXPECT_CALL(*mMockTracker, addVsyncTimestamp(_)).Times(2);
+    idleReactor.setIgnorePresentFences(true);
+
+    nsecs_t const newPeriod = 5000;
+    idleReactor.setPeriod(newPeriod);
+
+    EXPECT_TRUE(idleReactor.addResyncSample(0, 0, &periodFlushed));
+    EXPECT_FALSE(periodFlushed);
+    EXPECT_FALSE(idleReactor.addResyncSample(newPeriod, 0, &periodFlushed));
+    EXPECT_TRUE(periodFlushed);
+
+    EXPECT_TRUE(idleReactor.addPresentFence(generateSignalledFenceWithTime(0)));
 }
 
 using VSyncReactorDeathTest = VSyncReactorTest;

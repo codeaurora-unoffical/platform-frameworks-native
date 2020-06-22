@@ -23,9 +23,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <SurfaceFlingerProperties.h>
+#include <android-base/properties.h>
 #include <android/dlext.h>
 #include <android/hardware/configstore/1.0/ISurfaceFlingerConfigs.h>
-#include <android-base/properties.h>
 #include <configstore/Utils.h>
 #include <cutils/properties.h>
 #include <graphicsenv/GraphicsEnv.h>
@@ -251,18 +252,6 @@ bool Hal::Open() {
     result = LoadUpdatedDriver(&module);
     if (result == -ENOENT) {
         result = LoadBuiltinDriver(&module);
-        if (result != 0) {
-            // -ENOENT means the sphal namespace doesn't exist, not that there
-            // is a problem with the driver.
-            ALOGW_IF(
-                result != -ENOENT,
-                "Failed to load Vulkan driver into sphal namespace. This "
-                "usually means the driver has forbidden library dependencies."
-                "Please fix, this will soon stop working.");
-            result =
-                hw_get_module(HWVULKAN_HARDWARE_MODULE_ID,
-                              reinterpret_cast<const hw_module_t**>(&module));
-        }
     }
     if (result != 0) {
         android::GraphicsEnv::getInstance().setDriverLoaded(
@@ -959,9 +948,7 @@ VkResult EnumerateDeviceExtensionProperties(
         VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME,
         VK_KHR_INCREMENTAL_PRESENT_SPEC_VERSION});
 
-    bool hdrBoardConfig =
-        getBool<ISurfaceFlingerConfigs, &ISurfaceFlingerConfigs::hasHDRDisplay>(
-            false);
+    bool hdrBoardConfig = android::sysprop::has_HDR_display(false);
     if (hdrBoardConfig) {
         loader_extensions.push_back({VK_EXT_HDR_METADATA_EXTENSION_NAME,
                                      VK_EXT_HDR_METADATA_SPEC_VERSION});

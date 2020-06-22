@@ -31,9 +31,12 @@
 #include "SurfaceInterceptor.h"
 
 #include "FrameTracer/FrameTracer.h"
+#include "Scheduler/LayerHistory.h"
 #include "TimeStats/TimeStats.h"
 
+#include "frame_extn_intf.h"
 #include "smomo_interface.h"
+#include "layer_extn_intf.h"
 
 namespace android {
 
@@ -60,8 +63,9 @@ void BufferQueueLayer::onLayerDisplayed(const sp<Fence>& releaseFence) {
     }
 }
 
-void BufferQueueLayer::setTransformHint(uint32_t orientation) const {
-    mConsumer->setTransformHint(orientation);
+void BufferQueueLayer::setTransformHint(ui::Transform::RotationFlags displayTransformHint) {
+    BufferLayer::setTransformHint(displayTransformHint);
+    mConsumer->setTransformHint(mTransformHint);
 }
 
 std::vector<OccupancyTracker::Segment> BufferQueueLayer::getOccupancyHistory(bool forceFlush) {
@@ -130,6 +134,7 @@ bool BufferQueueLayer::shouldPresentNow(nsecs_t expectedPresentTime) const {
         bufferStats.queued_frames = getQueuedFrameCount();
         bufferStats.auto_timestamp = mQueueItems[0].mIsAutoTimestamp;
         bufferStats.timestamp = mQueueItems[0].mTimestamp;
+        bufferStats.dequeue_latency = 0;
         isDue = mFlinger->mSmoMo->ShouldPresentNow(bufferStats, expectedPresentTime);
     }
 
@@ -377,21 +382,6 @@ status_t BufferQueueLayer::updateFrameNumber(nsecs_t latchTime) {
     return NO_ERROR;
 }
 
-void BufferQueueLayer::preparePerFrameCompositionState() {
-    BufferLayer::preparePerFrameCompositionState();
-
-    auto* compositionState = editCompositionState();
-    if (compositionState->compositionType == Hwc2::IComposerClient::Composition::SIDEBAND) {
-        return;
-    }
-
-    compositionState->buffer = mBufferInfo.mBuffer;
-    compositionState->bufferSlot = (mBufferInfo.mBufferSlot == BufferQueue::INVALID_BUFFER_SLOT)
-            ? 0
-            : mBufferInfo.mBufferSlot;
-    compositionState->acquireFence = mBufferInfo.mFence;
-}
-
 // -----------------------------------------------------------------------
 // Interface implementation for BufferLayerConsumer::ContentsChangedListener
 // -----------------------------------------------------------------------
@@ -425,7 +415,8 @@ void BufferQueueLayer::onFrameAvailable(const BufferItem& item) {
     // Add this buffer from our internal queue tracker
     { // Autolock scope
         const nsecs_t presentTime = item.mIsAutoTimestamp ? 0 : item.mTimestamp;
-        mFlinger->mScheduler->recordLayerHistory(this, presentTime);
+        mFlinger->mScheduler->recordLayerHistory(this, presentTime,
+                                                 LayerHistory::LayerUpdateType::Buffer);
 
         Mutex::Autolock lock(mQueueItemLock);
         // Reset the frame number tracker when we receive the first buffer after
@@ -460,7 +451,35 @@ void BufferQueueLayer::onFrameAvailable(const BufferItem& item) {
         bufferStats.queued_frames = getQueuedFrameCount();
         bufferStats.auto_timestamp = item.mIsAutoTimestamp;
         bufferStats.timestamp = item.mTimestamp;
+        bufferStats.dequeue_latency = 0;
         mFlinger->mSmoMo->CollectLayerStats(bufferStats);
+    }
+
+    if (mFlinger->mFrameExtn && mFlinger->mDolphinFuncsEnabled) {
+        composer::FrameInfo frameInfo;
+        frameInfo.version.major = (uint8_t)(1);
+        frameInfo.version.minor = (uint8_t)(0);
+        frameInfo.max_queued_frames = mFlinger->mMaxQueuedFrames;
+        frameInfo.num_idle = mFlinger->mNumIdle;
+        frameInfo.max_queued_layer_name = mFlinger->mNameLayerMax;
+        frameInfo.current_timestamp = systemTime(SYSTEM_TIME_MONOTONIC);
+        frameInfo.previous_timestamp = mLastTimeStamp;
+        frameInfo.vsync_timestamp = mFlinger->mVsyncTimeStamp;
+        frameInfo.refresh_timestamp = mFlinger->mRefreshTimeStamp;
+        frameInfo.ref_latency = mFrameTracker.getPreviousGfxInfo();
+        {
+            Mutex::Autolock lock(mFlinger->mStateLock);
+            frameInfo.vsync_period = mFlinger->mVsyncPeriod;
+        }
+        mLastTimeStamp = frameInfo.current_timestamp;
+        {
+            Mutex::Autolock lock(mFlinger->mDolphinStateLock);
+            frameInfo.transparent_region = this->getVisibleNonTransparentRegion().isEmpty();
+        }
+        frameInfo.width = item.mGraphicBuffer->getWidth();
+        frameInfo.height = item.mGraphicBuffer->getHeight();
+        frameInfo.layer_name = this->getName().c_str();
+        mFlinger->mFrameExtn->SetFrameInfo(frameInfo);
     }
 
     mFlinger->signalLayerUpdate();
@@ -530,8 +549,8 @@ void BufferQueueLayer::onFirstRef() {
         mProducer->setMaxDequeuedBufferCount(2);
     }
 
-    if (const auto display = mFlinger->getDefaultDisplayDeviceLocked()) {
-        updateTransformHint(display);
+    if (mFlinger->mLayerExt) {
+        mLayerClass = mFlinger->mLayerExt->GetLayerClass(mName);
     }
 }
 

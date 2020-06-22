@@ -31,6 +31,23 @@ namespace android::scheduler {
 using AllRefreshRatesMapType = RefreshRateConfigs::AllRefreshRatesMapType;
 using RefreshRate = RefreshRateConfigs::RefreshRate;
 
+std::string RefreshRateConfigs::layerVoteTypeString(LayerVoteType vote) {
+    switch (vote) {
+        case LayerVoteType::NoVote:
+            return "NoVote";
+        case LayerVoteType::Min:
+            return "Min";
+        case LayerVoteType::Max:
+            return "Max";
+        case LayerVoteType::Heuristic:
+            return "Heuristic";
+        case LayerVoteType::ExplicitDefault:
+            return "ExplicitDefault";
+        case LayerVoteType::ExplicitExactOrMultiple:
+            return "ExplicitExactOrMultiple";
+    }
+}
+
 const RefreshRate& RefreshRateConfigs::getRefreshRateForContent(
         const std::vector<LayerRequirement>& layers) const {
     std::lock_guard lock(mLock);
@@ -53,12 +70,12 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContent(
     if (explicitContentFramerate != 0) {
         contentFramerate = explicitContentFramerate;
     } else if (contentFramerate == 0) {
-        contentFramerate = round<int>(mMaxSupportedRefreshRate->fps);
+        contentFramerate = round<int>(mMaxSupportedRefreshRate->getFps());
     }
     ATRACE_INT("ContentFPS", contentFramerate);
 
     // Find the appropriate refresh rate with minimal error
-    auto iter = min_element(mAvailableRefreshRates.cbegin(), mAvailableRefreshRates.cend(),
+    auto iter = min_element(mPrimaryRefreshRates.cbegin(), mPrimaryRefreshRates.cend(),
                             [contentFramerate](const auto& lhs, const auto& rhs) -> bool {
                                 return std::abs(lhs->fps - contentFramerate) <
                                         std::abs(rhs->fps - contentFramerate);
@@ -71,7 +88,7 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContent(
     constexpr float MARGIN = 0.05f;
     float ratio = (*iter)->fps / contentFramerate;
     if (std::abs(std::round(ratio) - ratio) > MARGIN) {
-        while (iter != mAvailableRefreshRates.cend()) {
+        while (iter != mPrimaryRefreshRates.cend()) {
             ratio = (*iter)->fps / contentFramerate;
 
             if (std::abs(std::round(ratio) - ratio) <= MARGIN) {
@@ -97,21 +114,14 @@ std::pair<nsecs_t, nsecs_t> RefreshRateConfigs::getDisplayFrames(nsecs_t layerPe
     return {displayFramesQuot, displayFramesRem};
 }
 
-const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
-        const std::vector<LayerRequirement>& layers, bool touchActive,
+const RefreshRate& RefreshRateConfigs::getBestRefreshRate(
+        const std::vector<LayerRequirement>& layers, bool touchActive, bool idle,
         bool* touchConsidered) const {
     ATRACE_CALL();
     ALOGV("getRefreshRateForContent %zu layers", layers.size());
 
-    *touchConsidered = false;
+    if (touchConsidered) *touchConsidered = false;
     std::lock_guard lock(mLock);
-
-    // If there are not layers, there is not content detection, so return the current
-    // refresh rate.
-    if (layers.empty()) {
-        *touchConsidered = touchActive;
-        return touchActive ? *mAvailableRefreshRates.back() : getCurrentRefreshRateByPolicyLocked();
-    }
 
     int noVoteLayers = 0;
     int minVoteLayers = 0;
@@ -135,30 +145,49 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
         }
     }
 
-    // Consider the touch event if there are no ExplicitDefault layers.
-    // ExplicitDefault are mostly interactive (as opposed to ExplicitExactOrMultiple)
-    // and therefore if those posted an explicit vote we should not change it
-    // if get get a touch event.
-    if (touchActive && explicitDefaultVoteLayers == 0) {
-        *touchConsidered = true;
-        return *mAvailableRefreshRates.back();
+    const bool hasExplicitVoteLayers =
+            explicitDefaultVoteLayers > 0 || explicitExactOrMultipleVoteLayers > 0;
+
+    // Consider the touch event if there are no Explicit* layers. Otherwise wait until after we've
+    // selected a refresh rate to see if we should apply touch boost.
+    if (touchActive && !hasExplicitVoteLayers) {
+        ALOGV("TouchBoost - choose %s", getMaxRefreshRateByPolicyLocked().getName().c_str());
+        if (touchConsidered) *touchConsidered = true;
+        return getMaxRefreshRateByPolicyLocked();
+    }
+
+    // If the primary range consists of a single refresh rate then we can only
+    // move out the of range if layers explicitly request a different refresh
+    // rate.
+    const Policy* policy = getCurrentPolicyLocked();
+    const bool primaryRangeIsSingleRate = policy->primaryRange.min == policy->primaryRange.max;
+
+    if (!touchActive && idle && !(primaryRangeIsSingleRate && hasExplicitVoteLayers)) {
+        ALOGV("Idle - choose %s", getMinRefreshRateByPolicyLocked().getName().c_str());
+        return getMinRefreshRateByPolicyLocked();
+    }
+
+    if (layers.empty() || noVoteLayers == layers.size()) {
+        return getMaxRefreshRateByPolicyLocked();
     }
 
     // Only if all layers want Min we should return Min
     if (noVoteLayers + minVoteLayers == layers.size()) {
-        return *mAvailableRefreshRates.front();
+        ALOGV("all layers Min - choose %s", getMinRefreshRateByPolicyLocked().getName().c_str());
+        return getMinRefreshRateByPolicyLocked();
     }
 
     // Find the best refresh rate based on score
     std::vector<std::pair<const RefreshRate*, float>> scores;
-    scores.reserve(mAvailableRefreshRates.size());
+    scores.reserve(mAppRequestRefreshRates.size());
 
-    for (const auto refreshRate : mAvailableRefreshRates) {
+    for (const auto refreshRate : mAppRequestRefreshRates) {
         scores.emplace_back(refreshRate, 0.0f);
     }
 
     for (const auto& layer : layers) {
-        ALOGV("Calculating score for %s (type: %d)", layer.name.c_str(), layer.vote);
+        ALOGV("Calculating score for %s (%s, weight %.2f)", layer.name.c_str(),
+              layerVoteTypeString(layer.vote).c_str(), layer.weight);
         if (layer.vote == LayerVoteType::NoVote || layer.vote == LayerVoteType::Min) {
             continue;
         }
@@ -166,6 +195,16 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
         auto weight = layer.weight;
 
         for (auto i = 0u; i < scores.size(); i++) {
+            bool inPrimaryRange =
+                    scores[i].first->inPolicy(policy->primaryRange.min, policy->primaryRange.max);
+            if ((primaryRangeIsSingleRate || !inPrimaryRange) &&
+                layer.vote != LayerVoteType::ExplicitDefault &&
+                layer.vote != LayerVoteType::ExplicitExactOrMultiple) {
+                // Only layers with explicit frame rate settings are allowed to score refresh rates
+                // outside the primary range.
+                continue;
+            }
+
             // If the layer wants Max, give higher score to the higher refresh rate
             if (layer.vote == LayerVoteType::Max) {
                 const auto ratio = scores[i].first->fps / scores.back().first->fps;
@@ -177,7 +216,7 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
                 continue;
             }
 
-            const auto displayPeriod = scores[i].first->vsyncPeriod;
+            const auto displayPeriod = scores[i].first->hwcConfig->getVsyncPeriod();
             const auto layerPeriod = round<nsecs_t>(1e9f / layer.desiredRefreshRate);
             if (layer.vote == LayerVoteType::ExplicitDefault) {
                 const auto layerScore = [&]() {
@@ -233,9 +272,9 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
 
                     return 1.0f / iter;
                 }();
-                ALOGV("%s (ExplicitExactOrMultiple, weight %.2f) %.2fHz gives %s score of %.2f",
-                      layer.name.c_str(), weight, 1e9f / layerPeriod, scores[i].first->name.c_str(),
-                      layerScore);
+                ALOGV("%s (%s, weight %.2f) %.2fHz gives %s score of %.2f", layer.name.c_str(),
+                      layerVoteTypeString(layer.vote).c_str(), weight, 1e9f / layerPeriod,
+                      scores[i].first->name.c_str(), layerScore);
                 scores[i].second += weight * layerScore;
                 continue;
             }
@@ -248,6 +287,32 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
     const RefreshRate* bestRefreshRate = maxVoteLayers > 0
             ? getBestRefreshRate(scores.rbegin(), scores.rend())
             : getBestRefreshRate(scores.begin(), scores.end());
+
+    if (primaryRangeIsSingleRate) {
+        // If we never scored any layers, then choose the rate from the primary
+        // range instead of picking a random score from the app range.
+        if (std::all_of(scores.begin(), scores.end(),
+                        [](std::pair<const RefreshRate*, float> p) { return p.second == 0; })) {
+            ALOGV("layers not scored - choose %s",
+                  getMaxRefreshRateByPolicyLocked().getName().c_str());
+            return getMaxRefreshRateByPolicyLocked();
+        } else {
+            return *bestRefreshRate;
+        }
+    }
+
+    // Consider the touch event if there are no ExplicitDefault layers. ExplicitDefault are mostly
+    // interactive (as opposed to ExplicitExactOrMultiple) and therefore if those posted an explicit
+    // vote we should not change it if we get a touch event. Only apply touch boost if it will
+    // actually increase the refresh rate over the normal selection.
+    const RefreshRate& touchRefreshRate = getMaxRefreshRateByPolicyLocked();
+
+    if (touchActive && explicitDefaultVoteLayers == 0 &&
+        bestRefreshRate->fps < touchRefreshRate.fps) {
+        if (touchConsidered) *touchConsidered = true;
+        ALOGV("TouchBoost - choose %s", touchRefreshRate.getName().c_str());
+        return touchRefreshRate;
+    }
 
     return *bestRefreshRate;
 }
@@ -278,12 +343,20 @@ const AllRefreshRatesMapType& RefreshRateConfigs::getAllRefreshRates() const {
 
 const RefreshRate& RefreshRateConfigs::getMinRefreshRateByPolicy() const {
     std::lock_guard lock(mLock);
-    return *mAvailableRefreshRates.front();
+    return getMinRefreshRateByPolicyLocked();
+}
+
+const RefreshRate& RefreshRateConfigs::getMinRefreshRateByPolicyLocked() const {
+    return *mPrimaryRefreshRates.front();
 }
 
 const RefreshRate& RefreshRateConfigs::getMaxRefreshRateByPolicy() const {
     std::lock_guard lock(mLock);
-        return *mAvailableRefreshRates.back();
+    return getMaxRefreshRateByPolicyLocked();
+}
+
+const RefreshRate& RefreshRateConfigs::getMaxRefreshRateByPolicyLocked() const {
+    return *mPrimaryRefreshRates.back();
 }
 
 const RefreshRate& RefreshRateConfigs::getCurrentRefreshRate() const {
@@ -297,8 +370,8 @@ const RefreshRate& RefreshRateConfigs::getCurrentRefreshRateByPolicy() const {
 }
 
 const RefreshRate& RefreshRateConfigs::getCurrentRefreshRateByPolicyLocked() const {
-    if (std::find(mAvailableRefreshRates.begin(), mAvailableRefreshRates.end(),
-                  mCurrentRefreshRate) != mAvailableRefreshRates.end()) {
+    if (std::find(mAppRequestRefreshRates.begin(), mAppRequestRefreshRates.end(),
+                  mCurrentRefreshRate) != mAppRequestRefreshRates.end()) {
         return *mCurrentRefreshRate;
     }
     return *mRefreshRates.at(getCurrentPolicyLocked()->defaultConfig);
@@ -309,21 +382,30 @@ void RefreshRateConfigs::setCurrentConfigId(HwcConfigIndexType configId) {
     mCurrentRefreshRate = mRefreshRates.at(configId).get();
 }
 
-RefreshRateConfigs::RefreshRateConfigs(const std::vector<InputConfig>& configs,
-                                       HwcConfigIndexType currentHwcConfig) {
-    init(configs, currentHwcConfig);
-}
-
 RefreshRateConfigs::RefreshRateConfigs(
         const std::vector<std::shared_ptr<const HWC2::Display::Config>>& configs,
         HwcConfigIndexType currentConfigId) {
-    std::vector<InputConfig> inputConfigs;
-    for (size_t configId = 0; configId < configs.size(); ++configId) {
-        auto configGroup = HwcConfigGroupType(configs[configId]->getConfigGroup());
-        inputConfigs.push_back({HwcConfigIndexType(static_cast<int>(configId)), configGroup,
-                                configs[configId]->getVsyncPeriod()});
+    LOG_ALWAYS_FATAL_IF(configs.empty());
+    LOG_ALWAYS_FATAL_IF(currentConfigId.value() >= configs.size());
+
+    for (auto configId = HwcConfigIndexType(0); configId.value() < configs.size(); configId++) {
+        const auto& config = configs.at(static_cast<size_t>(configId.value()));
+        const float fps = 1e9f / config->getVsyncPeriod();
+        mRefreshRates.emplace(configId,
+                              std::make_unique<RefreshRate>(configId, config,
+                                                            base::StringPrintf("%.0ffps", fps), fps,
+                                                            RefreshRate::ConstructorTag(0)));
+        if (configId == currentConfigId) {
+            mCurrentRefreshRate = mRefreshRates.at(configId).get();
+        }
     }
-    init(inputConfigs, currentConfigId);
+
+    std::vector<const RefreshRate*> sortedConfigs;
+    getSortedRefreshRateList([](const RefreshRate&) { return true; }, &sortedConfigs);
+    mDisplayManagerPolicy.defaultConfig = currentConfigId;
+    mMinSupportedRefreshRate = sortedConfigs.front();
+    mMaxSupportedRefreshRate = sortedConfigs.back();
+    constructAvailableRefreshRates();
 }
 
 bool RefreshRateConfigs::isPolicyValid(const Policy& policy) {
@@ -333,10 +415,11 @@ bool RefreshRateConfigs::isPolicyValid(const Policy& policy) {
         return false;
     }
     const RefreshRate& refreshRate = *iter->second;
-    if (!refreshRate.inPolicy(policy.minRefreshRate, policy.maxRefreshRate)) {
+    if (!refreshRate.inPolicy(policy.primaryRange.min, policy.primaryRange.max)) {
         return false;
     }
-    return true;
+    return policy.appRequestRange.min <= policy.primaryRange.min &&
+            policy.appRequestRange.max >= policy.primaryRange.max;
 }
 
 status_t RefreshRateConfigs::setDisplayManagerPolicy(const Policy& policy) {
@@ -383,7 +466,7 @@ RefreshRateConfigs::Policy RefreshRateConfigs::getDisplayManagerPolicy() const {
 
 bool RefreshRateConfigs::isConfigAllowed(HwcConfigIndexType config) const {
     std::lock_guard lock(mLock);
-    for (const RefreshRate* refreshRate : mAvailableRefreshRates) {
+    for (const RefreshRate* refreshRate : mAppRequestRefreshRates) {
         if (refreshRate->configId == config) {
             return true;
         }
@@ -406,10 +489,13 @@ void RefreshRateConfigs::getSortedRefreshRateList(
 
     std::sort(outRefreshRates->begin(), outRefreshRates->end(),
               [](const auto refreshRate1, const auto refreshRate2) {
-                  if (refreshRate1->vsyncPeriod != refreshRate2->vsyncPeriod) {
-                      return refreshRate1->vsyncPeriod > refreshRate2->vsyncPeriod;
+                  if (refreshRate1->hwcConfig->getVsyncPeriod() !=
+                      refreshRate2->hwcConfig->getVsyncPeriod()) {
+                      return refreshRate1->hwcConfig->getVsyncPeriod() >
+                              refreshRate2->hwcConfig->getVsyncPeriod();
                   } else {
-                      return refreshRate1->configGroup > refreshRate2->configGroup;
+                      return refreshRate1->hwcConfig->getConfigGroup() >
+                              refreshRate2->hwcConfig->getConfigGroup();
                   }
               });
 }
@@ -417,53 +503,45 @@ void RefreshRateConfigs::getSortedRefreshRateList(
 void RefreshRateConfigs::constructAvailableRefreshRates() {
     // Filter configs based on current policy and sort based on vsync period
     const Policy* policy = getCurrentPolicyLocked();
-    HwcConfigGroupType group = mRefreshRates.at(policy->defaultConfig)->configGroup;
-    ALOGV("constructAvailableRefreshRates: default %d group %d min %.2f max %.2f",
-          policy->defaultConfig.value(), group.value(), policy->minRefreshRate,
-          policy->maxRefreshRate);
-    getSortedRefreshRateList(
-            [&](const RefreshRate& refreshRate) REQUIRES(mLock) {
-                return (policy->allowGroupSwitching || refreshRate.configGroup == group) &&
-                        refreshRate.inPolicy(policy->minRefreshRate, policy->maxRefreshRate);
-            },
-            &mAvailableRefreshRates);
+    const auto& defaultConfig = mRefreshRates.at(policy->defaultConfig)->hwcConfig;
+    ALOGV("constructAvailableRefreshRates: default %d group %d primaryRange=[%.2f %.2f]"
+          " appRequestRange=[%.2f %.2f]",
+          policy->defaultConfig.value(), defaultConfig->getConfigGroup(), policy->primaryRange.min,
+          policy->primaryRange.max, policy->appRequestRange.min, policy->appRequestRange.max);
 
-    std::string availableRefreshRates;
-    for (const auto& refreshRate : mAvailableRefreshRates) {
-        base::StringAppendF(&availableRefreshRates, "%s ", refreshRate->name.c_str());
-    }
+    auto filterRefreshRates = [&](float min, float max, const char* listName,
+                                  std::vector<const RefreshRate*>* outRefreshRates) {
+        getSortedRefreshRateList(
+                [&](const RefreshRate& refreshRate) REQUIRES(mLock) {
+                    const auto& hwcConfig = refreshRate.hwcConfig;
 
-    ALOGV("Available refresh rates: %s", availableRefreshRates.c_str());
-    LOG_ALWAYS_FATAL_IF(mAvailableRefreshRates.empty(),
-                        "No compatible display configs for default=%d min=%.0f max=%.0f",
-                        policy->defaultConfig.value(), policy->minRefreshRate,
-                        policy->maxRefreshRate);
-}
+                    return hwcConfig->getHeight() == defaultConfig->getHeight() &&
+                            hwcConfig->getWidth() == defaultConfig->getWidth() &&
+                            hwcConfig->getDpiX() == defaultConfig->getDpiX() &&
+                            hwcConfig->getDpiY() == defaultConfig->getDpiY() &&
+                            (policy->allowGroupSwitching ||
+                             hwcConfig->getConfigGroup() == defaultConfig->getConfigGroup()) &&
+                            refreshRate.inPolicy(min, max);
+                },
+                outRefreshRates);
 
-// NO_THREAD_SAFETY_ANALYSIS since this is called from the constructor
-void RefreshRateConfigs::init(const std::vector<InputConfig>& configs,
-                              HwcConfigIndexType currentHwcConfig) NO_THREAD_SAFETY_ANALYSIS {
-    LOG_ALWAYS_FATAL_IF(configs.empty());
-    LOG_ALWAYS_FATAL_IF(currentHwcConfig.value() >= configs.size());
+        LOG_ALWAYS_FATAL_IF(outRefreshRates->empty(),
+                            "No matching configs for %s range: min=%.0f max=%.0f", listName, min,
+                            max);
+        auto stringifyRefreshRates = [&]() -> std::string {
+            std::string str;
+            for (auto refreshRate : *outRefreshRates) {
+                base::StringAppendF(&str, "%s ", refreshRate->name.c_str());
+            }
+            return str;
+        };
+        ALOGV("%s refresh rates: %s", listName, stringifyRefreshRates().c_str());
+    };
 
-    for (const auto& config : configs) {
-        const float fps = 1e9f / config.vsyncPeriod;
-        mRefreshRates.emplace(config.configId,
-                              std::make_unique<RefreshRate>(config.configId, config.vsyncPeriod,
-                                                            config.configGroup,
-                                                            base::StringPrintf("%2.ffps", fps),
-                                                            fps));
-        if (config.configId == currentHwcConfig) {
-            mCurrentRefreshRate = mRefreshRates.at(config.configId).get();
-        }
-    }
-
-    std::vector<const RefreshRate*> sortedConfigs;
-    getSortedRefreshRateList([](const RefreshRate&) { return true; }, &sortedConfigs);
-    mDisplayManagerPolicy.defaultConfig = currentHwcConfig;
-    mMinSupportedRefreshRate = sortedConfigs.front();
-    mMaxSupportedRefreshRate = sortedConfigs.back();
-    constructAvailableRefreshRates();
+    filterRefreshRates(policy->primaryRange.min, policy->primaryRange.max, "primary",
+                       &mPrimaryRefreshRates);
+    filterRefreshRates(policy->appRequestRange.min, policy->appRequestRange.max, "app request",
+                       &mAppRequestRefreshRates);
 }
 
 } // namespace android::scheduler

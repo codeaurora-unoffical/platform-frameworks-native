@@ -25,6 +25,7 @@
 #include <aidl/android/hardware/graphics/common/Interlaced.h>
 #include <aidl/android/hardware/graphics/common/PlaneLayout.h>
 #include <aidl/android/hardware/graphics/common/PlaneLayoutComponentType.h>
+#include <aidl/android/hardware/graphics/common/Rect.h>
 #include <aidl/android/hardware/graphics/common/Smpte2086.h>
 #include <aidl/android/hardware/graphics/common/StandardMetadataType.h>
 #include <aidl/android/hardware/graphics/common/XyColor.h>
@@ -429,6 +430,12 @@ static const aidl::android::hardware::graphics::common::ExtendableType PlaneLayo
         {GRALLOC4_STANDARD_PLANE_LAYOUT_COMPONENT_TYPE,
          static_cast<int64_t>(
                  aidl::android::hardware::graphics::common::PlaneLayoutComponentType::A)};
+
+static const aidl::android::hardware::graphics::common::ExtendableType
+        PlaneLayoutComponentType_RAW =
+                {GRALLOC4_STANDARD_PLANE_LAYOUT_COMPONENT_TYPE,
+                 static_cast<int64_t>(
+                         aidl::android::hardware::graphics::common::PlaneLayoutComponentType::RAW)};
 
 /*---------------------------------------------------------------------------------------------*/
 

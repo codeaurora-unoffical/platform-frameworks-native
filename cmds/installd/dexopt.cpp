@@ -262,6 +262,17 @@ static std::string MapPropertyToArg(const std::string& property,
   return "";
 }
 
+static std::string MapPropertyToArgWithBackup(const std::string& property,
+                                              const std::string& backupProperty,
+                                              const std::string& format,
+                                              const std::string& default_value = "") {
+  std::string value = GetProperty(property, default_value);
+  if (!value.empty()) {
+    return StringPrintf(format.c_str(), value.c_str());
+  }
+  return MapPropertyToArg(backupProperty, format, default_value);
+}
+
 // Determines which binary we should use for execution (the debug or non-debug version).
 // e.g. dex2oatd vs dex2oat
 static const char* select_execution_binary(const char* binary, const char* debug_binary,
@@ -307,6 +318,16 @@ static const char* kJitZygoteImage =
 // Phenotype property name for enabling profiling the boot class path.
 static const char* PROFILE_BOOT_CLASS_PATH = "profilebootclasspath";
 
+static bool IsBootClassPathProfilingEnable() {
+    std::string profile_boot_class_path = GetProperty("dalvik.vm.profilebootclasspath", "");
+    profile_boot_class_path =
+        server_configurable_flags::GetServerConfigurableFlag(
+            RUNTIME_NATIVE_BOOT_NAMESPACE,
+            PROFILE_BOOT_CLASS_PATH,
+            /*default_value=*/ profile_boot_class_path);
+    return profile_boot_class_path == "true";
+}
+
 class RunDex2Oat : public ExecVHelper {
   public:
     RunDex2Oat(int zip_fd,
@@ -321,6 +342,7 @@ class RunDex2Oat : public ExecVHelper {
                const char* compiler_filter,
                bool debuggable,
                bool post_bootcomplete,
+               bool for_restore,
                bool background_job_compile,
                int profile_fd,
                const char* class_loader_context,
@@ -336,14 +358,24 @@ class RunDex2Oat : public ExecVHelper {
         std::string dex2oat_Xms_arg = MapPropertyToArg("dalvik.vm.dex2oat-Xms", "-Xms%s");
         std::string dex2oat_Xmx_arg = MapPropertyToArg("dalvik.vm.dex2oat-Xmx", "-Xmx%s");
 
-        const char* threads_property = post_bootcomplete
-                ? "dalvik.vm.dex2oat-threads"
-                : "dalvik.vm.boot-dex2oat-threads";
-        std::string dex2oat_threads_arg = MapPropertyToArg(threads_property, "-j%s");
-        const char* cpu_set_property = post_bootcomplete
-                ? "dalvik.vm.dex2oat-cpu-set"
-                : "dalvik.vm.boot-dex2oat-cpu-set";
-        std::string dex2oat_cpu_set_arg = MapPropertyToArg(cpu_set_property, "--cpu-set=%s");
+        std::string threads_format = "-j%s";
+        std::string dex2oat_threads_arg = post_bootcomplete
+                ? (for_restore
+                    ? MapPropertyToArgWithBackup(
+                            "dalvik.vm.restore-dex2oat-threads",
+                            "dalvik.vm.dex2oat-threads",
+                            threads_format)
+                    : MapPropertyToArg("dalvik.vm.dex2oat-threads", threads_format))
+                : MapPropertyToArg("dalvik.vm.boot-dex2oat-threads", threads_format);
+        std::string cpu_set_format = "--cpu-set=%s";
+        std::string dex2oat_cpu_set_arg = post_bootcomplete
+                ? (for_restore
+                    ? MapPropertyToArgWithBackup(
+                            "dalvik.vm.restore-dex2oat-cpu-set",
+                            "dalvik.vm.dex2oat-cpu-set",
+                            cpu_set_format)
+                    : MapPropertyToArg("dalvik.vm.dex2oat-cpu-set", cpu_set_format))
+                : MapPropertyToArg("dalvik.vm.boot-dex2oat-cpu-set", cpu_set_format);
 
         std::string bootclasspath;
         char* dex2oat_bootclasspath = getenv("DEX2OATBOOTCLASSPATH");
@@ -407,8 +439,17 @@ class RunDex2Oat : public ExecVHelper {
             MapPropertyToArg("dalvik.vm.dex2oat-very-large", "--very-large-app-threshold=%s");
 
 
+
+        // Decide whether to use dex2oat64.
+        bool use_dex2oat64 = false;
+        // Check whether the device even supports 64-bit ABIs.
+        if (!GetProperty("ro.product.cpu.abilist64", "").empty()) {
+          use_dex2oat64 = GetBoolProperty("dalvik.vm.dex2oat64.enabled", false);
+        }
         const char* dex2oat_bin = select_execution_binary(
-            kDex2oatPath, kDex2oatDebugPath, background_job_compile);
+            (use_dex2oat64 ? kDex2oat64Path : kDex2oat32Path),
+            (use_dex2oat64 ? kDex2oatDebug64Path : kDex2oatDebug32Path),
+            background_job_compile);
 
         bool generate_minidebug_info = kEnableMinidebugInfo &&
                 GetBoolProperty(kMinidebugInfoSystemProperty, kMinidebugInfoSystemPropertyDefault);
@@ -419,14 +460,7 @@ class RunDex2Oat : public ExecVHelper {
                                                                  ENABLE_JITZYGOTE_IMAGE,
                                                                  /*default_value=*/ "");
 
-        std::string profile_boot_class_path = GetProperty("dalvik.vm.profilebootclasspath", "");
-        profile_boot_class_path =
-            server_configurable_flags::GetServerConfigurableFlag(
-                RUNTIME_NATIVE_BOOT_NAMESPACE,
-                PROFILE_BOOT_CLASS_PATH,
-                /*default_value=*/ profile_boot_class_path);
-
-        if (use_jitzygote_image == "true" || profile_boot_class_path == "true") {
+        if (use_jitzygote_image == "true" || IsBootClassPathProfilingEnable()) {
           boot_image = StringPrintf("--boot-image=%s", kJitZygoteImage);
         } else {
           boot_image = MapPropertyToArg("dalvik.vm.boot-image", "--boot-image=%s");
@@ -865,7 +899,15 @@ static bool analyze_profiles(uid_t uid, const std::string& package_name,
     }
 
     RunProfman profman_merge;
-    profman_merge.SetupMerge(profiles_fd, reference_profile_fd);
+    const std::vector<unique_fd>& apk_fds = std::vector<unique_fd>();
+    const std::vector<std::string>& dex_locations = std::vector<std::string>();
+    profman_merge.SetupMerge(
+            profiles_fd,
+            reference_profile_fd,
+            apk_fds,
+            dex_locations,
+            /* for_snapshot= */ false,
+            IsBootClassPathProfilingEnable());
     pid_t pid = fork();
     if (pid == 0) {
         /* child -- drop privileges before continuing */
@@ -2075,6 +2117,7 @@ int dexopt(const char* dex_path, uid_t uid, const char* pkgname, const char* ins
     bool enable_hidden_api_checks = (dexopt_flags & DEXOPT_ENABLE_HIDDEN_API_CHECKS) != 0;
     bool generate_compact_dex = (dexopt_flags & DEXOPT_GENERATE_COMPACT_DEX) != 0;
     bool generate_app_image = (dexopt_flags & DEXOPT_GENERATE_APP_IMAGE) != 0;
+    bool for_restore = (dexopt_flags & DEXOPT_FOR_RESTORE) != 0;
 
     // Check if we're dealing with a secondary dex file and if we need to compile it.
     std::string oat_dir_str;
@@ -2191,6 +2234,7 @@ int dexopt(const char* dex_path, uid_t uid, const char* pkgname, const char* ins
                       compiler_filter,
                       debuggable,
                       boot_complete,
+                      for_restore,
                       background_job_compile,
                       reference_profile_fd.get(),
                       class_loader_context,
@@ -2777,7 +2821,13 @@ static bool create_app_profile_snapshot(int32_t app_id,
     }
 
     RunProfman args;
-    args.SetupMerge(profiles_fd, snapshot_fd, apk_fds, dex_locations, /*for_snapshot=*/true);
+    // This is specifically a snapshot for an app, so don't use boot image profiles.
+    args.SetupMerge(profiles_fd,
+            snapshot_fd,
+            apk_fds,
+            dex_locations,
+            /* for_snapshot= */ true,
+            /* for_boot_image= */ false);
     pid_t pid = fork();
     if (pid == 0) {
         /* child -- drop privileges before continuing */

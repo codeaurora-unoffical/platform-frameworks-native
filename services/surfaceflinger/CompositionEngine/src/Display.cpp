@@ -259,6 +259,7 @@ void Display::chooseCompositionStrategy() {
         applyChangedTypesToLayers(changes->changedTypes);
         applyDisplayRequests(changes->displayRequests);
         applyLayerRequestsToLayers(changes->layerRequests);
+        applyClientTargetRequests(changes->clientTargetProperty);
     }
 
     // Determine what type of composition we are doing from the final state
@@ -268,12 +269,9 @@ void Display::chooseCompositionStrategy() {
 }
 
 bool Display::getSkipColorTransform() const {
-    if (!mId) {
-        return false;
-    }
-
-    auto& hwc = getCompositionEngine().getHwComposer();
-    return hwc.hasDisplayCapability(*mId, HWC2::DisplayCapability::SkipClientColorTransform);
+    const auto& hwc = getCompositionEngine().getHwComposer();
+    return mId ? hwc.hasDisplayCapability(*mId, hal::DisplayCapability::SKIP_CLIENT_COLOR_TRANSFORM)
+               : hwc.hasCapability(hal::Capability::SKIP_CLIENT_COLOR_TRANSFORM);
 }
 
 bool Display::anyLayersRequireClientComposition() const {
@@ -309,7 +307,7 @@ void Display::applyChangedTypesToLayers(const ChangedTypes& changedTypes) {
 void Display::applyDisplayRequests(const DisplayRequests& displayRequests) {
     auto& state = editState();
     state.flipClientTarget = (static_cast<uint32_t>(displayRequests) &
-                              static_cast<uint32_t>(HWC2::DisplayRequest::FlipClientTarget)) != 0;
+                              static_cast<uint32_t>(hal::DisplayRequest::FLIP_CLIENT_TARGET)) != 0;
     // Note: HWC2::DisplayRequest::WriteClientTargetToOutput is currently ignored.
 }
 
@@ -327,6 +325,16 @@ void Display::applyLayerRequestsToLayers(const LayerRequests& layerRequests) {
                     static_cast<Hwc2::IComposerClient::LayerRequest>(it->second));
         }
     }
+}
+
+void Display::applyClientTargetRequests(const ClientTargetProperty& clientTargetProperty) {
+    if (clientTargetProperty.dataspace == ui::Dataspace::UNKNOWN) {
+        return;
+    }
+    auto outputState = editState();
+    outputState.dataspace = clientTargetProperty.dataspace;
+    getRenderSurface()->setBufferDataspace(clientTargetProperty.dataspace);
+    getRenderSurface()->setBufferPixelFormat(clientTargetProperty.pixelFormat);
 }
 
 compositionengine::Output::FrameFences Display::presentAndGetFrameFences() {

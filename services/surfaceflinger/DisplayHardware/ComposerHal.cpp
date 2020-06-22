@@ -119,6 +119,16 @@ Error unwrapRet(Return<Error>& ret)
 
 namespace impl {
 
+void Composer::CommandWriter::setLayerType(uint32_t type)
+{
+    constexpr uint16_t kSetLayerTypeLength = 1;
+    beginCommand(static_cast<V2_1::IComposerClient::Command>(
+                         IQtiComposerClient::Command::SET_LAYER_TYPE),
+                 kSetLayerTypeLength);
+    write(type);
+    endCommand();
+}
+
 #if defined(USE_VR_COMPOSER) && USE_VR_COMPOSER
 Composer::CommandWriter::CommandWriter(uint32_t initialMaxSize)
     : CommandWriterBase(initialMaxSize) {}
@@ -895,6 +905,19 @@ Error Composer::setLayerInfo(Display display, Layer layer, uint32_t, uint32_t) {
 }
 #endif // defined(USE_VR_COMPOSER) && USE_VR_COMPOSER
 
+Error Composer::setLayerType(Display display, Layer layer, uint32_t type)
+{
+    if (mClient_2_4) {
+        if (sp<IQtiComposerClient> qClient = IQtiComposerClient::castFrom(mClient_2_4)) {
+            mWriter.selectDisplay(display);
+            mWriter.selectLayer(layer);
+            mWriter.setLayerType(type);
+        }
+    }
+
+    return Error::NONE;
+}
+
 Error Composer::execute()
 {
     // prepare input command queue
@@ -1378,6 +1401,12 @@ V2_4::Error Composer::getLayerGenericMetadataKeys(
     return error;
 }
 
+Error Composer::getClientTargetProperty(
+        Display display, IComposerClient::ClientTargetProperty* outClientTargetProperty) {
+    mReader.takeClientTargetProperty(display, outClientTargetProperty);
+    return Error::NONE;
+}
+
 CommandReader::~CommandReader()
 {
     resetData();
@@ -1686,10 +1715,22 @@ void CommandReader::takePresentOrValidateStage(Display display, uint32_t* state)
     *state = data.presentOrValidateState;
 }
 
+void CommandReader::takeClientTargetProperty(
+        Display display, IComposerClient::ClientTargetProperty* outClientTargetProperty) {
+    auto found = mReturnData.find(display);
+
+    // If not found, return the default values.
+    if (found == mReturnData.end()) {
+        outClientTargetProperty->pixelFormat = PixelFormat::RGBA_8888;
+        outClientTargetProperty->dataspace = Dataspace::UNKNOWN;
+    }
+
+    ReturnData& data = found->second;
+    *outClientTargetProperty = data.clientTargetProperty;
+}
+
 } // namespace impl
-
 } // namespace Hwc2
-
 } // namespace android
 
 // TODO(b/129481165): remove the #pragma below and fix conversion issues

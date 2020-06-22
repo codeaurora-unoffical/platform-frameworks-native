@@ -65,6 +65,7 @@ public:
 
         struct VSync {
             uint32_t count;
+            nsecs_t expectedVSyncTimestamp;
         };
 
         struct Hotplug {
@@ -146,9 +147,10 @@ public:
     status_t requestNextVsync();
 
     /*
-     * toggleConfigEvents() toggles delivery of config change events.
+     * requestLatestConfig() force-requests the current config for the primary
+     * display.
      */
-    status_t toggleConfigEvents(ISurfaceComposer::ConfigChanged configChangeFlag);
+    status_t requestLatestConfig();
 
 private:
     sp<IDisplayEventConnection> mEventConnection;

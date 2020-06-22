@@ -36,14 +36,15 @@ class PredictedVsyncTracer;
 class VSyncReactor : public android::DispSync {
 public:
     VSyncReactor(std::unique_ptr<Clock> clock, std::unique_ptr<VSyncDispatch> dispatch,
-                 std::unique_ptr<VSyncTracker> tracker, size_t pendingFenceLimit);
+                 std::unique_ptr<VSyncTracker> tracker, size_t pendingFenceLimit,
+                 bool supportKernelIdleTimer);
     ~VSyncReactor();
 
     bool addPresentFence(const std::shared_ptr<FenceTime>& fence) final;
     void setIgnorePresentFences(bool ignoration) final;
 
-    nsecs_t computeNextRefresh(int periodOffset) const final;
-    nsecs_t expectedPresentTime() final;
+    nsecs_t computeNextRefresh(int periodOffset, nsecs_t now) const final;
+    nsecs_t expectedPresentTime(nsecs_t now) final;
 
     void setPeriod(nsecs_t period) final;
     nsecs_t getPeriod() final;
@@ -89,6 +90,7 @@ private:
             GUARDED_BY(mMutex);
 
     const std::unique_ptr<PredictedVsyncTracer> mPredictedVsyncTracer;
+    const bool mSupportKernelIdleTimer = false;
 };
 
 class SystemClock : public Clock {

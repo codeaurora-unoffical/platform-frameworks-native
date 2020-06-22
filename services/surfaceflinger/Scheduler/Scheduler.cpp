@@ -62,19 +62,19 @@
 
 namespace android {
 
-std::unique_ptr<DispSync> createDispSync() {
+std::unique_ptr<DispSync> createDispSync(bool supportKernelTimer) {
     // TODO (140302863) remove this and use the vsync_reactor system.
     if (property_get_bool("debug.sf.vsync_reactor", true)) {
         // TODO (144707443) tune Predictor tunables.
-        static constexpr int default_rate = 60;
-        static constexpr auto initial_period =
-                std::chrono::duration<nsecs_t, std::ratio<1, default_rate>>(1);
+        static constexpr int defaultRate = 60;
+        static constexpr auto initialPeriod =
+                std::chrono::duration<nsecs_t, std::ratio<1, defaultRate>>(1);
         static constexpr size_t vsyncTimestampHistorySize = 20;
         static constexpr size_t minimumSamplesForPrediction = 6;
         static constexpr uint32_t discardOutlierPercent = 20;
         auto tracker = std::make_unique<
                 scheduler::VSyncPredictor>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                   initial_period)
+                                                   initialPeriod)
                                                    .count(),
                                            vsyncTimestampHistorySize, minimumSamplesForPrediction,
                                            discardOutlierPercent);
@@ -90,7 +90,7 @@ std::unique_ptr<DispSync> createDispSync() {
         static constexpr size_t pendingFenceLimit = 20;
         return std::make_unique<scheduler::VSyncReactor>(std::make_unique<scheduler::SystemClock>(),
                                                          std::move(dispatch), std::move(tracker),
-                                                         pendingFenceLimit);
+                                                         pendingFenceLimit, supportKernelTimer);
     } else {
         return std::make_unique<impl::DispSync>("SchedulerDispSync",
                                                 sysprop::running_without_sync_framework(true));
@@ -101,9 +101,9 @@ Scheduler::Scheduler(impl::EventControlThread::SetVSyncEnabledFunction function,
                      const scheduler::RefreshRateConfigs& refreshRateConfig,
                      ISchedulerCallback& schedulerCallback, bool useContentDetectionV2,
                      bool useContentDetection)
-      : mPrimaryDispSync(createDispSync()),
+      : mSupportKernelTimer(sysprop::support_kernel_idle_timer(false)),
+        mPrimaryDispSync(createDispSync(mSupportKernelTimer)),
         mEventControlThread(new impl::EventControlThread(std::move(function))),
-        mSupportKernelTimer(sysprop::support_kernel_idle_timer(false)),
         mSchedulerCallback(schedulerCallback),
         mRefreshRateConfigs(refreshRateConfig),
         mUseContentDetection(useContentDetection),
@@ -151,9 +151,9 @@ Scheduler::Scheduler(std::unique_ptr<DispSync> primaryDispSync,
                      const scheduler::RefreshRateConfigs& configs,
                      ISchedulerCallback& schedulerCallback, bool useContentDetectionV2,
                      bool useContentDetection)
-      : mPrimaryDispSync(std::move(primaryDispSync)),
+      : mSupportKernelTimer(false),
+        mPrimaryDispSync(std::move(primaryDispSync)),
         mEventControlThread(std::move(eventControlThread)),
-        mSupportKernelTimer(false),
         mSchedulerCallback(schedulerCallback),
         mRefreshRateConfigs(configs),
         mUseContentDetection(useContentDetection),
@@ -250,7 +250,7 @@ void Scheduler::setPhaseOffset(ConnectionHandle handle, nsecs_t phaseOffset) {
 }
 
 void Scheduler::getDisplayStatInfo(DisplayStatInfo* stats) {
-    stats->vsyncTime = mPrimaryDispSync->computeNextRefresh(0);
+    stats->vsyncTime = mPrimaryDispSync->computeNextRefresh(0, systemTime());
     stats->vsyncPeriod = mPrimaryDispSync->getPeriod();
 }
 
@@ -276,12 +276,12 @@ Scheduler::ConnectionHandle Scheduler::enableVSyncInjection(bool enable) {
     return mInjectorConnectionHandle;
 }
 
-bool Scheduler::injectVSync(nsecs_t when) {
+bool Scheduler::injectVSync(nsecs_t when, nsecs_t expectedVSyncTime) {
     if (!mInjectVSyncs || !mVSyncInjector) {
         return false;
     }
 
-    mVSyncInjector->onInjectSyncEvent(when);
+    mVSyncInjector->onInjectSyncEvent(when, expectedVSyncTime);
     return true;
 }
 
@@ -306,7 +306,7 @@ void Scheduler::disableHardwareVsync(bool makeUnavailable) {
     }
 }
 
-void Scheduler::resyncToHardwareVsync(bool makeAvailable, nsecs_t period) {
+void Scheduler::resyncToHardwareVsync(bool makeAvailable, nsecs_t period, bool force_resync) {
     {
         std::lock_guard<std::mutex> lock(mHWVsyncLock);
         if (makeAvailable) {
@@ -322,7 +322,7 @@ void Scheduler::resyncToHardwareVsync(bool makeAvailable, nsecs_t period) {
         return;
     }
 
-    setVsyncPeriod(period);
+    setVsyncPeriod(period, force_resync);
 }
 
 void Scheduler::resync() {
@@ -332,15 +332,15 @@ void Scheduler::resync() {
     const nsecs_t last = mLastResyncTime.exchange(now);
 
     if (now - last > kIgnoreDelay) {
-        resyncToHardwareVsync(false, mRefreshRateConfigs.getCurrentRefreshRate().vsyncPeriod);
+        resyncToHardwareVsync(false, mRefreshRateConfigs.getCurrentRefreshRate().getVsyncPeriod());
     }
 }
 
-void Scheduler::setVsyncPeriod(nsecs_t period) {
+void Scheduler::setVsyncPeriod(nsecs_t period, bool force_resync) {
     std::lock_guard<std::mutex> lock(mHWVsyncLock);
     mPrimaryDispSync->setPeriod(period);
 
-    if (!mPrimaryHWVsyncEnabled) {
+    if (!mPrimaryHWVsyncEnabled || force_resync) {
         mPrimaryDispSync->beginResync();
         mEventControlThread->setVsyncEnabled(true);
         mPrimaryHWVsyncEnabled = true;
@@ -378,53 +378,55 @@ void Scheduler::setIgnorePresentFences(bool ignore) {
     mPrimaryDispSync->setIgnorePresentFences(ignore);
 }
 
-nsecs_t Scheduler::getDispSyncExpectedPresentTime() {
-    return mPrimaryDispSync->expectedPresentTime();
+nsecs_t Scheduler::getDispSyncExpectedPresentTime(nsecs_t now) {
+    return mPrimaryDispSync->expectedPresentTime(now);
 }
 
 void Scheduler::registerLayer(Layer* layer) {
     if (!mLayerHistory) return;
 
-    // If the content detection feature is off, all layers are registered at NoVote. We still
-    // keep the layer history, since we use it for other features (like Frame Rate API), so layers
-    // still need to be registered.
-    if (!mUseContentDetection) {
-        mLayerHistory->registerLayer(layer, mRefreshRateConfigs.getMinRefreshRate().fps,
-                                     mRefreshRateConfigs.getMaxRefreshRate().fps,
+    const auto minFps = mRefreshRateConfigs.getMinRefreshRate().getFps();
+    const auto maxFps = mRefreshRateConfigs.getMaxRefreshRate().getFps();
+
+    if (layer->getWindowType() == InputWindowInfo::TYPE_STATUS_BAR) {
+        mLayerHistory->registerLayer(layer, minFps, maxFps,
                                      scheduler::LayerHistory::LayerVoteType::NoVote);
-        return;
-    }
+    } else if (!mUseContentDetection) {
+        // If the content detection feature is off, all layers are registered at Max. We still keep
+        // the layer history, since we use it for other features (like Frame Rate API), so layers
+        // still need to be registered.
+        mLayerHistory->registerLayer(layer, minFps, maxFps,
+                                     scheduler::LayerHistory::LayerVoteType::Max);
+    } else if (!mUseContentDetectionV2) {
+        // In V1 of content detection, all layers are registered as Heuristic (unless it's
+        // wallpaper).
+        const auto highFps =
+                layer->getWindowType() == InputWindowInfo::TYPE_WALLPAPER ? minFps : maxFps;
 
-    // In V1 of content detection, all layers are registered as Heuristic (unless it's wallpaper).
-    if (!mUseContentDetectionV2) {
-        const auto lowFps = mRefreshRateConfigs.getMinRefreshRate().fps;
-        const auto highFps = layer->getWindowType() == InputWindowInfo::TYPE_WALLPAPER
-                ? lowFps
-                : mRefreshRateConfigs.getMaxRefreshRate().fps;
-
-        mLayerHistory->registerLayer(layer, lowFps, highFps,
+        mLayerHistory->registerLayer(layer, minFps, highFps,
                                      scheduler::LayerHistory::LayerVoteType::Heuristic);
     } else {
         if (layer->getWindowType() == InputWindowInfo::TYPE_WALLPAPER) {
             // Running Wallpaper at Min is considered as part of content detection.
-            mLayerHistory->registerLayer(layer, mRefreshRateConfigs.getMinRefreshRate().fps,
-                                         mRefreshRateConfigs.getMaxRefreshRate().fps,
+            mLayerHistory->registerLayer(layer, minFps, maxFps,
                                          scheduler::LayerHistory::LayerVoteType::Min);
-        } else if (layer->getWindowType() == InputWindowInfo::TYPE_STATUS_BAR) {
-            mLayerHistory->registerLayer(layer, mRefreshRateConfigs.getMinRefreshRate().fps,
-                                         mRefreshRateConfigs.getMaxRefreshRate().fps,
-                                         scheduler::LayerHistory::LayerVoteType::NoVote);
         } else {
-            mLayerHistory->registerLayer(layer, mRefreshRateConfigs.getMinRefreshRate().fps,
-                                         mRefreshRateConfigs.getMaxRefreshRate().fps,
+            mLayerHistory->registerLayer(layer, minFps, maxFps,
                                          scheduler::LayerHistory::LayerVoteType::Heuristic);
         }
     }
 }
 
-void Scheduler::recordLayerHistory(Layer* layer, nsecs_t presentTime) {
+void Scheduler::recordLayerHistory(Layer* layer, nsecs_t presentTime,
+                                   LayerHistory::LayerUpdateType updateType) {
     if (mLayerHistory) {
-        mLayerHistory->record(layer, presentTime, systemTime());
+        mLayerHistory->record(layer, presentTime, systemTime(), updateType);
+    }
+}
+
+void Scheduler::setConfigChangePending(bool pending) {
+    if (mLayerHistory) {
+        mLayerHistory->setConfigChangePending(pending);
     }
 }
 
@@ -469,7 +471,7 @@ void Scheduler::notifyTouchEvent() {
     // that is currently on top. b/142507166 will give us this capability.
     std::lock_guard<std::mutex> lock(mFeatureStateLock);
     if (mLayerHistory) {
-        // Layer History will be cleared based on RefreshRateConfigs::getRefreshRateForContentV2
+        // Layer History will be cleared based on RefreshRateConfigs::getBestRefreshRate
 
         mTouchTimer->reset();
 
@@ -503,12 +505,13 @@ void Scheduler::kernelIdleTimerCallback(TimerState state) {
     // magic number
     const auto& refreshRate = mRefreshRateConfigs.getCurrentRefreshRate();
     constexpr float FPS_THRESHOLD_FOR_KERNEL_TIMER = 65.0f;
-    if (state == TimerState::Reset && refreshRate.fps > FPS_THRESHOLD_FOR_KERNEL_TIMER) {
+    if (state == TimerState::Reset && refreshRate.getFps() > FPS_THRESHOLD_FOR_KERNEL_TIMER) {
         // If we're not in performance mode then the kernel timer shouldn't do
         // anything, as the refresh rate during DPU power collapse will be the
         // same.
-        resyncToHardwareVsync(true /* makeAvailable */, refreshRate.vsyncPeriod);
-    } else if (state == TimerState::Expired && refreshRate.fps <= FPS_THRESHOLD_FOR_KERNEL_TIMER) {
+        resyncToHardwareVsync(true /* makeAvailable */, refreshRate.getVsyncPeriod());
+    } else if (state == TimerState::Expired &&
+               refreshRate.getFps() <= FPS_THRESHOLD_FOR_KERNEL_TIMER) {
         // Disable HW VSYNC if the timer expired, as we don't need it enabled if
         // we're not pushing frames, and if we're in PERFORMANCE mode then we'll
         // need to update the DispSync model anyway.
@@ -525,7 +528,9 @@ void Scheduler::idleTimerCallback(TimerState state) {
 
 void Scheduler::touchTimerCallback(TimerState state) {
     const TouchState touch = state == TimerState::Reset ? TouchState::Active : TouchState::Inactive;
-    handleTimerStateChanged(&mFeatures.touch, touch, true /* eventOnContentDetection */);
+    if (handleTimerStateChanged(&mFeatures.touch, touch, true /* eventOnContentDetection */)) {
+        mLayerHistory->clear();
+    }
     ATRACE_INT("TouchState", static_cast<int>(touch));
 }
 
@@ -548,18 +553,19 @@ void Scheduler::dump(std::string& result) const {
 }
 
 template <class T>
-void Scheduler::handleTimerStateChanged(T* currentState, T newState, bool eventOnContentDetection) {
+bool Scheduler::handleTimerStateChanged(T* currentState, T newState, bool eventOnContentDetection) {
     ConfigEvent event = ConfigEvent::None;
     HwcConfigIndexType newConfigId;
+    bool touchConsidered = false;
     {
         std::lock_guard<std::mutex> lock(mFeatureStateLock);
         if (*currentState == newState) {
-            return;
+            return touchConsidered;
         }
         *currentState = newState;
-        newConfigId = calculateRefreshRateConfigIndexType();
+        newConfigId = calculateRefreshRateConfigIndexType(&touchConsidered);
         if (mFeatures.configId == newConfigId) {
-            return;
+            return touchConsidered;
         }
         mFeatures.configId = newConfigId;
         if (eventOnContentDetection && !mFeatures.contentRequirements.empty()) {
@@ -568,59 +574,49 @@ void Scheduler::handleTimerStateChanged(T* currentState, T newState, bool eventO
     }
     const RefreshRate& newRefreshRate = mRefreshRateConfigs.getRefreshRateFromConfigId(newConfigId);
     mSchedulerCallback.changeRefreshRate(newRefreshRate, event);
+    return touchConsidered;
 }
 
-HwcConfigIndexType Scheduler::calculateRefreshRateConfigIndexType() {
+HwcConfigIndexType Scheduler::calculateRefreshRateConfigIndexType(bool* touchConsidered) {
     ATRACE_CALL();
+    if (touchConsidered) *touchConsidered = false;
 
-    // NOTE: If we remove the kernel idle timer, and use our internal idle timer, this
-    // code will have to be refactored. If Display Power is not in normal operation we want to be in
-    // performance mode. When coming back to normal mode, a grace period is given with
-    // DisplayPowerTimer.
+    // If Display Power is not in normal operation we want to be in performance mode. When coming
+    // back to normal mode, a grace period is given with DisplayPowerTimer.
     if (mDisplayPowerTimer &&
         (!mFeatures.isDisplayPowerStateNormal ||
          mFeatures.displayPowerTimer == TimerState::Reset)) {
-        return mRefreshRateConfigs.getMaxRefreshRateByPolicy().configId;
+        return mRefreshRateConfigs.getMaxRefreshRateByPolicy().getConfigId();
     }
+
+    const bool touchActive = mTouchTimer && mFeatures.touch == TouchState::Active;
+    const bool idle = mIdleTimer && mFeatures.idleTimer == TimerState::Expired;
 
     if (!mUseContentDetectionV2) {
         // As long as touch is active we want to be in performance mode.
-        if (mTouchTimer && mFeatures.touch == TouchState::Active) {
-            return mRefreshRateConfigs.getMaxRefreshRateByPolicy().configId;
+        if (touchActive) {
+            return mRefreshRateConfigs.getMaxRefreshRateByPolicy().getConfigId();
         }
-    }
 
-    // If timer has expired as it means there is no new content on the screen.
-    if (mIdleTimer && mFeatures.idleTimer == TimerState::Expired) {
-        return mRefreshRateConfigs.getMinRefreshRateByPolicy().configId;
-    }
+        // If timer has expired as it means there is no new content on the screen.
+        if (idle) {
+            return mRefreshRateConfigs.getMinRefreshRateByPolicy().getConfigId();
+        }
 
-    if (!mUseContentDetectionV2) {
         // If content detection is off we choose performance as we don't know the content fps.
         if (mFeatures.contentDetectionV1 == ContentDetectionState::Off) {
             // NOTE: V1 always calls this, but this is not a default behavior for V2.
-            return mRefreshRateConfigs.getMaxRefreshRateByPolicy().configId;
+            return mRefreshRateConfigs.getMaxRefreshRateByPolicy().getConfigId();
         }
 
         // Content detection is on, find the appropriate refresh rate with minimal error
-        return mRefreshRateConfigs.getRefreshRateForContent(mFeatures.contentRequirements).configId;
+        return mRefreshRateConfigs.getRefreshRateForContent(mFeatures.contentRequirements)
+                .getConfigId();
     }
 
-    bool touchConsidered;
-    const auto& ret =
-            mRefreshRateConfigs
-                    .getRefreshRateForContentV2(mFeatures.contentRequirements,
-                                                mTouchTimer &&
-                                                        mFeatures.touch == TouchState::Active,
-                                                &touchConsidered)
-                    .configId;
-    if (touchConsidered) {
-        // Clear layer history if refresh rate was selected based on touch to allow
-        // the hueristic to pick up with the new rate.
-        mLayerHistory->clear();
-    }
-
-    return ret;
+    return mRefreshRateConfigs
+            .getBestRefreshRate(mFeatures.contentRequirements, touchActive, idle, touchConsidered)
+            .getConfigId();
 }
 
 std::optional<HwcConfigIndexType> Scheduler::getPreferredConfigId() {
@@ -632,7 +628,7 @@ std::optional<HwcConfigIndexType> Scheduler::getPreferredConfigId() {
     return mFeatures.configId;
 }
 
-void Scheduler::onNewVsyncPeriodChangeTimeline(const HWC2::VsyncPeriodChangeTimeline& timeline) {
+void Scheduler::onNewVsyncPeriodChangeTimeline(const hal::VsyncPeriodChangeTimeline& timeline) {
     if (timeline.refreshRequired) {
         mSchedulerCallback.repaintEverythingForHWC();
     }

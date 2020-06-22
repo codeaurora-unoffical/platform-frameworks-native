@@ -189,6 +189,7 @@ public:
                                         const std::vector<IComposerClient::Rect>& visible) = 0;
     virtual Error setLayerZOrder(Display display, Layer layer, uint32_t z) = 0;
     virtual Error setLayerInfo(Display display, Layer layer, uint32_t type, uint32_t appId) = 0;
+    virtual Error setLayerType(Display display, Layer layer, uint32_t type) = 0;
 
     // Composer HAL 2.2
     virtual Error setLayerPerFrameMetadata(
@@ -240,6 +241,8 @@ public:
                                                 const std::vector<uint8_t>& value) = 0;
     virtual V2_4::Error getLayerGenericMetadataKeys(
             std::vector<IComposerClient::LayerGenericMetadataKey>* outKeys) = 0;
+    virtual Error getClientTargetProperty(
+            Display display, IComposerClient::ClientTargetProperty* outClientTargetProperty) = 0;
     virtual Error setDisplayElapseTime(Display display, uint64_t timeStamp) = 0;
 };
 
@@ -282,6 +285,10 @@ public:
 
     // Get what stage succeeded during PresentOrValidate: Present or Validate
     void takePresentOrValidateStage(Display display, uint32_t * state);
+
+    // Get the client target properties requested by hardware composer.
+    void takeClientTargetProperty(Display display,
+                                  IComposerClient::ClientTargetProperty* outClientTargetProperty);
 
 private:
     void resetData();
@@ -432,6 +439,7 @@ public:
                                 const std::vector<IComposerClient::Rect>& visible) override;
     Error setLayerZOrder(Display display, Layer layer, uint32_t z) override;
     Error setLayerInfo(Display display, Layer layer, uint32_t type, uint32_t appId) override;
+    Error setLayerType(Display display, Layer layer, uint32_t type) override;
 
     // Composer HAL 2.2
     Error setLayerPerFrameMetadata(
@@ -481,6 +489,9 @@ public:
                                         bool mandatory, const std::vector<uint8_t>& value) override;
     V2_4::Error getLayerGenericMetadataKeys(
             std::vector<IComposerClient::LayerGenericMetadataKey>* outKeys) override;
+    Error getClientTargetProperty(
+            Display display,
+            IComposerClient::ClientTargetProperty* outClientTargetProperty) override;
 
 private:
 #if defined(USE_VR_COMPOSER) && USE_VR_COMPOSER
@@ -490,6 +501,7 @@ private:
         ~CommandWriter() override;
 
         void setLayerInfo(uint32_t type, uint32_t appId);
+        void setLayerType(uint32_t type);
         void setClientTargetMetadata(
                 const IVrComposerClient::BufferMetadata& metadata);
         void setLayerBufferMetadata(
@@ -507,6 +519,7 @@ private:
         ~CommandWriter() override {}
 
         void setDisplayElapseTime(uint64_t time);
+        void setLayerType(uint32_t type);
     };
 #endif // defined(USE_VR_COMPOSER) && USE_VR_COMPOSER
 

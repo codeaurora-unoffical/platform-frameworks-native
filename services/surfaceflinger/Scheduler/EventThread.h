@@ -57,7 +57,7 @@ public:
     class Callback {
     public:
         virtual ~Callback() {}
-        virtual void onVSyncEvent(nsecs_t when) = 0;
+        virtual void onVSyncEvent(nsecs_t when, nsecs_t expectedVSyncTimestamp) = 0;
     };
 
     virtual ~VSyncSource() {}
@@ -81,19 +81,19 @@ public:
     status_t stealReceiveChannel(gui::BitTube* outChannel) override;
     status_t setVsyncRate(uint32_t rate) override;
     void requestNextVsync() override; // asynchronous
-    void toggleConfigEvents(ISurfaceComposer::ConfigChanged configChangeFlag) override;
+    void requestLatestConfig() override; // asynchronous
 
     // Called in response to requestNextVsync.
     const ResyncCallback resyncCallback;
 
     VSyncRequest vsyncRequest = VSyncRequest::None;
-    std::atomic<ISurfaceComposer::ConfigChanged> mConfigChanged =
+    ISurfaceComposer::ConfigChanged mConfigChanged =
             ISurfaceComposer::ConfigChanged::eConfigChangedSuppress;
     // Store whether we need to force dispatching a config change separately -
     // if mConfigChanged ever changes before the config change is dispatched
     // then we still need to propagate an initial config to the app if we
     // haven't already.
-    std::atomic<bool> mForcedConfigChangeDispatch = false;
+    bool mForcedConfigChangeDispatch = false;
 
 private:
     virtual void onFirstRef();
@@ -129,11 +129,10 @@ public:
     virtual void setVsyncRate(uint32_t rate, const sp<EventThreadConnection>& connection) = 0;
     // Requests the next vsync. If resetIdleTimer is set to true, it resets the idle timer.
     virtual void requestNextVsync(const sp<EventThreadConnection>& connection) = 0;
-
     // Dispatches the most recent configuration
     // Usage of this method assumes that only the primary internal display
     // supports multiple display configurations.
-    virtual void requestLatestConfig() = 0;
+    virtual void requestLatestConfig(const sp<EventThreadConnection>& connection) = 0;
 
     // Retrieves the number of event connections tracked by this EventThread.
     virtual size_t getEventThreadConnectionCount() = 0;
@@ -154,7 +153,7 @@ public:
     status_t registerDisplayEventConnection(const sp<EventThreadConnection>& connection) override;
     void setVsyncRate(uint32_t rate, const sp<EventThreadConnection>& connection) override;
     void requestNextVsync(const sp<EventThreadConnection>& connection) override;
-    void requestLatestConfig() override;
+    void requestLatestConfig(const sp<EventThreadConnection>& connection) override;
 
     // called before the screen is turned off from main thread
     void onScreenReleased() override;
@@ -189,7 +188,7 @@ private:
             REQUIRES(mMutex);
 
     // Implements VSyncSource::Callback
-    void onVSyncEvent(nsecs_t timestamp) override;
+    void onVSyncEvent(nsecs_t timestamp, nsecs_t expectedVSyncTimestamp) override;
 
     const std::unique_ptr<VSyncSource> mVSyncSource GUARDED_BY(mMutex);
 
@@ -232,6 +231,8 @@ private:
     State mState GUARDED_BY(mMutex) = State::Idle;
 
     static const char* toCString(State);
+    void *mDolphinHandle = nullptr;
+    bool (*mDolphinCheck)(const char* name) = nullptr;
 };
 
 // ---------------------------------------------------------------------------

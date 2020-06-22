@@ -78,7 +78,7 @@ namespace android::inputdispatcher {
 
 // Default input dispatching timeout if there is no focused application or paused window
 // from which to determine an appropriate dispatching timeout.
-constexpr nsecs_t DEFAULT_INPUT_DISPATCHING_TIMEOUT = 5000 * 1000000LL; // 5 sec
+constexpr std::chrono::nanoseconds DEFAULT_INPUT_DISPATCHING_TIMEOUT = 5s;
 
 // Amount of time to allow for all pending events to be processed when an app switch
 // key is on the way.  This is used to preempt input dispatch and drop input events
@@ -352,18 +352,16 @@ std::array<uint8_t, 32> HmacKeyManager::sign(const VerifiedInputEvent& event) co
             break;
         }
     }
-    std::vector<uint8_t> data;
     const uint8_t* start = reinterpret_cast<const uint8_t*>(&event);
-    data.assign(start, start + size);
-    return sign(data);
+    return sign(start, size);
 }
 
-std::array<uint8_t, 32> HmacKeyManager::sign(const std::vector<uint8_t>& data) const {
+std::array<uint8_t, 32> HmacKeyManager::sign(const uint8_t* data, size_t size) const {
     // SHA256 always generates 32-bytes result
     std::array<uint8_t, 32> hash;
     unsigned int hashLen = 0;
-    uint8_t* result = HMAC(EVP_sha256(), mHmacKey.data(), mHmacKey.size(), data.data(), data.size(),
-                           hash.data(), &hashLen);
+    uint8_t* result =
+            HMAC(EVP_sha256(), mHmacKey.data(), mHmacKey.size(), data, size, hash.data(), &hashLen);
     if (result == nullptr) {
         ALOGE("Could not sign the data using HMAC");
         return INVALID_HMAC;
@@ -533,7 +531,7 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t* nextWakeupTime) {
         }
 
         // Get ready to dispatch the event.
-        resetANRTimeoutsLocked();
+        resetAnrTimeoutsLocked();
     }
 
     // Now we have an event to dispatch.
@@ -622,6 +620,33 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t* nextWakeupTime) {
     }
 }
 
+/**
+ * Return true if the events preceding this incoming motion event should be dropped
+ * Return false otherwise (the default behaviour)
+ */
+bool InputDispatcher::shouldPruneInboundQueueLocked(const MotionEntry& motionEntry) {
+    bool isPointerDownEvent = motionEntry.action == AMOTION_EVENT_ACTION_DOWN &&
+            (motionEntry.source & AINPUT_SOURCE_CLASS_POINTER);
+    if (isPointerDownEvent &&
+        mInputTargetWaitCause == INPUT_TARGET_WAIT_CAUSE_APPLICATION_NOT_READY &&
+        mInputTargetWaitApplicationToken != nullptr) {
+        int32_t displayId = motionEntry.displayId;
+        int32_t x = static_cast<int32_t>(
+                motionEntry.pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_X));
+        int32_t y = static_cast<int32_t>(
+                motionEntry.pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_Y));
+        sp<InputWindowHandle> touchedWindowHandle = findTouchedWindowAtLocked(displayId, x, y);
+        if (touchedWindowHandle != nullptr &&
+            touchedWindowHandle->getApplicationToken() != mInputTargetWaitApplicationToken) {
+            // User touched a different application than the one we are waiting on.
+            // Flag the event, and start pruning the input queue.
+            ALOGI("Pruning input queue because user touched a different application");
+            return true;
+        }
+    }
+    return false;
+}
+
 bool InputDispatcher::enqueueInboundEventLocked(EventEntry* entry) {
     bool needWake = mInboundQueue.empty();
     mInboundQueue.push_back(entry);
@@ -655,32 +680,18 @@ bool InputDispatcher::enqueueInboundEventLocked(EventEntry* entry) {
             // decides to touch a window in a different application.
             // If the application takes too long to catch up then we drop all events preceding
             // the touch into the other window.
-            MotionEntry* motionEntry = static_cast<MotionEntry*>(entry);
-            if (motionEntry->action == AMOTION_EVENT_ACTION_DOWN &&
-                (motionEntry->source & AINPUT_SOURCE_CLASS_POINTER) &&
-                mInputTargetWaitCause == INPUT_TARGET_WAIT_CAUSE_APPLICATION_NOT_READY &&
-                mInputTargetWaitApplicationToken != nullptr) {
-                int32_t displayId = motionEntry->displayId;
-                int32_t x =
-                        int32_t(motionEntry->pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_X));
-                int32_t y =
-                        int32_t(motionEntry->pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_Y));
-                sp<InputWindowHandle> touchedWindowHandle =
-                        findTouchedWindowAtLocked(displayId, x, y);
-                if (touchedWindowHandle != nullptr &&
-                    touchedWindowHandle->getApplicationToken() !=
-                            mInputTargetWaitApplicationToken) {
-                    // User touched a different application than the one we are waiting on.
-                    // Flag the event, and start pruning the input queue.
-                    mNextUnblockedEvent = motionEntry;
-                    needWake = true;
-                }
+            if (shouldPruneInboundQueueLocked(static_cast<MotionEntry&>(*entry))) {
+                mNextUnblockedEvent = entry;
+                needWake = true;
             }
             break;
         }
-        case EventEntry::Type::CONFIGURATION_CHANGED:
-        case EventEntry::Type::DEVICE_RESET:
         case EventEntry::Type::FOCUS: {
+            LOG_ALWAYS_FATAL("Focus events should be inserted using enqueueFocusEventLocked");
+            break;
+        }
+        case EventEntry::Type::CONFIGURATION_CHANGED:
+        case EventEntry::Type::DEVICE_RESET: {
             // nothing to do
             break;
         }
@@ -890,7 +901,7 @@ void InputDispatcher::drainInboundQueueLocked() {
 
 void InputDispatcher::releasePendingEventLocked() {
     if (mPendingEvent) {
-        resetANRTimeoutsLocked();
+        resetAnrTimeoutsLocked();
         releaseInboundEventLocked(mPendingEvent);
         mPendingEvent = nullptr;
     }
@@ -982,9 +993,24 @@ bool InputDispatcher::dispatchDeviceResetLocked(nsecs_t currentTime, DeviceReset
 }
 
 void InputDispatcher::enqueueFocusEventLocked(const InputWindowHandle& window, bool hasFocus) {
+    if (mPendingEvent != nullptr) {
+        // Move the pending event to the front of the queue. This will give the chance
+        // for the pending event to get dispatched to the newly focused window
+        mInboundQueue.push_front(mPendingEvent);
+        mPendingEvent = nullptr;
+    }
+
     FocusEntry* focusEntry =
             new FocusEntry(mIdGenerator.nextId(), now(), window.getToken(), hasFocus);
-    enqueueInboundEventLocked(focusEntry);
+
+    // This event should go to the front of the queue, but behind all other focus events
+    // Find the last focus event, and insert right after it
+    std::deque<EventEntry*>::reverse_iterator it =
+            std::find_if(mInboundQueue.rbegin(), mInboundQueue.rend(),
+                         [](EventEntry* event) { return event->type == EventEntry::Type::FOCUS; });
+
+    // Maintain the order of focus events. Insert the entry after all other focus events.
+    mInboundQueue.insert(it.base(), focusEntry);
 }
 
 void InputDispatcher::dispatchFocusLocked(nsecs_t currentTime, FocusEntry* entry) {
@@ -1154,14 +1180,16 @@ bool InputDispatcher::dispatchMotionLocked(nsecs_t currentTime, MotionEntry* ent
     }
 
     setInjectionResult(entry, injectionResult);
+    if (injectionResult == INPUT_EVENT_INJECTION_PERMISSION_DENIED) {
+        ALOGW("Permission denied, dropping the motion (isPointer=%s)", toString(isPointerEvent));
+        return true;
+    }
     if (injectionResult != INPUT_EVENT_INJECTION_SUCCEEDED) {
-        if (injectionResult != INPUT_EVENT_INJECTION_PERMISSION_DENIED) {
-            CancelationOptions::Mode mode(isPointerEvent
-                                                  ? CancelationOptions::CANCEL_POINTER_EVENTS
-                                                  : CancelationOptions::CANCEL_NON_POINTER_EVENTS);
-            CancelationOptions options(mode, "input event injection failed");
-            synthesizeCancelationEventsForMonitorsLocked(options);
-        }
+        CancelationOptions::Mode mode(isPointerEvent
+                                              ? CancelationOptions::CANCEL_POINTER_EVENTS
+                                              : CancelationOptions::CANCEL_NON_POINTER_EVENTS);
+        CancelationOptions options(mode, "input event injection failed");
+        synthesizeCancelationEventsForMonitorsLocked(options);
         return true;
     }
 
@@ -1267,11 +1295,9 @@ int32_t InputDispatcher::handleTargetsNotReadyLocked(
         }
     } else {
         if (mInputTargetWaitCause != INPUT_TARGET_WAIT_CAUSE_APPLICATION_NOT_READY) {
-            if (DEBUG_FOCUS) {
-                ALOGD("Waiting for application to become ready for input: %s.  Reason: %s",
-                      getApplicationWindowLabel(applicationHandle, windowHandle).c_str(), reason);
-            }
-            nsecs_t timeout;
+            ALOGI("Waiting for application to become ready for input: %s.  Reason: %s",
+                  getApplicationWindowLabel(applicationHandle, windowHandle).c_str(), reason);
+            std::chrono::nanoseconds timeout;
             if (windowHandle != nullptr) {
                 timeout = windowHandle->getDispatchingTimeout(DEFAULT_INPUT_DISPATCHING_TIMEOUT);
             } else if (applicationHandle != nullptr) {
@@ -1283,7 +1309,7 @@ int32_t InputDispatcher::handleTargetsNotReadyLocked(
 
             mInputTargetWaitCause = INPUT_TARGET_WAIT_CAUSE_APPLICATION_NOT_READY;
             mInputTargetWaitStartTime = currentTime;
-            mInputTargetWaitTimeoutTime = currentTime + timeout;
+            mInputTargetWaitTimeoutTime = currentTime + timeout.count();
             mInputTargetWaitTimeoutExpired = false;
             mInputTargetWaitApplicationToken.clear();
 
@@ -1301,7 +1327,7 @@ int32_t InputDispatcher::handleTargetsNotReadyLocked(
     }
 
     if (currentTime >= mInputTargetWaitTimeoutTime) {
-        onANRLocked(currentTime, applicationHandle, windowHandle, entry.eventTime,
+        onAnrLocked(currentTime, applicationHandle, windowHandle, entry.eventTime,
                     mInputTargetWaitStartTime, reason);
 
         // Force poll loop to wake up immediately on next iteration once we get the
@@ -1325,10 +1351,10 @@ void InputDispatcher::removeWindowByTokenLocked(const sp<IBinder>& token) {
 }
 
 void InputDispatcher::resumeAfterTargetsNotReadyTimeoutLocked(
-        nsecs_t newTimeout, const sp<IBinder>& inputConnectionToken) {
-    if (newTimeout > 0) {
+        nsecs_t timeoutExtension, const sp<IBinder>& inputConnectionToken) {
+    if (timeoutExtension > 0) {
         // Extend the timeout.
-        mInputTargetWaitTimeoutTime = now() + newTimeout;
+        mInputTargetWaitTimeoutTime = now() + timeoutExtension;
     } else {
         // Give up.
         mInputTargetWaitTimeoutExpired = true;
@@ -1347,14 +1373,7 @@ void InputDispatcher::resumeAfterTargetsNotReadyTimeoutLocked(
     }
 }
 
-nsecs_t InputDispatcher::getTimeSpentWaitingForApplicationLocked(nsecs_t currentTime) {
-    if (mInputTargetWaitCause == INPUT_TARGET_WAIT_CAUSE_APPLICATION_NOT_READY) {
-        return currentTime - mInputTargetWaitStartTime;
-    }
-    return 0;
-}
-
-void InputDispatcher::resetANRTimeoutsLocked() {
+void InputDispatcher::resetAnrTimeoutsLocked() {
     if (DEBUG_FOCUS) {
         ALOGD("Resetting ANR timeouts.");
     }
@@ -1396,7 +1415,6 @@ int32_t InputDispatcher::findFocusedWindowTargetsLocked(nsecs_t currentTime,
                                                         const EventEntry& entry,
                                                         std::vector<InputTarget>& inputTargets,
                                                         nsecs_t* nextWakeupTime) {
-    int32_t injectionResult;
     std::string reason;
 
     int32_t displayId = getTargetDisplayId(entry);
@@ -1409,54 +1427,38 @@ int32_t InputDispatcher::findFocusedWindowTargetsLocked(nsecs_t currentTime,
     // then drop the event.
     if (focusedWindowHandle == nullptr) {
         if (focusedApplicationHandle != nullptr) {
-            injectionResult =
-                    handleTargetsNotReadyLocked(currentTime, entry, focusedApplicationHandle,
-                                                nullptr, nextWakeupTime,
-                                                "Waiting because no window has focus but there is "
-                                                "a focused application that may eventually add a "
-                                                "window when it finishes starting up.");
-            goto Unresponsive;
+            return handleTargetsNotReadyLocked(currentTime, entry, focusedApplicationHandle,
+                                               nullptr, nextWakeupTime,
+                                               "Waiting because no window has focus but there is "
+                                               "a focused application that may eventually add a "
+                                               "window when it finishes starting up.");
         }
 
         ALOGI("Dropping event because there is no focused window or focused application in display "
               "%" PRId32 ".",
               displayId);
-        injectionResult = INPUT_EVENT_INJECTION_FAILED;
-        goto Failed;
+        return INPUT_EVENT_INJECTION_FAILED;
     }
 
     // Check permissions.
     if (!checkInjectionPermission(focusedWindowHandle, entry.injectionState)) {
-        injectionResult = INPUT_EVENT_INJECTION_PERMISSION_DENIED;
-        goto Failed;
+        return INPUT_EVENT_INJECTION_PERMISSION_DENIED;
     }
 
     // Check whether the window is ready for more input.
     reason = checkWindowReadyForMoreInputLocked(currentTime, focusedWindowHandle, entry, "focused");
     if (!reason.empty()) {
-        injectionResult =
-                handleTargetsNotReadyLocked(currentTime, entry, focusedApplicationHandle,
-                                            focusedWindowHandle, nextWakeupTime, reason.c_str());
-        goto Unresponsive;
+        return handleTargetsNotReadyLocked(currentTime, entry, focusedApplicationHandle,
+                                           focusedWindowHandle, nextWakeupTime, reason.c_str());
     }
 
     // Success!  Output targets.
-    injectionResult = INPUT_EVENT_INJECTION_SUCCEEDED;
     addWindowTargetLocked(focusedWindowHandle,
                           InputTarget::FLAG_FOREGROUND | InputTarget::FLAG_DISPATCH_AS_IS,
                           BitSet32(0), inputTargets);
 
     // Done.
-Failed:
-Unresponsive:
-    nsecs_t timeSpentWaitingForApplication = getTimeSpentWaitingForApplicationLocked(currentTime);
-    updateDispatchStatistics(currentTime, entry, injectionResult, timeSpentWaitingForApplication);
-    if (DEBUG_FOCUS) {
-        ALOGD("findFocusedWindow finished: injectionResult=%d, "
-              "timeSpentWaitingForApplication=%0.1fms",
-              injectionResult, timeSpentWaitingForApplication / 1000000.0);
-    }
-    return injectionResult;
+    return INPUT_EVENT_INJECTION_SUCCEEDED;
 }
 
 int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
@@ -1753,10 +1755,9 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
                     checkWindowReadyForMoreInputLocked(currentTime, touchedWindow.windowHandle,
                                                        entry, "touched");
             if (!reason.empty()) {
-                injectionResult = handleTargetsNotReadyLocked(currentTime, entry, nullptr,
-                                                              touchedWindow.windowHandle,
-                                                              nextWakeupTime, reason.c_str());
-                goto Unresponsive;
+                return handleTargetsNotReadyLocked(currentTime, entry, nullptr,
+                                                   touchedWindow.windowHandle, nextWakeupTime,
+                                                   reason.c_str());
             }
         }
     }
@@ -1816,98 +1817,85 @@ Failed:
         }
     }
 
+    if (injectionPermission != INJECTION_PERMISSION_GRANTED) {
+        return injectionResult;
+    }
+
     // Update final pieces of touch state if the injector had permission.
-    if (injectionPermission == INJECTION_PERMISSION_GRANTED) {
-        if (!wrongDevice) {
-            if (switchedDevice) {
+    if (!wrongDevice) {
+        if (switchedDevice) {
+            if (DEBUG_FOCUS) {
+                ALOGD("Conflicting pointer actions: Switched to a different device.");
+            }
+            *outConflictingPointerActions = true;
+        }
+
+        if (isHoverAction) {
+            // Started hovering, therefore no longer down.
+            if (oldState && oldState->down) {
                 if (DEBUG_FOCUS) {
-                    ALOGD("Conflicting pointer actions: Switched to a different device.");
+                    ALOGD("Conflicting pointer actions: Hover received while pointer was "
+                          "down.");
                 }
                 *outConflictingPointerActions = true;
             }
+            mTempTouchState.reset();
+            if (maskedAction == AMOTION_EVENT_ACTION_HOVER_ENTER ||
+                maskedAction == AMOTION_EVENT_ACTION_HOVER_MOVE) {
+                mTempTouchState.deviceId = entry.deviceId;
+                mTempTouchState.source = entry.source;
+                mTempTouchState.displayId = displayId;
+            }
+        } else if (maskedAction == AMOTION_EVENT_ACTION_UP ||
+                   maskedAction == AMOTION_EVENT_ACTION_CANCEL) {
+            // All pointers up or canceled.
+            mTempTouchState.reset();
+        } else if (maskedAction == AMOTION_EVENT_ACTION_DOWN) {
+            // First pointer went down.
+            if (oldState && oldState->down) {
+                if (DEBUG_FOCUS) {
+                    ALOGD("Conflicting pointer actions: Down received while already down.");
+                }
+                *outConflictingPointerActions = true;
+            }
+        } else if (maskedAction == AMOTION_EVENT_ACTION_POINTER_UP) {
+            // One pointer went up.
+            if (isSplit) {
+                int32_t pointerIndex = getMotionEventActionPointerIndex(action);
+                uint32_t pointerId = entry.pointerProperties[pointerIndex].id;
 
-            if (isHoverAction) {
-                // Started hovering, therefore no longer down.
-                if (oldState && oldState->down) {
-                    if (DEBUG_FOCUS) {
-                        ALOGD("Conflicting pointer actions: Hover received while pointer was "
-                              "down.");
-                    }
-                    *outConflictingPointerActions = true;
-                }
-                mTempTouchState.reset();
-                if (maskedAction == AMOTION_EVENT_ACTION_HOVER_ENTER ||
-                    maskedAction == AMOTION_EVENT_ACTION_HOVER_MOVE) {
-                    mTempTouchState.deviceId = entry.deviceId;
-                    mTempTouchState.source = entry.source;
-                    mTempTouchState.displayId = displayId;
-                }
-            } else if (maskedAction == AMOTION_EVENT_ACTION_UP ||
-                       maskedAction == AMOTION_EVENT_ACTION_CANCEL) {
-                // All pointers up or canceled.
-                mTempTouchState.reset();
-            } else if (maskedAction == AMOTION_EVENT_ACTION_DOWN) {
-                // First pointer went down.
-                if (oldState && oldState->down) {
-                    if (DEBUG_FOCUS) {
-                        ALOGD("Conflicting pointer actions: Down received while already down.");
-                    }
-                    *outConflictingPointerActions = true;
-                }
-            } else if (maskedAction == AMOTION_EVENT_ACTION_POINTER_UP) {
-                // One pointer went up.
-                if (isSplit) {
-                    int32_t pointerIndex = getMotionEventActionPointerIndex(action);
-                    uint32_t pointerId = entry.pointerProperties[pointerIndex].id;
-
-                    for (size_t i = 0; i < mTempTouchState.windows.size();) {
-                        TouchedWindow& touchedWindow = mTempTouchState.windows[i];
-                        if (touchedWindow.targetFlags & InputTarget::FLAG_SPLIT) {
-                            touchedWindow.pointerIds.clearBit(pointerId);
-                            if (touchedWindow.pointerIds.isEmpty()) {
-                                mTempTouchState.windows.erase(mTempTouchState.windows.begin() + i);
-                                continue;
-                            }
+                for (size_t i = 0; i < mTempTouchState.windows.size();) {
+                    TouchedWindow& touchedWindow = mTempTouchState.windows[i];
+                    if (touchedWindow.targetFlags & InputTarget::FLAG_SPLIT) {
+                        touchedWindow.pointerIds.clearBit(pointerId);
+                        if (touchedWindow.pointerIds.isEmpty()) {
+                            mTempTouchState.windows.erase(mTempTouchState.windows.begin() + i);
+                            continue;
                         }
-                        i += 1;
                     }
+                    i += 1;
                 }
             }
+        }
 
-            // Save changes unless the action was scroll in which case the temporary touch
-            // state was only valid for this one action.
-            if (maskedAction != AMOTION_EVENT_ACTION_SCROLL) {
-                if (mTempTouchState.displayId >= 0) {
-                    if (oldStateIndex >= 0) {
-                        mTouchStatesByDisplay.editValueAt(oldStateIndex).copyFrom(mTempTouchState);
-                    } else {
-                        mTouchStatesByDisplay.add(displayId, mTempTouchState);
-                    }
-                } else if (oldStateIndex >= 0) {
-                    mTouchStatesByDisplay.removeItemsAt(oldStateIndex);
+        // Save changes unless the action was scroll in which case the temporary touch
+        // state was only valid for this one action.
+        if (maskedAction != AMOTION_EVENT_ACTION_SCROLL) {
+            if (mTempTouchState.displayId >= 0) {
+                if (oldStateIndex >= 0) {
+                    mTouchStatesByDisplay.editValueAt(oldStateIndex).copyFrom(mTempTouchState);
+                } else {
+                    mTouchStatesByDisplay.add(displayId, mTempTouchState);
                 }
+            } else if (oldStateIndex >= 0) {
+                mTouchStatesByDisplay.removeItemsAt(oldStateIndex);
             }
+        }
 
-            // Update hover state.
-            mLastHoverWindowHandle = newHoverWindowHandle;
-        }
-    } else {
-        if (DEBUG_FOCUS) {
-            ALOGD("Not updating touch focus because injection was denied.");
-        }
+        // Update hover state.
+        mLastHoverWindowHandle = newHoverWindowHandle;
     }
 
-Unresponsive:
-    // Reset temporary touch state to ensure we release unnecessary references to input channels.
-    mTempTouchState.reset();
-
-    nsecs_t timeSpentWaitingForApplication = getTimeSpentWaitingForApplicationLocked(currentTime);
-    updateDispatchStatistics(currentTime, entry, injectionResult, timeSpentWaitingForApplication);
-    if (DEBUG_FOCUS) {
-        ALOGD("findTouchedWindow finished: injectionResult=%d, injectionPermission=%d, "
-              "timeSpentWaitingForApplication=%0.1fms",
-              injectionResult, injectionPermission, timeSpentWaitingForApplication / 1000000.0);
-    }
     return injectionResult;
 }
 
@@ -1988,18 +1976,49 @@ bool InputDispatcher::checkInjectionPermission(const sp<InputWindowHandle>& wind
     return true;
 }
 
+/**
+ * Indicate whether one window handle should be considered as obscuring
+ * another window handle. We only check a few preconditions. Actually
+ * checking the bounds is left to the caller.
+ */
+static bool canBeObscuredBy(const sp<InputWindowHandle>& windowHandle,
+                            const sp<InputWindowHandle>& otherHandle) {
+    // Compare by token so cloned layers aren't counted
+    if (haveSameToken(windowHandle, otherHandle)) {
+        return false;
+    }
+    auto info = windowHandle->getInfo();
+    auto otherInfo = otherHandle->getInfo();
+    if (!otherInfo->visible) {
+        return false;
+    } else if (info->ownerPid == otherInfo->ownerPid && otherHandle->getToken() == nullptr) {
+      // In general, if ownerPid is the same we don't want to generate occlusion
+      // events. This line is now necessary since we are including all Surfaces
+      // in occlusion calculation, so if we didn't check PID like this SurfaceView
+      // would occlude their parents. On the other hand before we started including
+      // all surfaces in occlusion calculation and had this line, we would count
+      // windows with an input channel from the same PID as occluding, and so we
+      // preserve this behavior with the getToken() == null check.
+        return false;
+    } else if (otherInfo->isTrustedOverlay()) {
+        return false;
+    } else if (otherInfo->displayId != info->displayId) {
+        return false;
+    }
+    return true;
+}
+
 bool InputDispatcher::isWindowObscuredAtPointLocked(const sp<InputWindowHandle>& windowHandle,
                                                     int32_t x, int32_t y) const {
     int32_t displayId = windowHandle->getInfo()->displayId;
     const std::vector<sp<InputWindowHandle>> windowHandles = getWindowHandlesLocked(displayId);
     for (const sp<InputWindowHandle>& otherHandle : windowHandles) {
-        if (otherHandle == windowHandle) {
-            break;
+        if (windowHandle == otherHandle) {
+            break; // All future windows are below us. Exit early.
         }
-
         const InputWindowInfo* otherInfo = otherHandle->getInfo();
-        if (otherInfo->displayId == displayId && otherInfo->visible &&
-            !otherInfo->isTrustedOverlay() && otherInfo->frameContainsPoint(x, y)) {
+          if (canBeObscuredBy(windowHandle, otherHandle) &&
+            otherInfo->frameContainsPoint(x, y)) {
             return true;
         }
     }
@@ -2011,13 +2030,13 @@ bool InputDispatcher::isWindowObscuredLocked(const sp<InputWindowHandle>& window
     const std::vector<sp<InputWindowHandle>> windowHandles = getWindowHandlesLocked(displayId);
     const InputWindowInfo* windowInfo = windowHandle->getInfo();
     for (const sp<InputWindowHandle>& otherHandle : windowHandles) {
-        if (otherHandle == windowHandle) {
-            break;
+        if (windowHandle == otherHandle) {
+            break; // All future windows are below us. Exit early.
         }
 
         const InputWindowInfo* otherInfo = otherHandle->getInfo();
-        if (otherInfo->displayId == displayId && otherInfo->visible &&
-            !otherInfo->isTrustedOverlay() && otherInfo->overlaps(windowInfo)) {
+        if (canBeObscuredBy(windowHandle, otherHandle) &&
+            otherInfo->overlaps(windowInfo)) {
             return true;
         }
     }
@@ -2115,15 +2134,12 @@ std::string InputDispatcher::getApplicationWindowLabel(
         const sp<InputWindowHandle>& windowHandle) {
     if (applicationHandle != nullptr) {
         if (windowHandle != nullptr) {
-            std::string label(applicationHandle->getName());
-            label += " - ";
-            label += windowHandle->getName();
-            return label;
+            return applicationHandle->getName() + " - " + windowHandle->getName();
         } else {
             return applicationHandle->getName();
         }
     } else if (windowHandle != nullptr) {
-        return windowHandle->getName();
+        return windowHandle->getInfo()->applicationInfo.name + " - " + windowHandle->getName();
     } else {
         return "<unknown application or window>";
     }
@@ -2451,11 +2467,8 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
         EventEntry* eventEntry = dispatchEntry->eventEntry;
         switch (eventEntry->type) {
             case EventEntry::Type::KEY: {
-                KeyEntry* keyEntry = static_cast<KeyEntry*>(eventEntry);
-                VerifiedKeyEvent verifiedEvent = verifiedKeyEventFromKeyEntry(*keyEntry);
-                verifiedEvent.flags = dispatchEntry->resolvedFlags & VERIFIED_KEY_EVENT_FLAGS;
-                verifiedEvent.action = dispatchEntry->resolvedAction;
-                std::array<uint8_t, 32> hmac = mHmacKeyManager.sign(verifiedEvent);
+                const KeyEntry* keyEntry = static_cast<KeyEntry*>(eventEntry);
+                std::array<uint8_t, 32> hmac = getSignature(*keyEntry, *dispatchEntry);
 
                 // Publish the key event.
                 status =
@@ -2507,12 +2520,8 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
                         usingCoords = scaledCoords;
                     }
                 }
-                VerifiedMotionEvent verifiedEvent =
-                        verifiedMotionEventFromMotionEntry(*motionEntry);
-                verifiedEvent.actionMasked =
-                        dispatchEntry->resolvedAction & AMOTION_EVENT_ACTION_MASK;
-                verifiedEvent.flags = dispatchEntry->resolvedFlags & VERIFIED_MOTION_EVENT_FLAGS;
-                std::array<uint8_t, 32> hmac = mHmacKeyManager.sign(verifiedEvent);
+
+                std::array<uint8_t, 32> hmac = getSignature(*motionEntry, *dispatchEntry);
 
                 // Publish the motion event.
                 status = connection->inputPublisher
@@ -2590,6 +2599,28 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
         connection->waitQueue.push_back(dispatchEntry);
         traceWaitQueueLength(connection);
     }
+}
+
+const std::array<uint8_t, 32> InputDispatcher::getSignature(
+        const MotionEntry& motionEntry, const DispatchEntry& dispatchEntry) const {
+    int32_t actionMasked = dispatchEntry.resolvedAction & AMOTION_EVENT_ACTION_MASK;
+    if ((actionMasked == AMOTION_EVENT_ACTION_UP) || (actionMasked == AMOTION_EVENT_ACTION_DOWN)) {
+        // Only sign events up and down events as the purely move events
+        // are tied to their up/down counterparts so signing would be redundant.
+        VerifiedMotionEvent verifiedEvent = verifiedMotionEventFromMotionEntry(motionEntry);
+        verifiedEvent.actionMasked = actionMasked;
+        verifiedEvent.flags = dispatchEntry.resolvedFlags & VERIFIED_MOTION_EVENT_FLAGS;
+        return mHmacKeyManager.sign(verifiedEvent);
+    }
+    return INVALID_HMAC;
+}
+
+const std::array<uint8_t, 32> InputDispatcher::getSignature(
+        const KeyEntry& keyEntry, const DispatchEntry& dispatchEntry) const {
+    VerifiedKeyEvent verifiedEvent = verifiedKeyEventFromKeyEntry(keyEntry);
+    verifiedEvent.flags = dispatchEntry.resolvedFlags & VERIFIED_KEY_EVENT_FLAGS;
+    verifiedEvent.action = dispatchEntry.resolvedAction;
+    return mHmacKeyManager.sign(verifiedEvent);
 }
 
 void InputDispatcher::finishDispatchCycleLocked(nsecs_t currentTime,
@@ -2704,7 +2735,10 @@ int InputDispatcher::handleReceiveCallback(int fd, int events, void* data) {
             // Monitor channels are never explicitly unregistered.
             // We do it automatically when the remote endpoint is closed so don't warn
             // about them.
-            notify = !connection->monitor;
+            const bool stillHaveWindowHandle =
+                    d->getWindowHandleLocked(connection->inputChannel->getConnectionToken()) !=
+                    nullptr;
+            notify = !connection->monitor && stillHaveWindowHandle;
             if (notify) {
                 ALOGW("channel '%s' ~ Consumer closed input channel or an error occurred.  "
                       "events=0x%x",
@@ -3229,14 +3263,14 @@ void InputDispatcher::notifyDeviceReset(const NotifyDeviceResetArgs* args) {
 
 int32_t InputDispatcher::injectInputEvent(const InputEvent* event, int32_t injectorPid,
                                           int32_t injectorUid, int32_t syncMode,
-                                          int32_t timeoutMillis, uint32_t policyFlags) {
+                                          std::chrono::milliseconds timeout, uint32_t policyFlags) {
 #if DEBUG_INBOUND_EVENT_DETAILS
     ALOGD("injectInputEvent - eventType=%d, injectorPid=%d, injectorUid=%d, "
-          "syncMode=%d, timeoutMillis=%d, policyFlags=0x%08x",
-          event->getType(), injectorPid, injectorUid, syncMode, timeoutMillis, policyFlags);
+          "syncMode=%d, timeout=%lld, policyFlags=0x%08x",
+          event->getType(), injectorPid, injectorUid, syncMode, timeout.count(), policyFlags);
 #endif
 
-    nsecs_t endTime = now() + milliseconds_to_nanoseconds(timeoutMillis);
+    nsecs_t endTime = now() + std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count();
 
     policyFlags |= POLICY_FLAG_INJECTED;
     if (hasInjectionPermission(injectorPid, injectorUid)) {
@@ -3280,9 +3314,8 @@ int32_t InputDispatcher::injectInputEvent(const InputEvent* event, int32_t injec
             KeyEntry* injectedEntry =
                     new KeyEntry(incomingKey.getId(), incomingKey.getEventTime(),
                                  VIRTUAL_KEYBOARD_ID, incomingKey.getSource(),
-                                 incomingKey.getDisplayId(), policyFlags, action, flags,
-                                 incomingKey.getKeyCode(), incomingKey.getScanCode(),
-                                 incomingKey.getMetaState(), incomingKey.getRepeatCount(),
+                                 incomingKey.getDisplayId(), policyFlags, action, flags, keyCode,
+                                 incomingKey.getScanCode(), metaState, incomingKey.getRepeatCount(),
                                  incomingKey.getDownTime());
             injectedEntries.push(injectedEntry);
             break;
@@ -3424,8 +3457,7 @@ int32_t InputDispatcher::injectInputEvent(const InputEvent* event, int32_t injec
     } // release lock
 
 #if DEBUG_INJECTION
-    ALOGD("injectInputEvent - Finished with result %d.  "
-          "injectorPid=%d, injectorUid=%d",
+    ALOGD("injectInputEvent - Finished with result %d. injectorPid=%d, injectorUid=%d",
           injectionResult, injectorPid, injectorUid);
 #endif
 
@@ -3598,8 +3630,8 @@ void InputDispatcher::updateWindowHandlesForDisplayLocked(
             if (canReceiveInput && !noInputChannel) {
                 ALOGV("Window handle %s has no registered input channel",
                       handle->getName().c_str());
+                continue;
             }
-            continue;
         }
 
         if (info->displayId != displayId) {
@@ -3608,7 +3640,8 @@ void InputDispatcher::updateWindowHandlesForDisplayLocked(
             continue;
         }
 
-        if (oldHandlesById.find(handle->getId()) != oldHandlesById.end()) {
+        if ((oldHandlesById.find(handle->getId()) != oldHandlesById.end()) &&
+                (oldHandlesById.at(handle->getId())->getToken() == handle->getToken())) {
             const sp<InputWindowHandle>& oldHandle = oldHandlesById.at(handle->getId());
             oldHandle->updateFrom(handle);
             newHandles.push_back(oldHandle);
@@ -3757,12 +3790,12 @@ void InputDispatcher::setFocusedApplication(
         if (inputApplicationHandle != nullptr && inputApplicationHandle->updateInfo()) {
             if (oldFocusedApplicationHandle != inputApplicationHandle) {
                 if (oldFocusedApplicationHandle != nullptr) {
-                    resetANRTimeoutsLocked();
+                    resetAnrTimeoutsLocked();
                 }
                 mFocusedApplicationHandlesByDisplay[displayId] = inputApplicationHandle;
             }
         } else if (oldFocusedApplicationHandle != nullptr) {
-            resetANRTimeoutsLocked();
+            resetAnrTimeoutsLocked();
             oldFocusedApplicationHandle.clear();
             mFocusedApplicationHandlesByDisplay.erase(displayId);
         }
@@ -3843,7 +3876,7 @@ void InputDispatcher::setInputDispatchMode(bool enabled, bool frozen) {
 
         if (mDispatchEnabled != enabled || mDispatchFrozen != frozen) {
             if (mDispatchFrozen && !frozen) {
-                resetANRTimeoutsLocked();
+                resetAnrTimeoutsLocked();
             }
 
             if (mDispatchEnabled && !enabled) {
@@ -3983,7 +4016,7 @@ void InputDispatcher::resetAndDropEverythingLocked(const char* reason) {
     resetKeyRepeatLocked();
     releasePendingEventLocked();
     drainInboundQueueLocked();
-    resetANRTimeoutsLocked();
+    resetAnrTimeoutsLocked();
 
     mTouchStatesByDisplay.clear();
     mLastHoverWindowHandle.clear();
@@ -4014,11 +4047,12 @@ void InputDispatcher::dumpDispatchStateLocked(std::string& dump) {
             const int32_t displayId = it.first;
             const sp<InputApplicationHandle>& applicationHandle = it.second;
             dump += StringPrintf(INDENT2 "displayId=%" PRId32
-                                         ", name='%s', dispatchingTimeout=%0.3fms\n",
+                                         ", name='%s', dispatchingTimeout=%" PRId64 "ms\n",
                                  displayId, applicationHandle->getName().c_str(),
-                                 applicationHandle->getDispatchingTimeout(
-                                         DEFAULT_INPUT_DISPATCHING_TIMEOUT) /
-                                         1000000.0);
+                                 ns2ms(applicationHandle
+                                               ->getDispatchingTimeout(
+                                                       DEFAULT_INPUT_DISPATCHING_TIMEOUT)
+                                               .count()));
         }
     } else {
         dump += StringPrintf(INDENT "FocusedApplications: <none>\n");
@@ -4098,9 +4132,10 @@ void InputDispatcher::dumpDispatchStateLocked(std::string& dump) {
                                          windowInfo->windowXScale, windowInfo->windowYScale);
                     dumpRegion(dump, windowInfo->touchableRegion);
                     dump += StringPrintf(", inputFeatures=0x%08x", windowInfo->inputFeatures);
-                    dump += StringPrintf(", ownerPid=%d, ownerUid=%d, dispatchingTimeout=%0.3fms\n",
+                    dump += StringPrintf(", ownerPid=%d, ownerUid=%d, dispatchingTimeout=%" PRId64
+                                         "ms\n",
                                          windowInfo->ownerPid, windowInfo->ownerUid,
-                                         windowInfo->dispatchingTimeout / 1000000.0);
+                                         ns2ms(windowInfo->dispatchingTimeout));
                 }
             } else {
                 dump += INDENT2 "Windows: <none>\n";
@@ -4133,7 +4168,7 @@ void InputDispatcher::dumpDispatchStateLocked(std::string& dump) {
         for (EventEntry* entry : mRecentQueue) {
             dump += INDENT2;
             entry->appendDescription(dump);
-            dump += StringPrintf(", age=%0.1fms\n", (currentTime - entry->eventTime) * 0.000001f);
+            dump += StringPrintf(", age=%" PRId64 "ms\n", ns2ms(currentTime - entry->eventTime));
         }
     } else {
         dump += INDENT "RecentQueue: <empty>\n";
@@ -4144,8 +4179,8 @@ void InputDispatcher::dumpDispatchStateLocked(std::string& dump) {
         dump += INDENT "PendingEvent:\n";
         dump += INDENT2;
         mPendingEvent->appendDescription(dump);
-        dump += StringPrintf(", age=%0.1fms\n",
-                             (currentTime - mPendingEvent->eventTime) * 0.000001f);
+        dump += StringPrintf(", age=%" PRId64 "ms\n",
+                             ns2ms(currentTime - mPendingEvent->eventTime));
     } else {
         dump += INDENT "PendingEvent: <none>\n";
     }
@@ -4156,7 +4191,7 @@ void InputDispatcher::dumpDispatchStateLocked(std::string& dump) {
         for (EventEntry* entry : mInboundQueue) {
             dump += INDENT2;
             entry->appendDescription(dump);
-            dump += StringPrintf(", age=%0.1fms\n", (currentTime - entry->eventTime) * 0.000001f);
+            dump += StringPrintf(", age=%" PRId64 "ms\n", ns2ms(currentTime - entry->eventTime));
         }
     } else {
         dump += INDENT "InboundQueue: <empty>\n";
@@ -4191,9 +4226,10 @@ void InputDispatcher::dumpDispatchStateLocked(std::string& dump) {
                 for (DispatchEntry* entry : connection->outboundQueue) {
                     dump.append(INDENT4);
                     entry->eventEntry->appendDescription(dump);
-                    dump += StringPrintf(", targetFlags=0x%08x, resolvedAction=%d, age=%0.1fms\n",
+                    dump += StringPrintf(", targetFlags=0x%08x, resolvedAction=%d, age=%" PRId64
+                                         "ms\n",
                                          entry->targetFlags, entry->resolvedAction,
-                                         (currentTime - entry->eventEntry->eventTime) * 0.000001f);
+                                         ns2ms(currentTime - entry->eventEntry->eventTime));
                 }
             } else {
                 dump += INDENT3 "OutboundQueue: <empty>\n";
@@ -4206,10 +4242,10 @@ void InputDispatcher::dumpDispatchStateLocked(std::string& dump) {
                     dump += INDENT4;
                     entry->eventEntry->appendDescription(dump);
                     dump += StringPrintf(", targetFlags=0x%08x, resolvedAction=%d, "
-                                         "age=%0.1fms, wait=%0.1fms\n",
+                                         "age=%" PRId64 "ms, wait=%" PRId64 "ms\n",
                                          entry->targetFlags, entry->resolvedAction,
-                                         (currentTime - entry->eventEntry->eventTime) * 0.000001f,
-                                         (currentTime - entry->deliveryTime) * 0.000001f);
+                                         ns2ms(currentTime - entry->eventEntry->eventTime),
+                                         ns2ms(currentTime - entry->deliveryTime));
                 }
             } else {
                 dump += INDENT3 "WaitQueue: <empty>\n";
@@ -4220,16 +4256,16 @@ void InputDispatcher::dumpDispatchStateLocked(std::string& dump) {
     }
 
     if (isAppSwitchPendingLocked()) {
-        dump += StringPrintf(INDENT "AppSwitch: pending, due in %0.1fms\n",
-                             (mAppSwitchDueTime - now()) / 1000000.0);
+        dump += StringPrintf(INDENT "AppSwitch: pending, due in %" PRId64 "ms\n",
+                             ns2ms(mAppSwitchDueTime - now()));
     } else {
         dump += INDENT "AppSwitch: not pending\n";
     }
 
     dump += INDENT "Configuration:\n";
-    dump += StringPrintf(INDENT2 "KeyRepeatDelay: %0.1fms\n", mConfig.keyRepeatDelay * 0.000001f);
-    dump += StringPrintf(INDENT2 "KeyRepeatTimeout: %0.1fms\n",
-                         mConfig.keyRepeatTimeout * 0.000001f);
+    dump += StringPrintf(INDENT2 "KeyRepeatDelay: %" PRId64 "ms\n", ns2ms(mConfig.keyRepeatDelay));
+    dump += StringPrintf(INDENT2 "KeyRepeatTimeout: %" PRId64 "ms\n",
+                         ns2ms(mConfig.keyRepeatTimeout));
 }
 
 void InputDispatcher::dumpMonitors(std::string& dump, const std::vector<Monitor>& monitors) {
@@ -4331,8 +4367,7 @@ status_t InputDispatcher::unregisterInputChannelLocked(const sp<InputChannel>& i
         return BAD_VALUE;
     }
 
-    [[maybe_unused]] const bool removed = removeByValue(mConnectionsByFd, connection);
-    ALOG_ASSERT(removed);
+    removeConnectionLocked(connection);
     mInputChannelsByToken.erase(inputChannel->getConnectionToken());
 
     if (connection->monitor) {
@@ -4434,7 +4469,7 @@ std::optional<int32_t> InputDispatcher::findGestureMonitorDisplayByTokenLocked(
     return std::nullopt;
 }
 
-sp<Connection> InputDispatcher::getConnectionLocked(const sp<IBinder>& inputConnectionToken) {
+sp<Connection> InputDispatcher::getConnectionLocked(const sp<IBinder>& inputConnectionToken) const {
     if (inputConnectionToken == nullptr) {
         return nullptr;
     }
@@ -4447,6 +4482,10 @@ sp<Connection> InputDispatcher::getConnectionLocked(const sp<IBinder>& inputConn
     }
 
     return nullptr;
+}
+
+void InputDispatcher::removeConnectionLocked(const sp<Connection>& connection) {
+    removeByValue(mConnectionsByFd, connection);
 }
 
 void InputDispatcher::onDispatchCycleFinishedLocked(nsecs_t currentTime,
@@ -4483,7 +4522,7 @@ void InputDispatcher::onFocusChangedLocked(const sp<InputWindowHandle>& oldFocus
     postCommandLocked(std::move(commandEntry));
 }
 
-void InputDispatcher::onANRLocked(nsecs_t currentTime,
+void InputDispatcher::onAnrLocked(nsecs_t currentTime,
                                   const sp<InputApplicationHandle>& applicationHandle,
                                   const sp<InputWindowHandle>& windowHandle, nsecs_t eventTime,
                                   nsecs_t waitStartTime, const char* reason) {
@@ -4500,19 +4539,19 @@ void InputDispatcher::onANRLocked(nsecs_t currentTime,
     localtime_r(&t, &tm);
     char timestr[64];
     strftime(timestr, sizeof(timestr), "%F %T", &tm);
-    mLastANRState.clear();
-    mLastANRState += INDENT "ANR:\n";
-    mLastANRState += StringPrintf(INDENT2 "Time: %s\n", timestr);
-    mLastANRState +=
+    mLastAnrState.clear();
+    mLastAnrState += INDENT "ANR:\n";
+    mLastAnrState += StringPrintf(INDENT2 "Time: %s\n", timestr);
+    mLastAnrState +=
             StringPrintf(INDENT2 "Window: %s\n",
                          getApplicationWindowLabel(applicationHandle, windowHandle).c_str());
-    mLastANRState += StringPrintf(INDENT2 "DispatchLatency: %0.1fms\n", dispatchLatency);
-    mLastANRState += StringPrintf(INDENT2 "WaitDuration: %0.1fms\n", waitDuration);
-    mLastANRState += StringPrintf(INDENT2 "Reason: %s\n", reason);
-    dumpDispatchStateLocked(mLastANRState);
+    mLastAnrState += StringPrintf(INDENT2 "DispatchLatency: %0.1fms\n", dispatchLatency);
+    mLastAnrState += StringPrintf(INDENT2 "WaitDuration: %0.1fms\n", waitDuration);
+    mLastAnrState += StringPrintf(INDENT2 "Reason: %s\n", reason);
+    dumpDispatchStateLocked(mLastAnrState);
 
     std::unique_ptr<CommandEntry> commandEntry =
-            std::make_unique<CommandEntry>(&InputDispatcher::doNotifyANRLockedInterruptible);
+            std::make_unique<CommandEntry>(&InputDispatcher::doNotifyAnrLockedInterruptible);
     commandEntry->inputApplicationHandle = applicationHandle;
     commandEntry->inputChannel =
             windowHandle != nullptr ? getInputChannelLocked(windowHandle->getToken()) : nullptr;
@@ -4548,17 +4587,17 @@ void InputDispatcher::doNotifyFocusChangedLockedInterruptible(CommandEntry* comm
     mLock.lock();
 }
 
-void InputDispatcher::doNotifyANRLockedInterruptible(CommandEntry* commandEntry) {
+void InputDispatcher::doNotifyAnrLockedInterruptible(CommandEntry* commandEntry) {
     sp<IBinder> token =
             commandEntry->inputChannel ? commandEntry->inputChannel->getConnectionToken() : nullptr;
     mLock.unlock();
 
-    nsecs_t newTimeout =
-            mPolicy->notifyANR(commandEntry->inputApplicationHandle, token, commandEntry->reason);
+    const nsecs_t timeoutExtension =
+            mPolicy->notifyAnr(commandEntry->inputApplicationHandle, token, commandEntry->reason);
 
     mLock.lock();
 
-    resumeAfterTargetsNotReadyTimeoutLocked(newTimeout, token);
+    resumeAfterTargetsNotReadyTimeoutLocked(timeoutExtension, token);
 }
 
 void InputDispatcher::doInterceptKeyBeforeDispatchingLockedInterruptible(
@@ -4611,14 +4650,12 @@ void InputDispatcher::doDispatchCycleFinishedLockedInterruptible(CommandEntry* c
     }
     DispatchEntry* dispatchEntry = *dispatchEntryIt;
 
-    nsecs_t eventDuration = finishTime - dispatchEntry->deliveryTime;
+    const nsecs_t eventDuration = finishTime - dispatchEntry->deliveryTime;
     if (eventDuration > SLOW_EVENT_PROCESSING_WARNING_TIMEOUT) {
-        std::string msg =
-                StringPrintf("Window '%s' spent %0.1fms processing the last input event: ",
-                             connection->getWindowName().c_str(), eventDuration * 0.000001f);
-        dispatchEntry->eventEntry->appendDescription(msg);
-        ALOGI("%s", msg.c_str());
+        ALOGI("%s spent %" PRId64 "ms processing %s", connection->getWindowName().c_str(),
+              ns2ms(eventDuration), dispatchEntry->eventEntry->getDescription().c_str());
     }
+    reportDispatchStatistics(std::chrono::nanoseconds(eventDuration), *connection, handled);
 
     bool restartEvent;
     if (dispatchEntry->eventEntry->type == EventEntry::Type::KEY) {
@@ -4634,7 +4671,7 @@ void InputDispatcher::doDispatchCycleFinishedLockedInterruptible(CommandEntry* c
     }
 
     // Dequeue the event and start the next cycle.
-    // Note that because the lock might have been released, it is possible that the
+    // Because the lock might have been released, it is possible that the
     // contents of the wait queue to have been drained, so we need to double-check
     // a few things.
     dispatchEntryIt = connection->findWaitQueueEntry(seq);
@@ -4853,9 +4890,8 @@ KeyEvent InputDispatcher::createKeyEvent(const KeyEntry& entry) {
     return event;
 }
 
-void InputDispatcher::updateDispatchStatistics(nsecs_t currentTime, const EventEntry& entry,
-                                               int32_t injectionResult,
-                                               nsecs_t timeSpentWaitingForApplication) {
+void InputDispatcher::reportDispatchStatistics(std::chrono::nanoseconds eventDuration,
+                                               const Connection& connection, bool handled) {
     // TODO Write some statistics about how long we spend waiting.
 }
 
@@ -4915,9 +4951,9 @@ void InputDispatcher::dump(std::string& dump) {
     dump += "Input Dispatcher State:\n";
     dumpDispatchStateLocked(dump);
 
-    if (!mLastANRState.empty()) {
+    if (!mLastAnrState.empty()) {
         dump += "\nInput Dispatcher State at time of last ANR:\n";
-        dump += mLastANRState;
+        dump += mLastAnrState;
     }
 }
 

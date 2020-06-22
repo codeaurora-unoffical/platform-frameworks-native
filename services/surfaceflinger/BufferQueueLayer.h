@@ -43,8 +43,6 @@ public:
 
     void onLayerDisplayed(const sp<Fence>& releaseFence) override;
 
-    void setTransformHint(uint32_t orientation) const override;
-
     std::vector<OccupancyTracker::Segment> getOccupancyHistory(bool forceFlush) override;
 
     // If a buffer was replaced this frame, release the former buffer
@@ -72,6 +70,7 @@ private:
     bool getSidebandStreamChanged() const override;
 
     bool latchSidebandStream(bool& recomputeVisibleRegions) override;
+    void setTransformHint(ui::Transform::RotationFlags displayTransformHint) override;
 
     bool hasFrameUpdate() const override;
 
@@ -82,7 +81,6 @@ private:
     status_t updateActiveBuffer() override;
     status_t updateFrameNumber(nsecs_t latchTime) override;
 
-    void preparePerFrameCompositionState() override;
     sp<Layer> createClone() override;
 
     void onFrameAvailable(const BufferItem& item);
@@ -150,6 +148,7 @@ private:
     std::atomic<bool> mSidebandStreamChanged{false};
 
     sp<ContentsChangedListener> mContentsChangedListener;
+    nsecs_t mLastTimeStamp = -1;
 };
 
 } // namespace android

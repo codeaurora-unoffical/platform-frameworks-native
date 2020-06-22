@@ -39,13 +39,11 @@ cc_defaults {
         "libbinder",
         "libbufferhubqueue",
         "libcutils",
-        "libdl",
         "libEGL",
         "libfmq",
         "libGLESv1_CM",
         "libGLESv2",
         "libgui",
-        "libhardware",
         "libhidlbase",
         "liblayers_proto",
         "liblog",
@@ -75,7 +73,6 @@ cc_defaults {
         "librenderengine",
         "libserviceutils",
         "libtrace_proto",
-        "libvr_manager",
         "libvrflinger",
     ],
     header_libs: [
@@ -289,6 +286,7 @@ cc_library_shared {
     export_shared_lib_headers: [
         "android.hardware.graphics.common@1.2",
         "libhidlbase",
+        "libui",
     ],
     export_static_lib_headers: [
         "SurfaceFlingerProperties",

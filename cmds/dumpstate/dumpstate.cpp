@@ -169,6 +169,7 @@ void add_mountinfo();
 #define OTA_METADATA_DIR "/metadata/ota"
 #define SNAPSHOTCTL_LOG_DIR "/data/misc/snapshotctl_log"
 #define LINKERCONFIG_DIR "/linkerconfig"
+#define PACKAGE_DEX_USE_LIST "/data/system/package-dex-usage.list"
 
 // TODO(narayan): Since this information has to be kept in sync
 // with tombstoned, we should just put it in a common header.
@@ -304,8 +305,9 @@ static const CommandOptions AS_ROOT_20 = CommandOptions::WithTimeout(20).AsRoot(
 
 /*
  * Returns a vector of dump fds under |dir_path| with a given |file_prefix|.
- * The returned vector is sorted by the mtimes of the dumps. If |limit_by_mtime|
- * is set, the vector only contains files that were written in the last 30 minutes.
+ * The returned vector is sorted by the mtimes of the dumps with descending
+ * order. If |limit_by_mtime| is set, the vector only contains files that
+ * were written in the last 30 minutes.
  */
 static std::vector<DumpData> GetDumpFds(const std::string& dir_path,
                                         const std::string& file_prefix,
@@ -351,6 +353,10 @@ static std::vector<DumpData> GetDumpFds(const std::string& dir_path,
         }
 
         dump_data.emplace_back(DumpData{abs_path, std::move(fd), st.st_mtime});
+    }
+    if (!dump_data.empty()) {
+        std::sort(dump_data.begin(), dump_data.end(),
+            [](const auto& a, const auto& b) { return a.mtime > b.mtime; });
     }
 
     return dump_data;
@@ -1361,6 +1367,53 @@ static void DumpExternalFragmentationInfo() {
     printf("\n");
 }
 
+static void DumpstateArcOnly() {
+    // Trimmed-down version of dumpstate to only include a whitelisted
+    // set of logs (system log, event log, and system server / system app
+    // crashes, and ARC networking logs). See b/136273873 and b/138459828
+    // for context. New sections must be first approved by Chrome OS Privacy
+    // and then added to server side cros monitoring PII scrubber before adding
+    // them here. See cl/312126645 for an example.
+    DurationReporter duration_reporter("DUMPSTATE");
+    unsigned long timeout_ms;
+    // calculate timeout
+    timeout_ms = logcat_timeout({"main", "system", "crash"});
+    RunCommand("SYSTEM LOG",
+               {"logcat", "-v", "threadtime", "-v", "printable", "-v", "uid", "-d", "*:v"},
+               CommandOptions::WithTimeoutInMs(timeout_ms).Build());
+    timeout_ms = logcat_timeout({"events"});
+    RunCommand(
+        "EVENT LOG",
+        {"logcat", "-b", "events", "-v", "threadtime", "-v", "printable", "-v", "uid", "-d", "*:v"},
+        CommandOptions::WithTimeoutInMs(timeout_ms).Build());
+
+    printf("========================================================\n");
+    printf("== Networking Service\n");
+    printf("========================================================\n");
+
+    // ARC networking service implements dumpsys by reusing the 'wifi' service name.
+    // The top-level handler is implemented in handleDump() in
+    // vendor/google_arc/libs/arc-services/src/com/android/server/arc/net/ArcNetworkService.java.
+    // It outputs a subset of Android system server state relevant for debugging ARC
+    // connectivity issues, in a PII-free manner. See b/147270970.
+    RunDumpsys("DUMPSYS NETWORK_SERVICE_LIMITED", {"wifi", "-a"},
+               CommandOptions::WithTimeout(90).Build(), SEC_TO_MSEC(10));
+
+    printf("========================================================\n");
+    printf("== Dropbox crashes\n");
+    printf("========================================================\n");
+
+    RunDumpsys("DROPBOX SYSTEM SERVER CRASHES", {"dropbox", "-p", "system_server_crash"});
+    RunDumpsys("DROPBOX SYSTEM APP CRASHES", {"dropbox", "-p", "system_app_crash"});
+
+    printf("========================================================\n");
+    printf("== Final progress (pid %d): %d/%d (estimated %d)\n", ds.pid_, ds.progress_->Get(),
+           ds.progress_->GetMax(), ds.progress_->GetInitialMax());
+    printf("========================================================\n");
+    printf("== dumpstate: done (id %d)\n", ds.id_);
+    printf("========================================================\n");
+}
+
 // Dumps various things. Returns early with status USER_CONSENT_DENIED if user denies consent
 // via the consent they are shown. Ignores other errors that occur while running various
 // commands. The consent checking is currently done around long running tasks, which happen to
@@ -1612,6 +1665,7 @@ Dumpstate::RunStatus Dumpstate::DumpstateDefaultAfterCritical() {
     if (!PropertiesHelper::IsUserBuild()) {
         ds.AddDir(PROFILE_DATA_DIR_CUR, true);
         ds.AddDir(PROFILE_DATA_DIR_REF, true);
+        ds.AddZipEntry(ZIP_ROOT_DIR + PACKAGE_DEX_USE_LIST, PACKAGE_DEX_USE_LIST);
     }
     ds.AddDir(PREREBOOT_DATA_DIR, false);
     add_mountinfo();
@@ -2046,7 +2100,7 @@ void Dumpstate::DumpstateBoard() {
 static void ShowUsage() {
     fprintf(stderr,
             "usage: dumpstate [-h] [-b soundfile] [-e soundfile] [-d] [-p] "
-            "[-z] [-s] [-S] [-q] [-P] [-R] [-V version]\n"
+            "[-z] [-s] [-S] [-q] [-P] [-R] [-A] [-V version]\n"
             "  -h: display this help message\n"
             "  -b: play sound file instead of vibrate, at beginning of job\n"
             "  -e: play sound file instead of vibrate, at end of job\n"
@@ -2059,6 +2113,7 @@ static void ShowUsage() {
             "  -P: send broadcast when started and do progress updates\n"
             "  -R: take bugreport in remote mode (requires -z and -d, shouldn't be used with -P)\n"
             "  -w: start binder service and make it wait for a call to startBugreport\n"
+            "  -A: output limited information that is safe for submission in ARC++ bugreports\n"
             "  -v: prints the dumpstate header and exit\n");
 }
 
@@ -2304,13 +2359,12 @@ static void LogDumpOptions(const Dumpstate::DumpOptions& options) {
         "do_zip_file: %d do_vibrate: %d use_socket: %d use_control_socket: %d do_screenshot: %d "
         "is_remote_mode: %d show_header_only: %d do_start_service: %d telephony_only: %d "
         "wifi_only: %d do_progress_updates: %d fd: %d bugreport_mode: %s dumpstate_hal_mode: %s "
-        "args: %s\n",
+        "arc_only: %d args: %s\n",
         options.do_zip_file, options.do_vibrate, options.use_socket, options.use_control_socket,
         options.do_screenshot, options.is_remote_mode, options.show_header_only,
-        options.do_start_service,
-        options.telephony_only, options.wifi_only, options.do_progress_updates,
-        options.bugreport_fd.get(), options.bugreport_mode.c_str(),
-        toString(options.dumpstate_hal_mode).c_str(), options.args.c_str());
+        options.do_start_service, options.telephony_only, options.wifi_only,
+        options.do_progress_updates, options.bugreport_fd.get(), options.bugreport_mode.c_str(),
+        toString(options.dumpstate_hal_mode).c_str(), options.arc_only, options.args.c_str());
 }
 
 void Dumpstate::DumpOptions::Initialize(BugreportMode bugreport_mode,
@@ -2332,7 +2386,7 @@ void Dumpstate::DumpOptions::Initialize(BugreportMode bugreport_mode,
 Dumpstate::RunStatus Dumpstate::DumpOptions::Initialize(int argc, char* argv[]) {
     RunStatus status = RunStatus::OK;
     int c;
-    while ((c = getopt(argc, argv, "dho:svqzpPBRSV:w")) != -1) {
+    while ((c = getopt(argc, argv, "dho:svqzpAPBRSV:w")) != -1) {
         switch (c) {
             // clang-format off
             case 'd': do_add_date = true;            break;
@@ -2344,6 +2398,7 @@ Dumpstate::RunStatus Dumpstate::DumpOptions::Initialize(int argc, char* argv[]) 
             case 'p': do_screenshot = true;          break;
             case 'P': do_progress_updates = true;    break;
             case 'R': is_remote_mode = true;         break;
+            case 'A': arc_only = true;               break;
             case 'V':                                break;  // compatibility no-op
             case 'w':
                 // This was already processed
@@ -2628,21 +2683,30 @@ Dumpstate::RunStatus Dumpstate::RunInternal(int32_t calling_uid,
     // duration is logged into MYLOG instead.
     PrintHeader();
 
+    // TODO(nandana) reduce code repetition in if branches
     if (options_->telephony_only) {
         MaybeTakeEarlyScreenshot();
+        onUiIntensiveBugreportDumpsFinished(calling_uid, calling_package);
         MaybeCheckUserConsent(calling_uid, calling_package);
         DumpstateTelephonyOnly(calling_package);
         DumpstateBoard();
     } else if (options_->wifi_only) {
         MaybeTakeEarlyScreenshot();
+        onUiIntensiveBugreportDumpsFinished(calling_uid, calling_package);
         MaybeCheckUserConsent(calling_uid, calling_package);
         DumpstateWifiOnly();
+    } else if (options_->arc_only) {
+        MaybeTakeEarlyScreenshot();
+        onUiIntensiveBugreportDumpsFinished(calling_uid, calling_package);
+        MaybeCheckUserConsent(calling_uid, calling_package);
+        DumpstateArcOnly();
     } else {
         // Invoke critical dumpsys first to preserve system state, before doing anything else.
         RunDumpsysCritical();
 
         // Take screenshot and get consent only after critical dumpsys has finished.
         MaybeTakeEarlyScreenshot();
+        onUiIntensiveBugreportDumpsFinished(calling_uid, calling_package);
         MaybeCheckUserConsent(calling_uid, calling_package);
 
         // Dump state for the default case. This also drops root.
@@ -2730,6 +2794,19 @@ void Dumpstate::MaybeTakeEarlyScreenshot() {
     }
 
     TakeScreenshot();
+}
+
+void Dumpstate::onUiIntensiveBugreportDumpsFinished(int32_t calling_uid,
+                                                    const std::string& calling_package) {
+    if (calling_uid == AID_SHELL || !CalledByApi()) {
+        return;
+    }
+    if (listener_ != nullptr) {
+        // Let listener know ui intensive bugreport dumps are finished, then it can do event
+        // handling if required.
+        android::String16 package(calling_package.c_str());
+        listener_->onUiIntensiveBugreportDumpsFinished(package);
+    }
 }
 
 void Dumpstate::MaybeCheckUserConsent(int32_t calling_uid, const std::string& calling_package) {
