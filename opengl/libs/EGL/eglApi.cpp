@@ -550,7 +550,7 @@ static EGLBoolean processAttributes(egl_display_ptr dp, NativeWindowType window,
         bool copyAttribute = true;
         if (attr[0] == EGL_GL_COLORSPACE_KHR) {
             // Fail immediately if the driver doesn't have color space support at all.
-            if (!dp->hasColorSpaceSupport) return false;
+            if (!dp->hasColorSpaceSupport) return setError(EGL_BAD_ATTRIBUTE, EGL_FALSE);
             *colorSpace = attr[1];
 
             // Strip the attribute if the driver doesn't understand it.
@@ -594,12 +594,12 @@ static EGLBoolean processAttributes(egl_display_ptr dp, NativeWindowType window,
             ALOGE("processAttributes: invalid window (win=%p) "
                   "failed (%#x) (already connected to another API?)",
                   window, err);
-            return false;
+            return setError(EGL_BAD_NATIVE_WINDOW, EGL_FALSE);
         }
         if (!windowSupportsWideColor) {
             // Application has asked for a wide-color colorspace but
             // wide-color support isn't available on the display the window is on.
-            return false;
+            return setError(EGL_BAD_MATCH, EGL_FALSE);
         }
     }
     return true;
@@ -731,7 +731,7 @@ EGLSurface eglCreateWindowSurface(  EGLDisplay dpy, EGLConfig config,
                                &strippedAttribList)) {
             ALOGE("error invalid colorspace: %d", colorSpace);
             native_window_api_disconnect(window, NATIVE_WINDOW_API_EGL);
-            return setError(EGL_BAD_ATTRIBUTE, EGL_NO_SURFACE);
+            return EGL_NO_SURFACE;
         }
         attrib_list = strippedAttribList.data();
 
@@ -796,7 +796,7 @@ EGLSurface eglCreatePixmapSurface(  EGLDisplay dpy, EGLConfig config,
         if (!processAttributes(dp, nullptr, format, attrib_list, &colorSpace,
                                &strippedAttribList)) {
             ALOGE("error invalid colorspace: %d", colorSpace);
-            return setError(EGL_BAD_ATTRIBUTE, EGL_NO_SURFACE);
+            return EGL_NO_SURFACE;
         }
         attrib_list = strippedAttribList.data();
 
@@ -830,7 +830,7 @@ EGLSurface eglCreatePbufferSurface( EGLDisplay dpy, EGLConfig config,
         if (!processAttributes(dp, nullptr, format, attrib_list, &colorSpace,
                                &strippedAttribList)) {
             ALOGE("error invalid colorspace: %d", colorSpace);
-            return setError(EGL_BAD_ATTRIBUTE, EGL_NO_SURFACE);
+            return EGL_NO_SURFACE;
         }
         attrib_list = strippedAttribList.data();
 
