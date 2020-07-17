@@ -1345,6 +1345,7 @@ void Layer::miniDumpHeader(std::string& result) {
     result.append(" Layer name\n");
     result.append("           Z | ");
     result.append(" Window Type | ");
+    result.append(" Layer Type  | ");
     result.append(" Comp Type | ");
     result.append(" Transform | ");
     result.append("  Disp Frame (LTRB) | ");
@@ -1382,6 +1383,7 @@ void Layer::miniDump(std::string& result, const sp<DisplayDevice>& displayDevice
         StringAppendF(&result, "  %10d | ", layerState.z);
     }
     StringAppendF(&result, "  %10d | ", mWindowType);
+    StringAppendF(&result, "  %10d | ", mLayerType);
     StringAppendF(&result, "%10s | ", toString(getCompositionType(displayDevice)).c_str());
     StringAppendF(&result, "%10s | ",
                   toString(getCompositionLayer() ? compositionState.bufferTransform
@@ -2145,7 +2147,7 @@ std::shared_ptr<compositionengine::Layer> Layer::getCompositionLayer() const {
 }
 
 bool Layer::canReceiveInput() const {
-    return isVisible();
+    return !isHiddenByPolicy();
 }
 
 compositionengine::OutputLayer* Layer::findOutputLayerForDisplay(
