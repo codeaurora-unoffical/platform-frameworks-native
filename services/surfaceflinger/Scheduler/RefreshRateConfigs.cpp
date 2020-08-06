@@ -31,6 +31,23 @@ namespace android::scheduler {
 using AllRefreshRatesMapType = RefreshRateConfigs::AllRefreshRatesMapType;
 using RefreshRate = RefreshRateConfigs::RefreshRate;
 
+std::string RefreshRateConfigs::layerVoteTypeString(LayerVoteType vote) {
+    switch (vote) {
+        case LayerVoteType::NoVote:
+            return "NoVote";
+        case LayerVoteType::Min:
+            return "Min";
+        case LayerVoteType::Max:
+            return "Max";
+        case LayerVoteType::Heuristic:
+            return "Heuristic";
+        case LayerVoteType::ExplicitDefault:
+            return "ExplicitDefault";
+        case LayerVoteType::ExplicitExactOrMultiple:
+            return "ExplicitExactOrMultiple";
+    }
+}
+
 const RefreshRate& RefreshRateConfigs::getRefreshRateForContent(
         const std::vector<LayerRequirement>& layers) const {
     std::lock_guard lock(mLock);
@@ -97,22 +114,26 @@ std::pair<nsecs_t, nsecs_t> RefreshRateConfigs::getDisplayFrames(nsecs_t layerPe
     return {displayFramesQuot, displayFramesRem};
 }
 
-const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
-        const std::vector<LayerRequirement>& layers, bool touchActive,
-        bool* touchConsidered) const {
+const RefreshRate& RefreshRateConfigs::getBestRefreshRate(
+        const std::vector<LayerRequirement>& layers, const GlobalSignals& globalSignals,
+        GlobalSignals* outSignalsConsidered) const {
     ATRACE_CALL();
     ALOGV("getRefreshRateForContent %zu layers", layers.size());
 
-    *touchConsidered = false;
-    std::lock_guard lock(mLock);
+    if (outSignalsConsidered) *outSignalsConsidered = {};
+    const auto setTouchConsidered = [&] {
+        if (outSignalsConsidered) {
+            outSignalsConsidered->touch = true;
+        }
+    };
 
-    // If there are not layers, there is not content detection, so return the current
-    // refresh rate.
-    if (layers.empty()) {
-        *touchConsidered = touchActive;
-        return touchActive ? getMaxRefreshRateByPolicyLocked()
-                           : getCurrentRefreshRateByPolicyLocked();
-    }
+    const auto setIdleConsidered = [&] {
+        if (outSignalsConsidered) {
+            outSignalsConsidered->idle = true;
+        }
+    };
+
+    std::lock_guard lock(mLock);
 
     int noVoteLayers = 0;
     int minVoteLayers = 0;
@@ -136,19 +157,39 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
         }
     }
 
+    const bool hasExplicitVoteLayers =
+            explicitDefaultVoteLayers > 0 || explicitExactOrMultipleVoteLayers > 0;
+
     // Consider the touch event if there are no Explicit* layers. Otherwise wait until after we've
     // selected a refresh rate to see if we should apply touch boost.
-    if (touchActive && explicitDefaultVoteLayers == 0 && explicitExactOrMultipleVoteLayers == 0) {
-        *touchConsidered = true;
+    if (globalSignals.touch && !hasExplicitVoteLayers) {
+        ALOGV("TouchBoost - choose %s", getMaxRefreshRateByPolicyLocked().getName().c_str());
+        setTouchConsidered();
+        return getMaxRefreshRateByPolicyLocked();
+    }
+
+    // If the primary range consists of a single refresh rate then we can only
+    // move out the of range if layers explicitly request a different refresh
+    // rate.
+    const Policy* policy = getCurrentPolicyLocked();
+    const bool primaryRangeIsSingleRate = policy->primaryRange.min == policy->primaryRange.max;
+
+    if (!globalSignals.touch && globalSignals.idle &&
+        !(primaryRangeIsSingleRate && hasExplicitVoteLayers)) {
+        ALOGV("Idle - choose %s", getMinRefreshRateByPolicyLocked().getName().c_str());
+        setIdleConsidered();
+        return getMinRefreshRateByPolicyLocked();
+    }
+
+    if (layers.empty() || noVoteLayers == layers.size()) {
         return getMaxRefreshRateByPolicyLocked();
     }
 
     // Only if all layers want Min we should return Min
     if (noVoteLayers + minVoteLayers == layers.size()) {
+        ALOGV("all layers Min - choose %s", getMinRefreshRateByPolicyLocked().getName().c_str());
         return getMinRefreshRateByPolicyLocked();
     }
-
-    const Policy* policy = getCurrentPolicyLocked();
 
     // Find the best refresh rate based on score
     std::vector<std::pair<const RefreshRate*, float>> scores;
@@ -159,7 +200,8 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
     }
 
     for (const auto& layer : layers) {
-        ALOGV("Calculating score for %s (type: %d)", layer.name.c_str(), layer.vote);
+        ALOGV("Calculating score for %s (%s, weight %.2f)", layer.name.c_str(),
+              layerVoteTypeString(layer.vote).c_str(), layer.weight);
         if (layer.vote == LayerVoteType::NoVote || layer.vote == LayerVoteType::Min) {
             continue;
         }
@@ -169,10 +211,12 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
         for (auto i = 0u; i < scores.size(); i++) {
             bool inPrimaryRange =
                     scores[i].first->inPolicy(policy->primaryRange.min, policy->primaryRange.max);
-            if (!inPrimaryRange && layer.vote != LayerVoteType::ExplicitDefault &&
-                layer.vote != LayerVoteType::ExplicitExactOrMultiple) {
-                // Only layers with explicit frame rate settings are allowed to score refresh rates
-                // outside the primary range.
+            if ((primaryRangeIsSingleRate || !inPrimaryRange) &&
+                !(layer.focused &&
+                  (layer.vote == LayerVoteType::ExplicitDefault ||
+                   layer.vote == LayerVoteType::ExplicitExactOrMultiple))) {
+                // Only focused layers with explicit frame rate settings are allowed to score
+                // refresh rates outside the primary range.
                 continue;
             }
 
@@ -213,7 +257,7 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
 
             if (layer.vote == LayerVoteType::ExplicitExactOrMultiple ||
                 layer.vote == LayerVoteType::Heuristic) {
-                const auto layerScore = [&]() {
+                const auto layerScore = [&] {
                     // Calculate how many display vsyncs we need to present a single frame for this
                     // layer
                     const auto [displayFramesQuot, displayFramesRem] =
@@ -243,9 +287,9 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
 
                     return 1.0f / iter;
                 }();
-                ALOGV("%s (ExplicitExactOrMultiple, weight %.2f) %.2fHz gives %s score of %.2f",
-                      layer.name.c_str(), weight, 1e9f / layerPeriod, scores[i].first->name.c_str(),
-                      layerScore);
+                ALOGV("%s (%s, weight %.2f) %.2fHz gives %s score of %.2f", layer.name.c_str(),
+                      layerVoteTypeString(layer.vote).c_str(), weight, 1e9f / layerPeriod,
+                      scores[i].first->name.c_str(), layerScore);
                 scores[i].second += weight * layerScore;
                 continue;
             }
@@ -259,14 +303,29 @@ const RefreshRate& RefreshRateConfigs::getRefreshRateForContentV2(
             ? getBestRefreshRate(scores.rbegin(), scores.rend())
             : getBestRefreshRate(scores.begin(), scores.end());
 
+    if (primaryRangeIsSingleRate) {
+        // If we never scored any layers, then choose the rate from the primary
+        // range instead of picking a random score from the app range.
+        if (std::all_of(scores.begin(), scores.end(),
+                        [](std::pair<const RefreshRate*, float> p) { return p.second == 0; })) {
+            ALOGV("layers not scored - choose %s",
+                  getMaxRefreshRateByPolicyLocked().getName().c_str());
+            return getMaxRefreshRateByPolicyLocked();
+        } else {
+            return *bestRefreshRate;
+        }
+    }
+
     // Consider the touch event if there are no ExplicitDefault layers. ExplicitDefault are mostly
     // interactive (as opposed to ExplicitExactOrMultiple) and therefore if those posted an explicit
     // vote we should not change it if we get a touch event. Only apply touch boost if it will
     // actually increase the refresh rate over the normal selection.
     const RefreshRate& touchRefreshRate = getMaxRefreshRateByPolicyLocked();
-    if (touchActive && explicitDefaultVoteLayers == 0 &&
+
+    if (globalSignals.touch && explicitDefaultVoteLayers == 0 &&
         bestRefreshRate->fps < touchRefreshRate.fps) {
-        *touchConsidered = true;
+        setTouchConsidered();
+        ALOGV("TouchBoost - choose %s", touchRefreshRate.getName().c_str());
         return touchRefreshRate;
     }
 
@@ -340,7 +399,8 @@ void RefreshRateConfigs::setCurrentConfigId(HwcConfigIndexType configId) {
 
 RefreshRateConfigs::RefreshRateConfigs(
         const std::vector<std::shared_ptr<const HWC2::Display::Config>>& configs,
-        HwcConfigIndexType currentConfigId) {
+        HwcConfigIndexType currentConfigId)
+      : mKnownFrameRates(constructKnownFrameRates(configs)) {
     LOG_ALWAYS_FATAL_IF(configs.empty());
     LOG_ALWAYS_FATAL_IF(currentConfigId.value() >= configs.size());
 
@@ -498,6 +558,66 @@ void RefreshRateConfigs::constructAvailableRefreshRates() {
                        &mPrimaryRefreshRates);
     filterRefreshRates(policy->appRequestRange.min, policy->appRequestRange.max, "app request",
                        &mAppRequestRefreshRates);
+}
+
+std::vector<float> RefreshRateConfigs::constructKnownFrameRates(
+        const std::vector<std::shared_ptr<const HWC2::Display::Config>>& configs) {
+    std::vector<float> knownFrameRates = {24.0f, 30.0f, 45.0f, 60.0f, 72.0f};
+    knownFrameRates.reserve(knownFrameRates.size() + configs.size());
+
+    // Add all supported refresh rates to the set
+    for (const auto& config : configs) {
+        const auto refreshRate = 1e9f / config->getVsyncPeriod();
+        knownFrameRates.emplace_back(refreshRate);
+    }
+
+    // Sort and remove duplicates
+    const auto frameRatesEqual = [](float a, float b) { return std::abs(a - b) <= 0.01f; };
+    std::sort(knownFrameRates.begin(), knownFrameRates.end());
+    knownFrameRates.erase(std::unique(knownFrameRates.begin(), knownFrameRates.end(),
+                                      frameRatesEqual),
+                          knownFrameRates.end());
+    return knownFrameRates;
+}
+
+float RefreshRateConfigs::findClosestKnownFrameRate(float frameRate) const {
+    if (frameRate <= *mKnownFrameRates.begin()) {
+        return *mKnownFrameRates.begin();
+    }
+
+    if (frameRate >= *std::prev(mKnownFrameRates.end())) {
+        return *std::prev(mKnownFrameRates.end());
+    }
+
+    auto lowerBound = std::lower_bound(mKnownFrameRates.begin(), mKnownFrameRates.end(), frameRate);
+
+    const auto distance1 = std::abs(frameRate - *lowerBound);
+    const auto distance2 = std::abs(frameRate - *std::prev(lowerBound));
+    return distance1 < distance2 ? *lowerBound : *std::prev(lowerBound);
+}
+
+RefreshRateConfigs::KernelIdleTimerAction RefreshRateConfigs::getIdleTimerAction() const {
+    std::lock_guard lock(mLock);
+    const auto& deviceMin = getMinRefreshRate();
+    const auto& minByPolicy = getMinRefreshRateByPolicyLocked();
+    const auto& maxByPolicy = getMaxRefreshRateByPolicyLocked();
+
+    // Kernel idle timer will set the refresh rate to the device min. If DisplayManager says that
+    // the min allowed refresh rate is higher than the device min, we do not want to enable the
+    // timer.
+    if (deviceMin < minByPolicy) {
+        return RefreshRateConfigs::KernelIdleTimerAction::TurnOff;
+    }
+    if (minByPolicy == maxByPolicy) {
+        // Do not sent the call to toggle off kernel idle timer if the device min and policy min and
+        // max are all the same. This saves us extra unnecessary calls to sysprop.
+        if (deviceMin == minByPolicy) {
+            return RefreshRateConfigs::KernelIdleTimerAction::NoChange;
+        }
+        return RefreshRateConfigs::KernelIdleTimerAction::TurnOff;
+    }
+    // Turn on the timer in all other cases.
+    return RefreshRateConfigs::KernelIdleTimerAction::TurnOn;
 }
 
 } // namespace android::scheduler

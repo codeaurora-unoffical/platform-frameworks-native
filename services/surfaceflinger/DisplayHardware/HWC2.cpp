@@ -208,13 +208,17 @@ Error Display::getDisplayVsyncPeriod(nsecs_t* outVsyncPeriod) const {
         *outVsyncPeriod = static_cast<nsecs_t>(vsyncPeriodNanos);
     } else {
         // Get the default vsync period
-        HWConfigId configId = 0;
-        auto intError_2_1 = mComposer.getActiveConfig(mId, &configId);
-        error = static_cast<Error>(intError_2_1);
-        if (error == Error::NONE) {
-            auto config = mConfigs.at(configId);
-            *outVsyncPeriod = config->getVsyncPeriod();
+        std::shared_ptr<const Display::Config> config;
+        error = getActiveConfig(&config);
+        if (error != Error::NONE) {
+            return error;
         }
+        if (!config) {
+            // HWC has updated the display modes and hasn't notified us yet.
+            return Error::BAD_CONFIG;
+        }
+
+        *outVsyncPeriod = config->getVsyncPeriod();
     }
 
     return error;
@@ -349,7 +353,7 @@ Error Display::getName(std::string* outName) const
 
 Error Display::getRequests(HWC2::DisplayRequest* outDisplayRequests,
                            std::unordered_map<HWC2::Layer*, LayerRequest>* outLayerRequests) {
-    uint32_t intDisplayRequests;
+    uint32_t intDisplayRequests = 0;
     std::vector<Hwc2::Layer> layerIds;
     std::vector<uint32_t> layerRequests;
     auto intError = mComposer.getDisplayRequests(
@@ -668,6 +672,11 @@ Error Display::setContentType(ContentType contentType) {
     return static_cast<Error>(intError);
 }
 
+Error Display::getClientTargetProperty(ClientTargetProperty* outClientTargetProperty) {
+    const auto error = mComposer.getClientTargetProperty(mId, outClientTargetProperty);
+    return static_cast<Error>(error);
+}
+
 // For use by Device
 
 void Display::setConnected(bool connected) {
@@ -885,6 +894,10 @@ Error Layer::setPerFrameMetadata(const int32_t supportedPerFrameMetadata,
             mComposer.setLayerPerFrameMetadata(mDisplayId, mId, perFrameMetadatas));
 
     if (validTypes & HdrMetadata::HDR10PLUS) {
+        if (CC_UNLIKELY(mHdrMetadata.hdr10plus.size() == 0)) {
+            return Error::BAD_PARAMETER;
+        }
+
         std::vector<Hwc2::PerFrameMetadataBlob> perFrameMetadataBlobs;
         perFrameMetadataBlobs.push_back(
                 {Hwc2::PerFrameMetadataKey::HDR10_PLUS_SEI, mHdrMetadata.hdr10plus});
