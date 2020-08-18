@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_LAYER_H
-#define ANDROID_LAYER_H
+#pragma once
 
 #include <compositionengine/LayerFE.h>
 #include <gui/BufferQueue.h>
@@ -77,8 +76,8 @@ class SurfaceInterceptor;
 // ---------------------------------------------------------------------------
 
 struct LayerCreationArgs {
-    LayerCreationArgs(SurfaceFlinger* flinger, const sp<Client> client, std::string name,
-                      uint32_t w, uint32_t h, uint32_t flags, LayerMetadata metadata);
+    LayerCreationArgs(SurfaceFlinger*, sp<Client>, std::string name, uint32_t w, uint32_t h,
+                      uint32_t flags, LayerMetadata);
 
     SurfaceFlinger* flinger;
     const sp<Client> client;
@@ -87,15 +86,24 @@ struct LayerCreationArgs {
     uint32_t h;
     uint32_t flags;
     LayerMetadata metadata;
+
     pid_t callingPid;
     uid_t callingUid;
-    sp<const DisplayDevice> displayDevice;
     uint32_t textureName;
 };
 
 class Layer : public virtual RefBase, compositionengine::LayerFE {
     static std::atomic<int32_t> sSequence;
+    // The following constants represent priority of the window. SF uses this information when
+    // deciding which window has a priority when deciding about the refresh rate of the screen.
+    // Priority 0 is considered the highest priority. -1 means that the priority is unset.
     static constexpr int32_t PRIORITY_UNSET = -1;
+    // Windows that are in focus and voted for the preferred mode ID
+    static constexpr int32_t PRIORITY_FOCUSED_WITH_MODE = 0;
+    // // Windows that are in focus, but have not requested a specific mode ID.
+    static constexpr int32_t PRIORITY_FOCUSED_WITHOUT_MODE = 1;
+    // Windows that are not in focus, but voted for a specific mode ID.
+    static constexpr int32_t PRIORITY_NOT_FOCUSED_WITH_MODE = 2;
 
 public:
     mutable bool contentDirty{false};
@@ -262,6 +270,15 @@ public:
 
         // Indicates whether parents / children of this layer had set FrameRate
         bool treeHasFrameRateVote;
+
+        // Set by window manager indicating the layer and all its children are
+        // in a different orientation than the display. The hint suggests that
+        // the graphic producers should receive a transform hint as if the
+        // display was in this orientation. When the display changes to match
+        // the layer orientation, the graphic producer may not need to allocate
+        // a buffer of a different size. ui::Transform::ROT_INVALID means the
+        // a fixed transform hint is not set.
+        ui::Transform::RotationFlags fixedTransformHint;
     };
 
     explicit Layer(const LayerCreationArgs& args);
@@ -388,9 +405,11 @@ public:
     virtual bool setColorSpaceAgnostic(const bool agnostic);
     bool setShadowRadius(float shadowRadius);
     virtual bool setFrameRateSelectionPriority(int32_t priority);
+    virtual bool setFixedTransformHint(ui::Transform::RotationFlags fixedTransformHint);
     //  If the variable is not set on the layer, it traverses up the tree to inherit the frame
     //  rate priority from its parent.
     virtual int32_t getFrameRateSelectionPriority() const;
+    static bool isLayerFocusedBasedOnPriority(int32_t priority);
 
     virtual ui::Dataspace getDataSpace() const { return ui::Dataspace::UNKNOWN; }
 
@@ -509,15 +528,14 @@ public:
 
     bool isRemovedFromCurrentState() const;
 
-    LayerProto* writeToProto(LayersProto& layersProto,
-                             uint32_t traceFlags = SurfaceTracing::TRACE_ALL,
-                             const sp<const DisplayDevice>& device = nullptr) const;
+    LayerProto* writeToProto(LayersProto& layersProto, uint32_t traceFlags,
+                             const DisplayDevice*) const;
 
     // Write states that are modified by the main thread. This includes drawing
     // state as well as buffer data. This should be called in the main or tracing
     // thread.
-    void writeToProtoDrawingState(LayerProto* layerInfo,
-                                  uint32_t traceFlags = SurfaceTracing::TRACE_ALL) const;
+    void writeToProtoDrawingState(LayerProto* layerInfo, uint32_t traceFlags,
+                                  const DisplayDevice*) const;
     // Write drawing or current state. If writing current state, the caller should hold the
     // external mStateLock. If writing drawing state, this function should be called on the
     // main or tracing thread.
@@ -534,7 +552,7 @@ public:
         return s.activeTransparentRegion_legacy;
     }
     virtual Rect getCrop(const Layer::State& s) const { return s.crop_legacy; }
-    virtual bool needsFiltering(const sp<const DisplayDevice>&) const { return false; }
+    virtual bool needsFiltering(const DisplayDevice*) const { return false; }
     // True if this layer requires filtering
     // This method is distinct from needsFiltering() in how the filter
     // requirement is computed. needsFiltering() compares displayFrame and crop,
@@ -544,8 +562,7 @@ public:
     // different.
     // If the parent transform needs to be undone when capturing the layer, then
     // the inverse parent transform is also required.
-    virtual bool needsFilteringForScreenshots(const sp<const DisplayDevice>&,
-                                              const ui::Transform&) const {
+    virtual bool needsFilteringForScreenshots(const DisplayDevice*, const ui::Transform&) const {
         return false;
     }
 
@@ -606,21 +623,16 @@ public:
 
     virtual bool isHdrY410() const { return false; }
 
-    Hwc2::IComposerClient::Composition getCompositionType(
-            const sp<const DisplayDevice>& display) const;
-    bool getClearClientTarget(const sp<const DisplayDevice>& display) const;
-
     virtual bool shouldPresentNow(nsecs_t /*expectedPresentTime*/) const { return false; }
-    virtual void setTransformHint(uint32_t /*orientation*/) const { }
 
     /*
      * called after composition.
      * returns true if the layer latched a new buffer this frame.
      */
-    virtual bool onPostComposition(sp<const DisplayDevice> /*displayDevice*/,
+    virtual bool onPostComposition(const DisplayDevice*,
                                    const std::shared_ptr<FenceTime>& /*glDoneFence*/,
                                    const std::shared_ptr<FenceTime>& /*presentFence*/,
-                                   const CompositorTiming& /*compositorTiming*/) {
+                                   const CompositorTiming&) {
         return false;
     }
 
@@ -672,9 +684,10 @@ public:
      */
     void addToCurrentState();
 
-    // Updates the transform hint in our SurfaceFlingerConsumer to match
-    // the current orientation of the display device.
-    void updateTransformHint(const sp<const DisplayDevice>& display) const;
+    /*
+     * Sets display transform hint on BufferLayerConsumer.
+     */
+    void updateTransformHint(ui::Transform::RotationFlags);
 
     /*
      * returns the rectangle that crops the content of the layer and scales it
@@ -689,6 +702,8 @@ public:
 
     virtual sp<GraphicBuffer> getBuffer() const { return nullptr; }
 
+    virtual ui::Transform::RotationFlags getTransformHint() const { return ui::Transform::ROT_0; }
+
     /*
      * Returns if a frame is ready
      */
@@ -701,11 +716,10 @@ public:
     inline const State& getCurrentState() const { return mCurrentState; }
     inline State& getCurrentState() { return mCurrentState; }
 
-    LayerDebugInfo getLayerDebugInfo() const;
+    LayerDebugInfo getLayerDebugInfo(const DisplayDevice*) const;
 
-    /* always call base class first */
     static void miniDumpHeader(std::string& result);
-    void miniDump(std::string& result, const sp<DisplayDevice>& display) const;
+    void miniDump(std::string& result, const DisplayDevice&) const;
     void dumpFrameStats(std::string& result) const;
     void dumpFrameEvents(std::string& result);
     void dumpCallingUidPid(std::string& result) const;
@@ -732,6 +746,12 @@ public:
     half4 getColor() const;
     int32_t getBackgroundBlurRadius() const;
     bool drawShadows() const { return mEffectiveShadowRadius > 0.f; };
+
+    // Returns the transform hint set by Window Manager on the layer or one of its parents.
+    // This traverses the current state because the data is needed when creating
+    // the layer(off drawing thread) and the hint should be available before the producer
+    // is ready to acquire a buffer.
+    ui::Transform::RotationFlags getFixedTransformHint() const;
 
     // Returns how rounded corners should be drawn for this layer.
     // This will traverse the hierarchy until it reaches its root, finding topmost rounded
@@ -804,11 +824,6 @@ public:
         return parentBounds;
     }
 
-    compositionengine::OutputLayer* findOutputLayerForDisplay(
-            const sp<const DisplayDevice>& display) const;
-
-    Region debugGetVisibleRegionOnDefaultDisplay() const;
-
     /**
      * Returns the cropped buffer size or the layer crop if the layer has no buffer. Return
      * INVALID_RECT if the layer has no buffer and no crop.
@@ -819,6 +834,7 @@ public:
 
     bool setFrameRate(FrameRate frameRate);
     virtual FrameRate getFrameRateForLayerTree() const;
+    static std::string frameRateCompatibilityString(FrameRateCompatibility compatibility);
 
 protected:
     // constant
@@ -941,10 +957,21 @@ public:
     void setInputInfo(const InputWindowInfo& info);
 
     InputWindowInfo fillInputInfo();
-    bool hasInput() const;
+    /**
+     * Returns whether this layer has an explicitly set input-info.
+     */
+    bool hasInputInfo() const;
+    /**
+     * Return whether this layer needs an input info. For most layer types
+     * this is only true if they explicitly set an input-info but BufferLayer
+     * overrides this so we can generate input-info for Buffered layers that don't
+     * have them (for input occlusion detection checks).
+     */
+    virtual bool needsInputInfo() const { return hasInputInfo(); }
 
 protected:
-    // -----------------------------------------------------------------------
+    compositionengine::OutputLayer* findOutputLayerForDisplay(const DisplayDevice*) const;
+
     bool usingRelativeZ(LayerVector::StateSet stateSet) const;
 
     bool mPremultipliedAlpha{true};
@@ -1016,6 +1043,11 @@ protected:
     const int mWindowType;
 
 private:
+    virtual void setTransformHint(ui::Transform::RotationFlags) {}
+
+    Hwc2::IComposerClient::Composition getCompositionType(const DisplayDevice&) const;
+    Region getVisibleRegion(const DisplayDevice*) const;
+
     /**
      * Returns an unsorted vector of all layers that are part of this tree.
      * That includes the current layer and all its descendants.
@@ -1076,17 +1108,10 @@ private:
     // Find the root of the cloned hierarchy, this means the first non cloned parent.
     // This will return null if first non cloned parent is not found.
     sp<Layer> getClonedRoot();
+
+    // Finds the top most layer in the hierarchy. This will find the root Layer where the parent is
+    // null.
+    sp<Layer> getRootLayer();
 };
 
 } // namespace android
-
-#define RETURN_IF_NO_HWC_LAYER(displayDevice, ...)                                     \
-    do {                                                                               \
-        if (!hasHwcLayer(displayDevice)) {                                             \
-            ALOGE("[%s] %s failed: no HWC layer found for display %s", mName.string(), \
-                  __FUNCTION__, displayDevice->getDebugName().c_str());                \
-            return __VA_ARGS__;                                                        \
-        }                                                                              \
-    } while (false)
-
-#endif // ANDROID_LAYER_H

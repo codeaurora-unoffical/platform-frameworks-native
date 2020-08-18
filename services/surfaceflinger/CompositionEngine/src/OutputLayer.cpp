@@ -149,9 +149,9 @@ FloatRect OutputLayer::calculateOutputSourceCrop() const {
         // a modification of the axes of rotation. To account for this we
         // need to reorient the inverse rotation in terms of the current
         // axes of rotation.
-        bool is_h_flipped = (invTransform & HAL_TRANSFORM_FLIP_H) != 0;
-        bool is_v_flipped = (invTransform & HAL_TRANSFORM_FLIP_V) != 0;
-        if (is_h_flipped == is_v_flipped) {
+        bool isHFlipped = (invTransform & HAL_TRANSFORM_FLIP_H) != 0;
+        bool isVFlipped = (invTransform & HAL_TRANSFORM_FLIP_V) != 0;
+        if (isHFlipped == isVFlipped) {
             invTransform ^= HAL_TRANSFORM_FLIP_V | HAL_TRANSFORM_FLIP_H;
         }
         std::swap(winWidth, winHeight);
@@ -160,18 +160,18 @@ FloatRect OutputLayer::calculateOutputSourceCrop() const {
             activeCrop.transform(invTransform, bufferSize.getWidth(), bufferSize.getHeight());
 
     // below, crop is intersected with winCrop expressed in crop's coordinate space
-    float xScale = crop.getWidth() / float(winWidth);
-    float yScale = crop.getHeight() / float(winHeight);
+    const float xScale = crop.getWidth() / float(winWidth);
+    const float yScale = crop.getHeight() / float(winHeight);
 
-    float insetL = winCrop.left * xScale;
-    float insetT = winCrop.top * yScale;
-    float insetR = (winWidth - winCrop.right) * xScale;
-    float insetB = (winHeight - winCrop.bottom) * yScale;
+    const float insetLeft = winCrop.left * xScale;
+    const float insetTop = winCrop.top * yScale;
+    const float insetRight = (winWidth - winCrop.right) * xScale;
+    const float insetBottom = (winHeight - winCrop.bottom) * yScale;
 
-    crop.left += insetL;
-    crop.top += insetT;
-    crop.right -= insetR;
-    crop.bottom -= insetB;
+    crop.left += insetLeft;
+    crop.top += insetTop;
+    crop.right -= insetRight;
+    crop.bottom -= insetBottom;
 
     return crop;
 }
@@ -223,7 +223,8 @@ Rect OutputLayer::calculateOutputDisplayFrame() const {
     return displayTransform.transform(frame);
 }
 
-uint32_t OutputLayer::calculateOutputRelativeBufferTransform() const {
+uint32_t OutputLayer::calculateOutputRelativeBufferTransform(
+        uint32_t internalDisplayRotationFlags) const {
     const auto& layerState = *getLayerFE().getCompositionState();
     const auto& outputState = getOutput().getState();
 
@@ -241,10 +242,11 @@ uint32_t OutputLayer::calculateOutputRelativeBufferTransform() const {
 
     if (layerState.geomBufferUsesDisplayInverseTransform) {
         /*
-         * the code below applies the primary display's inverse transform to the
-         * buffer
+         * We must apply the internal display's inverse transform to the buffer
+         * transform, and not the one for the output this layer is on.
          */
-        uint32_t invTransform = outputState.orientation;
+        uint32_t invTransform = internalDisplayRotationFlags;
+
         // calculate the inverse transform
         if (invTransform & HAL_TRANSFORM_ROT_90) {
             invTransform ^= HAL_TRANSFORM_FLIP_V | HAL_TRANSFORM_FLIP_H;
@@ -261,9 +263,11 @@ uint32_t OutputLayer::calculateOutputRelativeBufferTransform() const {
 
     // this gives us only the "orientation" component of the transform
     return transform.getOrientation();
-} // namespace impl
+}
 
-void OutputLayer::updateCompositionState(bool includeGeometry, bool forceClientComposition) {
+void OutputLayer::updateCompositionState(
+        bool includeGeometry, bool forceClientComposition,
+        ui::Transform::RotationFlags internalDisplayRotationFlags) {
     const auto* layerFEState = getLayerFE().getCompositionState();
     if (!layerFEState) {
         return;
@@ -283,8 +287,8 @@ void OutputLayer::updateCompositionState(bool includeGeometry, bool forceClientC
 
         state.displayFrame = calculateOutputDisplayFrame();
         state.sourceCrop = calculateOutputSourceCrop();
-        state.bufferTransform =
-                static_cast<Hwc2::Transform>(calculateOutputRelativeBufferTransform());
+        state.bufferTransform = static_cast<Hwc2::Transform>(
+                calculateOutputRelativeBufferTransform(internalDisplayRotationFlags));
 
         if ((layerFEState->isSecure && !outputState.isSecure) ||
             (state.bufferTransform & ui::Transform::ROT_INVALID)) {

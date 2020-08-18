@@ -27,13 +27,13 @@
 #include <EGL/eglext.h>
 #include <EGL/eglext_angle.h>
 
-#include <android/hardware_buffer.h>
+#include <android-base/properties.h>
 #include <android-base/strings.h>
+#include <android/hardware_buffer.h>
 #include <graphicsenv/GraphicsEnv.h>
 #include <private/android/AHardwareBufferHelpers.h>
 
 #include <cutils/compiler.h>
-#include <cutils/properties.h>
 #include <log/log.h>
 
 #include <condition_variable>
@@ -96,7 +96,7 @@ char const * const gBuiltinExtensionString =
         "EGL_EXT_surface_CTA861_3_metadata "
         ;
 
-// Whitelist of extensions exposed to applications if implemented in the vendor driver.
+// Allowed list of extensions exposed to applications if implemented in the vendor driver.
 char const * const gExtensionString  =
         "EGL_KHR_image "                        // mandatory
         "EGL_KHR_image_base "                   // mandatory
@@ -381,10 +381,7 @@ EGLBoolean eglChooseConfigImpl( EGLDisplay dpy, const EGLint *attrib_list,
     egl_connection_t* const cnx = &gEGLImpl;
     if (cnx->dso) {
         if (attrib_list) {
-            char value[PROPERTY_VALUE_MAX];
-            property_get("debug.egl.force_msaa", value, "false");
-
-            if (!strcmp(value, "true")) {
+            if (base::GetBoolProperty("debug.egl.force_msaa", false)) {
                 size_t attribCount = 0;
                 EGLint attrib = attrib_list[0];
 
